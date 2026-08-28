@@ -24,20 +24,18 @@ $shopConfig = [
         'url' => 'uratex-philippines.myshopify.com',
         'fallback_url' => 'uratex-ph.myshopify.com',
         'domain' => 'uratex.com.ph',
-        'api_key' => '89f9f3f97cc00f1ab817a56aef3b76c5',
-        'access_token' => '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',
-        'version' => '2025-10',
-        'total_catalog_count' => 496
+        'access_token' => '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',
+        'version' => '2026-07',
+        'total_catalog_count' => 500
     ],
     'business' => [
         'id' => 'business',
         'name' => 'Uratex Business (B2B)',
         'url' => 'uratex-business.myshopify.com',
         'domain' => 'business.uratex.com.ph',
-        'api_key' => '89f9f3f97cc00f1ab817a56aef3b76c5',
-        'access_token' => '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',
-        'version' => '2025-10',
-        'total_catalog_count' => 496
+        'access_token' => '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',
+        'version' => '2026-07',
+        'total_catalog_count' => 500
     ]
 ];
 
