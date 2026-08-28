@@ -1,0 +1,6 @@
+{
+  "name": "Uratex Shopify SEO Partner Portal",
+  "description": "Dynamic Shopify SEO title and meta tag management dashboard for Uratex Philippines with AdminLTE styling, AI optimization, and multi-store support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
