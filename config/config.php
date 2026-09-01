@@ -12,32 +12,117 @@ define('DB_NAME', 'u390249810_seomini');
 define('DB_USER', 'u390249810_seominiu');
 define('DB_PASS', 'Ric@fort2025');
 
-// Google reCAPTCHA v2 Credentials
-define('RECAPTCHA_SITE_KEY', '6LcWAv4qAAAAABQSMgz07Zw617rv8YmmeGGa1kXN');
-define('RECAPTCHA_SECRET_KEY', '6LcWAv4qAAAAAM6PdZkjJJXnK2SUV33wyWyUfMbQ');
+// Google reCAPTCHA v2 Credentials - loaded from database
+// Initialize as empty, will be populated from settings table
+define('RECAPTCHA_SITE_KEY', '');
+define('RECAPTCHA_SECRET_KEY', '');
 
-// Shopify Multi-Store API Credentials
+// Shopify Multi-Store API Credentials - loaded from database
+// Initialize empty structure, will be populated from settings table
 $shopConfig = [
     'retail' => [
-        'id' => 'retail',
-        'name' => 'Uratex Retail (Consumer)',
-        'url' => 'uratex-ph.myshopify.com',
-        'fallback_url' => 'uratex-philippines.myshopify.com',
-        'domain' => 'uratex.com.ph',
-        'access_token' => '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',
-        'version' => '2025-10',
-        'total_catalog_count' => 500
+        'id' => '',
+        'name' => '',
+        'url' => '',
+        'fallback_url' => '',
+        'domain' => '',
+        'access_token' => '',
+        'version' => '',
+        'total_catalog_count' => 0
     ],
     'business' => [
-        'id' => 'business',
-        'name' => 'Uratex Business (B2B)',
-        'url' => 'uratex-business.myshopify.com',
-        'domain' => 'business.uratex.com.ph',
-        'access_token' => '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',
-        'version' => '2025-10',
-        'total_catalog_count' => 500
+        'id' => '',
+        'name' => '',
+        'url' => '',
+        'domain' => '',
+        'access_token' => '',
+        'version' => '',
+        'total_catalog_count' => 0
     ]
 ];
+
+// Load all credentials from database settings table
+function loadSettingsFromDatabase() {
+    $db = getDbConnection();
+    if (!$db) {
+        return;
+    }
+
+    try {
+        // Get all settings rows that match our prefixes
+        $stmt = $db->query("SELECT * FROM `settings` WHERE `keys` LIKE 'recaptcha_%' OR `keys` LIKE 'retail_%' OR `keys` LIKE 'business_%'");
+        $settings = $stmt->fetchAll();
+        
+        if (empty($settings)) {
+            return; // No matching settings found
+        }
+        
+        // Find which column contains the actual values
+        $firstRow = $settings[0];
+        $valueColumn = null;
+        
+        // Check for common value column names
+        foreach (['value', 'settings_value', 'data', 'content'] as $possibleColumn) {
+            if (isset($firstRow[$possibleColumn])) {
+                $valueColumn = $possibleColumn;
+                break;
+            }
+        }
+        
+        // If no dedicated value column, check if handle contains the value
+        if ($valueColumn === null && isset($firstRow['handle']) && !empty($firstRow['handle'])) {
+            $valueColumn = 'handle';
+        }
+        
+        // If we still don't have a value column, try to find any non-key column with data
+        if ($valueColumn === null) {
+            foreach ($firstRow as $column => $val) {
+                if ($column !== 'id' && $column !== 'keys' && $column !== 'created_at' && $column !== 'updated_at' && !empty($val)) {
+                    $valueColumn = $column;
+                    break;
+                }
+            }
+        }
+        
+        // If we found a value column, process the settings
+        if ($valueColumn !== null) {
+            // Process reCAPTCHA settings
+            foreach ($settings as $setting) {
+                $key = $setting['keys'];
+                $value = $setting[$valueColumn] ?? '';
+                
+                if (strpos($key, 'recaptcha_') === 0) {
+                    $constName = strtoupper($key);
+                    define($constName, $value);
+                }
+            }
+
+            // Process store settings
+            global $shopConfig;
+            foreach ($settings as $setting) {
+                $key = $setting['keys'];
+                $value = $setting[$valueColumn] ?? '';
+                
+                if (strpos($key, 'retail_') === 0) {
+                    $field = str_replace('retail_', '', $key);
+                    if (isset($shopConfig['retail'][$field])) {
+                        $shopConfig['retail'][$field] = $value;
+                    }
+                } elseif (strpos($key, 'business_') === 0) {
+                    $field = str_replace('business_', '', $key);
+                    if (isset($shopConfig['business'][$field])) {
+                        $shopConfig['business'][$field] = $value;
+                    }
+                }
+            }
+        }
+    } catch (Exception $e) {
+        // If database fails, credentials remain empty - application requires database to be available
+    }
+}
+
+// Load all credentials from database
+loadSettingsFromDatabase();
 
 // Active Store in Session (Supports GET switch_store or store parameter)
 if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {

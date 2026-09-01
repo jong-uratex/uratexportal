@@ -38,6 +38,225 @@ include __DIR__ . '/../includes/sidebar.php';
   <!-- Main content -->
   <section class="content">
     <div class="container-fluid">
+      <!-- API Connection Status -->
+      <div class="card card-outline card-primary shadow-sm mb-4">
+        <div class="card-header border-0">
+          <h3 class="card-title font-weight-bold"><i class="fas fa-server mr-2 text-primary"></i> API Connection Status</h3>
+          <div class="card-tools">
+            <button type="button" class="btn btn-tool" data-card-widget="collapse"><i class="fas fa-minus"></i></button>
+            <button type="button" class="btn btn-tool" data-card-widget="remove"><i class="fas fa-times"></i></button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="row">
+            <?php
+            // Check Database Connection
+            $dbConnected = false;
+            $db = getDbConnection();
+            if ($db) {
+                $dbConnected = true;
+            }
+            
+            // Check reCAPTCHA Configuration
+            $recaptchaConfigured = !empty(RECAPTCHA_SITE_KEY) && !empty(RECAPTCHA_SECRET_KEY);
+            
+            // Check Shopify Connections
+            $shopifyRetailConnected = false;
+            $shopifyBusinessConnected = false;
+            $retailError = '';
+            $businessError = '';
+            
+            // Test Retail connection
+            if (!empty($shopConfig['retail']['url']) && !empty($shopConfig['retail']['access_token'])) {
+                try {
+                    $testUrl = "https://" . $shopConfig['retail']['url'] . "/admin/api/" . $shopConfig['retail']['version'] . "/shop.json";
+                    $ch = curl_init($testUrl);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                        "Content-Type: application/json",
+                        "X-Shopify-Access-Token: " . $shopConfig['retail']['access_token']
+                    ]);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+                    curl_setopt($ch, CURLOPT_FAILONERROR, true);
+                    curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                    $shopifyRetailConnected = ($httpCode === 200);
+                    if (!$shopifyRetailConnected) {
+                        $retailError = "HTTP $httpCode";
+                    }
+                } catch (Exception $e) {
+                    $retailError = "Connection failed";
+                }
+            }
+            
+            // Test Business connection
+            if (!empty($shopConfig['business']['url']) && !empty($shopConfig['business']['access_token'])) {
+                try {
+                    $testUrl = "https://" . $shopConfig['business']['url'] . "/admin/api/" . $shopConfig['business']['version'] . "/shop.json";
+                    $ch = curl_init($testUrl);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                        "Content-Type: application/json",
+                        "X-Shopify-Access-Token: " . $shopConfig['business']['access_token']
+                    ]);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+                    curl_setopt($ch, CURLOPT_FAILONERROR, true);
+                    curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                    $shopifyBusinessConnected = ($httpCode === 200);
+                    if (!$shopifyBusinessConnected) {
+                        $businessError = "HTTP $httpCode";
+                    }
+                } catch (Exception $e) {
+                    $businessError = "Connection failed";
+                }
+            }
+            ?>
+            
+            <!-- Database Status -->
+            <div class="col-12 col-sm-6 col-md-3 mb-3">
+              <div class="small-box <?php echo $dbConnected ? 'bg-success' : 'bg-danger'; ?>">
+                <div class="inner">
+                  <h3><i class="fas <?php echo $dbConnected ? 'fa-database' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <p>Database Connection</p>
+                </div>
+                <div class="icon">
+                  <i class="ion <?php echo $dbConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                </div>
+                <div class="small-box-footer">
+                  <?php echo $dbConnected ? 'Connected' : 'Disconnected'; ?>
+                </div>
+              </div>
+            </div>
+            
+            <!-- reCAPTCHA Status -->
+            <div class="col-12 col-sm-6 col-md-3 mb-3">
+              <div class="small-box <?php echo $recaptchaConfigured ? 'bg-success' : 'bg-warning'; ?>">
+                <div class="inner">
+                  <h3><i class="fas <?php echo $recaptchaConfigured ? 'fa-shield-alt' : 'fa-exclamation-circle'; ?>"></i></h3>
+                  <p>reCAPTCHA</p>
+                </div>
+                <div class="icon">
+                  <i class="ion <?php echo $recaptchaConfigured ? 'ion-checkmark-circled' : 'ion-alert-circled'; ?>"></i>
+                </div>
+                <div class="small-box-footer">
+                  <?php echo $recaptchaConfigured ? 'Configured' : 'Not configured'; ?>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Retail Store Status -->
+            <div class="col-12 col-sm-6 col-md-3 mb-3">
+              <div class="small-box <?php echo $shopifyRetailConnected ? 'bg-success' : 'bg-danger'; ?>">
+                <div class="inner">
+                  <h3><i class="fas <?php echo $shopifyRetailConnected ? 'fa-shop' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <p>Retail Store</p>
+                </div>
+                <div class="icon">
+                  <i class="ion <?php echo $shopifyRetailConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                </div>
+                <div class="small-box-footer">
+                  <?php echo $shopifyRetailConnected ? 'Connected' : 'Connection failed'; ?>
+                  <?php echo $retailError ? '<br><small class="text-white">' . $retailError . '</small>' : ''; ?>
+                </div>
+              </div>
+            </div>
+            
+            <!-- Business Store Status -->
+            <div class="col-12 col-sm-6 col-md-3 mb-3">
+              <div class="small-box <?php echo $shopifyBusinessConnected ? 'bg-success' : 'bg-danger'; ?>">
+                <div class="inner">
+                  <h3><i class="fas <?php echo $shopifyBusinessConnected ? 'fa-store' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <p>Business Store</p>
+                </div>
+                <div class="icon">
+                  <i class="ion <?php echo $shopifyBusinessConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                </div>
+                <div class="small-box-footer">
+                  <?php echo $shopifyBusinessConnected ? 'Connected' : 'Connection failed'; ?>
+                  <?php echo $businessError ? '<br><small class="text-white">' . $businessError . '</small>' : ''; ?>
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Connection Details Table -->
+          <div class="row mt-4">
+            <div class="col-12">
+              <div class="table-responsive">
+                <table class="table table-bordered table-striped">
+                  <thead class="thead-light">
+                    <tr>
+                      <th>Service</th>
+                      <th>Endpoint</th>
+                      <th>Status</th>
+                      <th>Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td><strong>MySQL Database</strong></td>
+                      <td><?php echo DB_HOST . '/' . DB_NAME; ?></td>
+                      <td><span class="badge <?php echo $dbConnected ? 'badge-success' : 'badge-danger'; ?>">
+                          <?php echo $dbConnected ? 'Connected' : 'Disconnected'; ?>
+                        </span></td>
+                      <td><?php echo $dbConnected ? 'Database connection established' : 'Unable to connect to database'; ?></td>
+                    </tr>
+                    <tr>
+                      <td><strong>reCAPTCHA</strong></td>
+                      <td>Google reCAPTCHA v2</td>
+                      <td><span class="badge <?php echo $recaptchaConfigured ? 'badge-success' : 'badge-warning'; ?>">
+                          <?php echo $recaptchaConfigured ? 'Configured' : 'Missing Keys'; ?>
+                        </span></td>
+                      <td>
+                        <?php echo !empty(RECAPTCHA_SITE_KEY) ? 'Site Key: Set' : 'Site Key: Missing'; ?> |
+                        <?php echo !empty(RECAPTCHA_SECRET_KEY) ? 'Secret Key: Set' : 'Secret Key: Missing'; ?>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><strong>Shopify Retail</strong></td>
+                      <td><?php echo !empty($shopConfig['retail']['url']) ? 'https://' . $shopConfig['retail']['url'] : 'Not configured'; ?></td>
+                      <td><span class="badge <?php echo $shopifyRetailConnected ? 'badge-success' : 'badge-danger'; ?>">
+                          <?php echo $shopifyRetailConnected ? 'Connected' : 'Failed'; ?>
+                        </span></td>
+                      <td>
+                        <?php 
+                        if (!empty($shopConfig['retail']['access_token'])) {
+                            echo 'Token: ' . substr($shopConfig['retail']['access_token'], 0, 10) . '...' . substr($shopConfig['retail']['access_token'], -4);
+                        } else {
+                            echo 'Token: Not set';
+                        }
+                        ?>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td><strong>Shopify Business</strong></td>
+                      <td><?php echo !empty($shopConfig['business']['url']) ? 'https://' . $shopConfig['business']['url'] : 'Not configured'; ?></td>
+                      <td><span class="badge <?php echo $shopifyBusinessConnected ? 'badge-success' : 'badge-danger'; ?>">
+                          <?php echo $shopifyBusinessConnected ? 'Connected' : 'Failed'; ?>
+                        </span></td>
+                      <td>
+                        <?php 
+                        if (!empty($shopConfig['business']['access_token'])) {
+                            echo 'Token: ' . substr($shopConfig['business']['access_token'], 0, 10) . '...' . substr($shopConfig['business']['access_token'], -4);
+                        } else {
+                            echo 'Token: Not set';
+                        }
+                        ?>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      
       <!-- Info boxes -->
       <div class="row">
         <div class="col-12 col-sm-6 col-md-3">
