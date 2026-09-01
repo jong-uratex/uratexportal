@@ -8,6 +8,7 @@
  *  3. Editable fields: ONLY Page Title, Meta Description, and URL Handle
  *  4. 20 Products Per Page Pagination (LIMIT 20 OFFSET ...) with page buttons & counts
  *  5. Single & Bulk Save Drafts / Push to Shopify API
+ *  6. Uses REAL Shopify product status (active → published, draft → draft, archived → archived)
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -47,6 +48,24 @@ function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
     return ($activeStore === 'business')
         ? 'uratex-business.myshopify.com'
         : 'uratex-philippines.myshopify.com';
+}
+
+/**
+ * Maps Shopify product status to portal status
+ */
+function mapShopifyStatus(string $shopifyStatus): string
+{
+    $status = strtolower(trim($shopifyStatus));
+    switch ($status) {
+        case 'active':
+            return 'published';
+        case 'draft':
+            return 'draft';
+        case 'archived':
+            return 'archived';
+        default:
+            return 'draft';
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -100,9 +119,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 
 // B. SYNC PRODUCTS FROM SHOPIFY REST API
 if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
-    $syncedCount     = 0;
-    $shopifyProducts = [];
-    $apiError        = null;
+    $syncedCount      = 0;
+    $shopifyProducts  = [];
+    $apiError         = null;
     $successfulDomain = null;
 
     $primaryUrl  = getShopifyAdminDomain($shopCfg, $activeStore);
@@ -203,6 +222,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
                 category          = VALUES(category),
                 price             = VALUES(price),
                 seo_score         = VALUES(seo_score),
+                status            = VALUES(status),
                 last_synced_at    = NOW()
         ");
 
@@ -240,7 +260,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
 
             $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
             $score       = $seoAnalysis['score'];
-            $status      = ($score >= 90) ? 'published' : 'draft';
+
+            // ★ FIX: Use the REAL status from Shopify instead of inventing it from SEO score
+            $status = mapShopifyStatus($p['status'] ?? 'active');
 
             $insertStmt->execute([
                 ':store'     => $activeStore,
@@ -324,10 +346,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
 
             $payload = json_encode([
                 "product" => [
-                    "id"                             => $shopifyPid,
-                    "title"                          => $title ?: $prod['title'],
-                    "handle"                         => $handle ?: $prod['handle'],
-                    "metafields_global_title_tag"    => $title ?: $prod['title'],
+                    "id"                                => $shopifyPid,
+                    "title"                             => $title ?: $prod['title'],
+                    "handle"                            => $handle ?: $prod['handle'],
+                    "metafields_global_title_tag"       => $title ?: $prod['title'],
                     "metafields_global_description_tag" => $metaDescription ?: $prod['meta_description']
                 ]
             ]);
@@ -348,7 +370,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
 
-            // Update local database regardless of remote result (optimistic)
+            // Update local database
             $upStmt = $db->prepare("
                 UPDATE shopify_products
                 SET title = :title,
@@ -408,19 +430,20 @@ $whereClauses = ["store_key = :store"];
 $params       = [':store' => $activeStore];
 
 if (!empty($searchQuery)) {
-    $whereClauses[]   = "(title LIKE :search OR handle LIKE :search OR product_name LIKE :search)";
+    $whereClauses[]    = "(title LIKE :search OR handle LIKE :search OR product_name LIKE :search)";
     $params[':search'] = '%' . $searchQuery . '%';
 }
 
 if ($statusFilter !== 'All Statuses' && !empty($statusFilter)) {
     $statusMap = [
-        'Draft'               => 'draft',
-        'Published'           => 'published',
-        'Needs Optimization'  => 'needs_optimization'
+        'Draft'              => 'draft',
+        'Published'          => 'published',
+        'Needs Optimization' => 'needs_optimization',
+        'Archived'           => 'archived'
     ];
-    $mappedStatus         = $statusMap[$statusFilter] ?? strtolower($statusFilter);
-    $whereClauses[]       = "status = :status";
-    $params[':status']    = $mappedStatus;
+    $mappedStatus      = $statusMap[$statusFilter] ?? strtolower($statusFilter);
+    $whereClauses[]    = "status = :status";
+    $params[':status'] = $mappedStatus;
 }
 
 $whereSql = implode(' AND ', $whereClauses);
@@ -541,6 +564,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <option value="All Statuses" <?php echo $statusFilter === 'All Statuses' ? 'selected' : ''; ?>>All Statuses</option>
               <option value="Draft" <?php echo $statusFilter === 'Draft' ? 'selected' : ''; ?>>Draft</option>
               <option value="Published" <?php echo $statusFilter === 'Published' ? 'selected' : ''; ?>>Published</option>
+              <option value="Archived" <?php echo $statusFilter === 'Archived' ? 'selected' : ''; ?>>Archived</option>
               <option value="Needs Optimization" <?php echo $statusFilter === 'Needs Optimization' ? 'selected' : ''; ?>>Needs Optimization</option>
             </select>
           </div>
@@ -600,11 +624,13 @@ include __DIR__ . '/../includes/sidebar.php';
                   </div>
                   <span class="badge <?php
                     echo $prod['status'] === 'published' ? 'badge-primary'
-                      : ($prod['status'] === 'needs_optimization' ? 'badge-warning' : 'badge-success');
+                      : ($prod['status'] === 'archived' ? 'badge-secondary'
+                      : ($prod['status'] === 'needs_optimization' ? 'badge-warning' : 'badge-success'));
                   ?> px-2.5 py-1" style="font-size: 11px; font-weight: 700;">
                     <?php
                       echo $prod['status'] === 'published' ? 'Published'
-                        : ($prod['status'] === 'needs_optimization' ? 'Needs Fix' : 'Draft');
+                        : ($prod['status'] === 'archived' ? 'Archived'
+                        : ($prod['status'] === 'needs_optimization' ? 'Needs Fix' : 'Draft'));
                     ?>
                   </span>
                 </div>
@@ -822,6 +848,7 @@ include __DIR__ . '/../includes/sidebar.php';
         <ol class="pl-3 mb-0" style="line-height: 1.8;">
           <li>Click <strong>Test Connection</strong> first to verify API credentials.</li>
           <li>Click <strong>Sync Products</strong> to import the latest catalog and images from Shopify.</li>
+          <li>Product status now comes directly from Shopify (Draft / Published / Archived).</li>
           <li>Product Image, Name, and Shopify URL are read-only metadata fetched directly from Shopify.</li>
           <li>Edit <strong>Page Title</strong> (recommended 50-60 characters).</li>
           <li>Edit <strong>Meta Description</strong> (recommended 120-160 characters).</li>
