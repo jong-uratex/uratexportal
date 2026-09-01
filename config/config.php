@@ -11,40 +11,37 @@ define('DB_NAME', 'u390249810_seomini');
 define('DB_USER', 'u390249810_seominiu');
 define('DB_PASS', 'Ric@fort2025');
 
-// Google reCAPTCHA v2 Credentials - loaded from database
-// Initialize as empty, will be populated from settings table
-define('RECAPTCHA_SITE_KEY', '');
-define('RECAPTCHA_SECRET_KEY', '');
-
 // Shopify Multi-Store API Credentials - loaded from database
-// Initialize empty structure, will be populated from settings table
 $shopConfig = [
     'retail' => [
-        'id' => '',
-        'name' => '',
-        'url' => '',
-        'fallback_url' => '',
-        'domain' => '',
-        'access_token' => '',
-        'version' => '',
+        'id'                  => '',
+        'name'                => '',
+        'url'                 => '',
+        'fallback_url'        => '',
+        'domain'              => '',
+        'access_token'        => '',
+        'version'             => '',
         'total_catalog_count' => 0
     ],
     'business' => [
-        'id' => '',
-        'name' => '',
-        'url' => '',
-        'domain' => '',
-        'access_token' => '',
-        'version' => '',
+        'id'                  => '',
+        'name'                => '',
+        'url'                 => '',
+        'domain'              => '',
+        'access_token'        => '',
+        'version'             => '',
         'total_catalog_count' => 0
     ]
 ];
 
+// These will be defined later from the database
+// DO NOT define them here as empty strings
+
 /**
  * Load all credentials from the database settings table.
- * IMPORTANT: In the actual table the column meanings are swapped:
- *   - `handle`  = setting name  (e.g. "recaptcha_site_key", "retail_access_token")
- *   - `keys`    = setting value (e.g. the actual key / token)
+ * Column meanings in the actual table:
+ *   - `handle` = setting name  (e.g. "recaptcha_site_key")
+ *   - `keys`   = setting value
  */
 function loadSettingsFromDatabase() {
     $db = getDbConnection();
@@ -53,7 +50,6 @@ function loadSettingsFromDatabase() {
     }
 
     try {
-        // FIXED: select handle (name) and keys (value)
         $stmt = $db->query("
             SELECT `handle`, `keys`
             FROM `settings`
@@ -64,20 +60,28 @@ function loadSettingsFromDatabase() {
         $settings = $stmt->fetchAll();
 
         if (empty($settings)) {
-            return; // No matching settings found
+            return;
         }
 
-        // Process reCAPTCHA settings
+        // Process reCAPTCHA settings FIRST (define constants only once)
         foreach ($settings as $setting) {
-            $key   = $setting['handle'];          // e.g. "recaptcha_site_key"
+            $key   = $setting['handle'];
             $value = $setting['keys'] ?? '';
 
             if (strpos($key, 'recaptcha_') === 0) {
-                $constName = strtoupper($key);    // RECAPTCHA_SITE_KEY / RECAPTCHA_SECRET_KEY
+                $constName = strtoupper($key); // RECAPTCHA_SITE_KEY / RECAPTCHA_SECRET_KEY
                 if (!defined($constName)) {
                     define($constName, $value);
                 }
             }
+        }
+
+        // Fallback if keys were missing in DB
+        if (!defined('RECAPTCHA_SITE_KEY')) {
+            define('RECAPTCHA_SITE_KEY', '');
+        }
+        if (!defined('RECAPTCHA_SECRET_KEY')) {
+            define('RECAPTCHA_SECRET_KEY', '');
         }
 
         // Process store settings
@@ -99,14 +103,38 @@ function loadSettingsFromDatabase() {
             }
         }
     } catch (Exception $e) {
-        // If database fails, credentials remain empty - application requires database to be available
+        // keep empty credentials on failure
+        if (!defined('RECAPTCHA_SITE_KEY')) {
+            define('RECAPTCHA_SITE_KEY', '');
+        }
+        if (!defined('RECAPTCHA_SECRET_KEY')) {
+            define('RECAPTCHA_SECRET_KEY', '');
+        }
     }
 }
 
-// Load all credentials from database
+// Database Connection Helper (must be defined before loadSettingsFromDatabase)
+function getDbConnection() {
+    try {
+        $pdo = new PDO(
+            "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4",
+            DB_USER,
+            DB_PASS,
+            [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+            ]
+        );
+        return $pdo;
+    } catch (PDOException $e) {
+        return null;
+    }
+}
+
+// Load everything from database
 loadSettingsFromDatabase();
 
-// Active Store in Session (Supports GET switch_store or store parameter)
+// Active Store in Session
 if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['switch_store'];
 } elseif (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
@@ -130,25 +158,6 @@ function setActiveStore($storeKey) {
         return true;
     }
     return false;
-}
-
-// Database Connection Helper
-function getDbConnection() {
-    try {
-        $pdo = new PDO(
-            "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4",
-            DB_USER,
-            DB_PASS,
-            [
-                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-            ]
-        );
-        return $pdo;
-    } catch (PDOException $e) {
-        // Fallback for local sandbox without live MySQL server
-        return null;
-    }
 }
 
 // Shopify API Request Helper (REST Admin API)
@@ -189,7 +198,6 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
     $dLen = mb_strlen(trim($metaDescription));
     $h    = trim($handle);
 
-    // Title validation (Optimal: 50-60 chars)
     if ($tLen === 0) {
         $score -= 35;
         $issues[] = "Missing Page Title";
@@ -201,7 +209,6 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
         $issues[] = "Title too long ({$tLen} chars, max: 60-65)";
     }
 
-    // Meta description validation (Optimal: 120-160 chars)
     if ($dLen === 0) {
         $score -= 35;
         $issues[] = "Missing Meta Description";
@@ -213,7 +220,6 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
         $issues[] = "Meta description exceeds 160 chars ({$dLen} chars)";
     }
 
-    // Handle check
     if (empty($h)) {
         $score -= 15;
         $issues[] = "Missing URL Handle";
@@ -227,13 +233,10 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
 
 /**
  * User Activity & Audit Trail Logger
- * Records logins, logouts, draft revisions, Shopify syncs/pushes, AI optimizations, etc.
- * Persists into MySQL `user_logs` table and maintains session fallback.
  */
 function recordUserLog($action, $targetResource, $changeDetails, $resourceType = 'system', $resourceId = null, $status = 'success', $customUser = null) {
     $db = getDbConnection();
 
-    // Resolve user details
     $userId    = $_SESSION['user_id'] ?? null;
     $userEmail = $customUser ?? ($_SESSION['user_email'] ?? ($_SESSION['user_username'] ?? 'jenor.ricafort@uratex.com.ph'));
     $userName  = $_SESSION['user_name'] ?? 'Jenor Ricafort';
@@ -243,7 +246,6 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
 
     if ($db) {
         try {
-            // Auto create user_logs table if not exists
             $db->exec("CREATE TABLE IF NOT EXISTS `user_logs` (
               `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
               `user_id` INT UNSIGNED NULL DEFAULT NULL,
@@ -290,7 +292,6 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
         }
     }
 
-    // Session fallback log store for sandbox environments
     if (!isset($_SESSION['user_logs_fallback'])) {
         $_SESSION['user_logs_fallback'] = [];
     }
@@ -316,7 +317,7 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
 }
 
 /**
- * Executes a Shopify Admin GraphQL query (POST /admin/api/{version}/graphql.json)
+ * Executes a Shopify Admin GraphQL query
  */
 function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
     global $shopConfig;
@@ -358,15 +359,13 @@ function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
 
 /**
  * Synchronously fetches ALL pages from Shopify Admin GraphQL API
- * using Cursor-Based Pagination (first: 250, after: $cursor).
- * Loop continues while pageInfo.hasNextPage is true.
  */
 function fetchAllShopifyPagesGraphQL($storeKey = null) {
-    $allPages   = [];
+    $allPages    = [];
     $hasNextPage = true;
-    $cursor     = null;
-    $batchCount = 0;
-    $maxBatches = 100; // Safeguard up to 25,000 pages
+    $cursor      = null;
+    $batchCount  = 0;
+    $maxBatches  = 100;
 
     $initialQuery = <<<'GRAPHQL'
 query GetPagesFirstPage {
@@ -547,7 +546,7 @@ GRAPHQL;
 }
 
 /**
- * Checks current bulk operation status on Shopify Admin GraphQL API
+ * Checks current bulk operation status
  */
 function getCurrentShopifyBulkOperation($storeKey = null) {
     $query = <<<'GRAPHQL'
