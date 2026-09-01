@@ -10,7 +10,9 @@
  *  5. 20 Collections Per Page Pagination
  *  6. Single & Bulk Save Drafts / Push to Shopify API
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
- *  8. Defensive error handling – never dies with HTTP 500
+ *  8. Live View button next to title
+ *  9. No image fetching / display (collections have no images in Shopify)
+ * 10. Defensive error handling – never dies with HTTP 500
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -53,7 +55,6 @@ function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
 
 /**
  * Map Shopify collection publish state to portal status.
- * Collections use published_at (null = draft/unpublished).
  */
 function mapCollectionStatus(?string $publishedAt): string
 {
@@ -72,8 +73,6 @@ if ($db) {
                 `shopify_collection_id` BIGINT UNSIGNED NOT NULL,
                 `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom',
                 `collection_title` VARCHAR(255) NOT NULL,
-                `image_url` VARCHAR(1000) NULL DEFAULT NULL,
-                `image_name` VARCHAR(255) NULL DEFAULT NULL,
                 `collection_url` VARCHAR(1000) NULL DEFAULT NULL,
                 `title` VARCHAR(255) NOT NULL,
                 `meta_description` TEXT NULL,
@@ -93,13 +92,13 @@ if ($db) {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
 
-        // Migrate older tables that are missing the new column
+        // Migrate older tables that are missing collection_type
         $cols = $db->query("SHOW COLUMNS FROM `shopify_collections` LIKE 'collection_type'")->fetchAll();
         if (empty($cols)) {
             $db->exec("ALTER TABLE `shopify_collections` ADD COLUMN `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom' AFTER `shopify_collection_id`");
         }
     } catch (PDOException $e) {
-        // keep going – we will surface errors later
+        // keep going
     }
 }
 
@@ -262,20 +261,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_collections (
                     store_key, shopify_collection_id, collection_type, collection_title,
-                    image_url, image_name, collection_url,
-                    title, meta_description, handle, item_count,
+                    collection_url, title, meta_description, handle, item_count,
                     status, seo_score, last_synced_at
                 ) VALUES (
                     :store, :cid, :ctype, :cname,
-                    :img_url, :img_name, :curl,
-                    :title, :meta_desc, :handle, :item_count,
+                    :curl, :title, :meta_desc, :handle, :item_count,
                     :status, :seo_score, NOW()
                 )
                 ON DUPLICATE KEY UPDATE
                     collection_title  = VALUES(collection_title),
                     collection_type   = VALUES(collection_type),
-                    image_url         = VALUES(image_url),
-                    image_name        = VALUES(image_name),
                     collection_url    = VALUES(collection_url),
                     title             = IF(shopify_collections.status = 'draft' AND shopify_collections.title != '', shopify_collections.title, VALUES(title)),
                     meta_description  = IF(shopify_collections.status = 'draft' AND shopify_collections.meta_description != '', shopify_collections.meta_description, VALUES(meta_description)),
@@ -291,15 +286,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
                 $cname  = $c['title'] ?? 'Untitled Collection';
                 $handle = $c['handle'] ?? '';
                 $ctype  = $c['_type'] ?? 'custom';
-
-                $rawImg = !empty($c['image']['src']) ? $c['image']['src'] : '';
-                if (empty($rawImg)) {
-                    $imgUrl  = 'https://images.unsplash.com/photo-1540518614846-7ede433c4550?w=600&auto=format&fit=crop&q=80';
-                    $imgName = ($handle ?: 'collection') . '.jpg';
-                } else {
-                    $imgUrl  = $rawImg;
-                    $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: (($handle ?: 'collection') . '.jpg'));
-                }
 
                 $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/collections/" . $handle;
 
@@ -326,8 +312,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
                     ':cid'        => $cid,
                     ':ctype'      => $ctype,
                     ':cname'      => $cname,
-                    ':img_url'    => $imgUrl,
-                    ':img_name'   => $imgName,
                     ':curl'       => $colUrl,
                     ':title'      => $title,
                     ':meta_desc'  => $metaDesc,
@@ -350,7 +334,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
             recordUserLog('sync_error', 'collections', $message, 'collection', null, 'error');
         }
     } catch (Throwable $e) {
-        // Catch ANY fatal / exception so the page never dies with HTTP 500
         $message = "ERROR: Sync crashed – " . htmlspecialchars($e->getMessage()) .
                    " (file: " . basename($e->getFile()) . " line " . $e->getLine() . ")";
         recordUserLog('sync_crash', 'collections', $message, 'collection', null, 'error');
@@ -526,7 +509,6 @@ if ($statusFilter !== 'All Statuses' && !empty($statusFilter)) {
 
 $whereSql = implode(' AND ', $whereClauses);
 
-// Totals
 $totalCollections = 0;
 $draftCount       = 0;
 $publishedCount   = 0;
@@ -550,7 +532,7 @@ if ($db) {
         $sStmt->execute([':store' => $activeStore]);
         $avgScore = (int)round((float)$sStmt->fetchColumn());
     } catch (Throwable $e) {
-        // silent – page still loads
+        // silent
     }
 }
 
@@ -559,7 +541,6 @@ if ($currentPage > $totalPages) {
     $currentPage = $totalPages;
 }
 
-// Current page
 $collectionsList = [];
 if ($db) {
     try {
@@ -725,20 +706,28 @@ include __DIR__ . '/../includes/sidebar.php';
               $colName     = $col['collection_title'] ?? $colTitle;
               $colMeta     = $col['meta_description'] ?? '';
               $colHandle   = $col['handle'] ?? '';
-              $colImg      = $col['image_url'] ?? 'https://images.unsplash.com/photo-1540518614846-7ede433c4550?w=600&auto=format&fit=crop&q=80';
-              $colUrl      = $col['collection_url'] ?? ("https://" . ($shopCfg['domain'] ?? '') . "/collections/" . $colHandle);
+              $colUrl      = $col['collection_url']
+                             ?? ("https://" . ($shopCfg['domain'] ?? '') . "/collections/" . $colHandle);
             ?>
             <div class="col-md-6 mb-4">
               <div class="card shadow-sm h-100 border-0" style="border-radius: 12px; overflow: hidden; border-top: 4px solid #003087 !important;">
 
+                <!-- HEADER with Live View -->
                 <div class="card-header bg-white d-flex justify-content-between align-items-center py-3 border-bottom">
-                  <div class="d-flex align-items-center text-truncate mr-2">
-                    <i class="fas fa-layer-group text-primary mr-2"></i>
-                    <h6 class="font-weight-bold mb-0 text-truncate text-dark" title="<?php echo htmlspecialchars($colName); ?>">
+                  <div class="d-flex align-items-center text-truncate mr-2" style="max-width: 65%;">
+                    <i class="fas fa-layer-group text-primary mr-2 flex-shrink-0"></i>
+                    <h6 class="font-weight-bold mb-0 text-truncate text-dark mr-2" title="<?php echo htmlspecialchars($colName); ?>">
                       <?php echo htmlspecialchars($colName); ?>
                     </h6>
+                    <a href="<?php echo htmlspecialchars($colUrl); ?>"
+                       target="_blank" rel="noreferrer"
+                       class="btn btn-sm btn-info shadow-sm flex-shrink-0"
+                       title="Live View"
+                       style="padding: 0.2rem 0.5rem; font-size: 0.75rem;">
+                      <i class="fas fa-eye"></i> <span class="d-none d-md-inline ml-1">Live View</span>
+                    </a>
                   </div>
-                  <div class="d-flex align-items-center">
+                  <div class="d-flex align-items-center flex-shrink-0">
                     <span class="badge badge-light border text-secondary mr-1" style="font-size: 10px;">
                       <?php echo (int)($col['item_count'] ?? 0); ?> Products
                     </span>
@@ -750,23 +739,6 @@ include __DIR__ . '/../includes/sidebar.php';
                 </div>
 
                 <div class="card-body p-4">
-                  <!-- Banner -->
-                  <div class="mb-3 rounded overflow-hidden position-relative border" style="height: 120px; background: #f1f5f9;">
-                    <img src="<?php echo htmlspecialchars($colImg); ?>"
-                         alt="<?php echo htmlspecialchars($colName); ?>"
-                         class="w-100 h-100" style="object-fit: cover;"
-                         referrerpolicy="no-referrer"
-                         onerror="this.src='https://images.unsplash.com/photo-1540518614846-7ede433c4550?w=600&auto=format&fit=crop&q=80';">
-                    <div class="position-absolute bottom-0 left-0 right-0 p-2 text-white"
-                         style="background: linear-gradient(transparent, rgba(0,0,0,0.7));">
-                      <span class="small font-weight-bold" style="font-size: 11px;">Collection Banner</span>
-                      <a href="<?php echo htmlspecialchars($colUrl); ?>" target="_blank" rel="noreferrer"
-                         class="text-white float-right small" style="font-size: 10px;">
-                        View Live <i class="fas fa-external-link-alt"></i>
-                      </a>
-                    </div>
-                  </div>
-
                   <form method="POST" action="collections.php?page=<?php echo $currentPage; ?>">
                     <input type="hidden" name="collection_id" value="<?php echo $colId; ?>">
 
@@ -826,7 +798,7 @@ include __DIR__ . '/../includes/sidebar.php';
           <div class="d-flex flex-column flex-lg-row justify-content-between align-items-center gap-3">
             <div class="small text-muted">
               Showing page <strong><?php echo $currentPage; ?></strong> of <strong><?php echo $totalPages; ?></strong>
-              <strong><?php echo $totalCollections; ?></strong> total collections
+              (<strong><?php echo $totalCollections; ?></strong> total collections
             </div>
             <nav>
               <ul class="pagination pagination-sm m-0">
@@ -859,7 +831,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   </li>
                 <?php endif; endforeach; ?>
                 <li class="page-item <?php echo $currentPage >= $totalPages ? 'disabled' : ''; ?>">
-                  <a class="page-link" href="?store=<?php echo urlencode($storeKey); ?>&page=<?php echo min($totalPages, $currentPage + 1); ?>&search=<?php echo urlencode($searchQuery); ?>&status=<?php echo urlencode($statusFilter); ?>">
+                  <a class="page-link" href="?store=<?php echo urlencode($storeKey); ?>&page=<?php echo min($totalPages, $currentPage + 1); ?>&search=<?php echo urlencode($statusFilter); ?>">
                     Next
                   </a>
                 </li>
