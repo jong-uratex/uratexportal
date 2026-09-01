@@ -1,0 +1,83 @@
+<?php
+/**
+ * Uratex Shopify Dynamic SEO Partner Portal
+ * Configuration File Template: Shopify API & Database Credentials
+ * 
+ * IMPORTANT: Copy this file to config.php and update with your actual credentials
+ * DO NOT commit config.php to version control - it contains sensitive access tokens
+ */
+
+session_start();
+
+// Database Credentials (MySQL)
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'your_database_name');
+define('DB_USER', 'your_database_user');
+define('DB_PASS', 'your_database_password');
+
+// Google reCAPTCHA v2 Credentials
+define('RECAPTCHA_SITE_KEY', 'your_recaptcha_site_key');
+define('RECAPTCHA_SECRET_KEY', 'your_recaptcha_secret_key');
+
+// Shopify Multi-Store API Credentials
+$shopConfig = [
+    'retail' => [
+        'id' => 'retail',
+        'name' => 'Uratex Retail (Consumer)',
+        'url' => 'uratex-philippines.myshopify.com',
+        'fallback_url' => 'uratex-ph.myshopify.com',
+        'domain' => 'uratex.com.ph',
+        'access_token' => 'your_retail_store_access_token_here',
+        'version' => '2025-10',
+        'total_catalog_count' => 500
+    ],
+    'business' => [
+        'id' => 'business',
+        'name' => 'Uratex Business (B2B)',
+        'url' => 'uratex-business.myshopify.com',
+        'domain' => 'business.uratex.com.ph',
+        'access_token' => 'your_business_store_access_token_here',
+        'version' => '2025-10',
+        'total_catalog_count' => 500
+    ]
+];
+
+// Active Store in Session (Supports GET switch_store or store parameter)
+if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
+    $_SESSION['active_store'] = $_GET['switch_store'];
+} elseif (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
+    $_SESSION['active_store'] = $_GET['store'];
+}
+
+if (!isset($_SESSION['active_store'])) {
+    $_SESSION['active_store'] = 'business';
+}
+
+function getActiveStore() {
+    global $shopConfig;
+    $key = $_SESSION['active_store'] ?? 'business';
+    return $shopConfig[$key] ?? $shopConfig['business'];
+}
+
+function setActiveStore($storeKey) {
+    global $shopConfig;
+    if (isset($shopConfig[$storeKey])) {
+        $_SESSION['active_store'] = $storeKey;
+        return true;
+    }
+    return false;
+}
+
+// Database Connection Helper
+function getDbConnection() {
+    try {
+        $pdo = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+        ]);
+        return $pdo;
+    } catch (PDOException $e) {
+        // Fallback for local sandbox without live MySQL server
+        return null;
+    }
+}
