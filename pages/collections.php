@@ -10,6 +10,7 @@
  *  5. 20 Collections Per Page Pagination
  *  6. Single & Bulk Save Drafts / Push to Shopify API
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
+ *  8. Defensive error handling – never dies with HTTP 500
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -60,7 +61,7 @@ function mapCollectionStatus(?string $publishedAt): string
 }
 
 // -----------------------------------------------------------------------------
-// AUTO-CREATE TABLE
+// AUTO-CREATE / MIGRATE TABLE
 // -----------------------------------------------------------------------------
 if ($db) {
     try {
@@ -69,7 +70,7 @@ if ($db) {
                 `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
                 `store_key` VARCHAR(50) NOT NULL DEFAULT 'business',
                 `shopify_collection_id` BIGINT UNSIGNED NOT NULL,
-                `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom' COMMENT 'custom or smart',
+                `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom',
                 `collection_title` VARCHAR(255) NOT NULL,
                 `image_url` VARCHAR(1000) NULL DEFAULT NULL,
                 `image_name` VARCHAR(255) NULL DEFAULT NULL,
@@ -91,8 +92,14 @@ if ($db) {
                 KEY `idx_collections_handle` (`handle`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
+
+        // Migrate older tables that are missing the new column
+        $cols = $db->query("SHOW COLUMNS FROM `shopify_collections` LIKE 'collection_type'")->fetchAll();
+        if (empty($cols)) {
+            $db->exec("ALTER TABLE `shopify_collections` ADD COLUMN `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom' AFTER `shopify_collection_id`");
+        }
     } catch (PDOException $e) {
-        // silent
+        // keep going – we will surface errors later
     }
 }
 
@@ -102,358 +109,388 @@ if ($db) {
 
 // A. TEST CONNECTION
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
-    $targetUrl = getShopifyAdminDomain($shopCfg, $activeStore);
-    $version   = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
-    $token     = $shopCfg['access_token'] ?? '';
+    try {
+        $targetUrl = getShopifyAdminDomain($shopCfg, $activeStore);
+        $version   = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+        $token     = $shopCfg['access_token'] ?? '';
 
-    $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
-
-    $ch = curl_init($testUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => [
-            "X-Shopify-Access-Token: {$token}",
-            "Content-Type: application/json"
-        ],
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_HEADER         => true,
-    ]);
-
-    $response   = curl_exec($ch);
-    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-    $curlError  = curl_error($ch);
-    curl_close($ch);
-
-    $bodyStr = substr($response, $headerSize);
-    $json    = json_decode($bodyStr, true);
-
-    if ($httpCode === 200 && !empty($json['shop'])) {
-        $shopName   = $json['shop']['name'] ?? 'Unknown';
-        $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-        $message = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
-    } else {
-        $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-        $message = "❌ Connection FAILED! HTTP {$httpCode}";
-        if ($curlError) {
-            $message .= " | cURL: " . htmlspecialchars($curlError);
+        if (empty($token)) {
+            throw new Exception('Access token is empty for the active store.');
         }
-        $message .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+
+        $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+
+        $ch = curl_init($testUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ],
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_HEADER         => true,
+        ]);
+
+        $response   = curl_exec($ch);
+        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        $curlError  = curl_error($ch);
+        curl_close($ch);
+
+        $bodyStr = substr($response, $headerSize);
+        $json    = json_decode($bodyStr, true);
+
+        if ($httpCode === 200 && !empty($json['shop'])) {
+            $shopName   = $json['shop']['name'] ?? 'Unknown';
+            $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
+            $message = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+        } else {
+            $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
+            $message = "❌ Connection FAILED! HTTP {$httpCode}";
+            if ($curlError) {
+                $message .= " | cURL: " . htmlspecialchars($curlError);
+            }
+            $message .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+        }
+        $message .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
+    } catch (Throwable $e) {
+        $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
     }
-    $message .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
 }
 
 // B. SYNC COLLECTIONS FROM SHOPIFY
 if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
-    $syncedCount      = 0;
-    $allCollections   = [];
-    $apiError         = null;
-    $successfulDomain = null;
+    try {
+        $syncedCount      = 0;
+        $allCollections   = [];
+        $apiError         = null;
+        $successfulDomain = null;
 
-    $primaryUrl  = getShopifyAdminDomain($shopCfg, $activeStore);
-    $fallbackUrl = $shopCfg['fallback_url'] ?? null;
-    $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
-    $token       = $shopCfg['access_token'] ?? '';
+        $primaryUrl  = getShopifyAdminDomain($shopCfg, $activeStore);
+        $fallbackUrl = $shopCfg['fallback_url'] ?? null;
+        $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+        $token       = $shopCfg['access_token'] ?? '';
 
-    $domainsToTry = array_unique(array_filter([$primaryUrl, $fallbackUrl]));
+        if (empty($token)) {
+            throw new Exception('Access token is empty for the active store. Check your settings table.');
+        }
 
-    recordUserLog('sync_started', 'collections', "Starting collections sync for store: {$activeStore}", 'collection', null, 'info');
+        $domainsToTry = array_unique(array_filter([$primaryUrl, $fallbackUrl]));
+        $endpoints    = ['custom_collections', 'smart_collections'];
 
-    // We fetch both custom_collections and smart_collections
-    $endpoints = ['custom_collections', 'smart_collections'];
+        recordUserLog('sync_started', 'collections', "Starting collections sync for store: {$activeStore}", 'collection', null, 'info');
 
-    foreach ($domainsToTry as $domain) {
-        $domainSuccess = true;
-        $tempCollections = [];
+        foreach ($domainsToTry as $domain) {
+            $domainSuccess   = true;
+            $tempCollections = [];
 
-        foreach ($endpoints as $endpoint) {
-            $nextUrl = "https://{$domain}/admin/api/{$version}/{$endpoint}.json?limit=250";
-            $headers = [
-                "X-Shopify-Access-Token: {$token}",
-                "Content-Type: application/json"
-            ];
-            $pageLimit = 20;
-            $pageCount = 0;
+            foreach ($endpoints as $endpoint) {
+                $nextUrl   = "https://{$domain}/admin/api/{$version}/{$endpoint}.json?limit=250";
+                $headers   = [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ];
+                $pageLimit = 20;
+                $pageCount = 0;
 
-            while (!empty($nextUrl) && $pageCount < $pageLimit) {
-                $pageCount++;
+                while (!empty($nextUrl) && $pageCount < $pageLimit) {
+                    $pageCount++;
 
-                $ch = curl_init($nextUrl);
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_HTTPHEADER     => $headers,
-                    CURLOPT_HEADER         => true,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_TIMEOUT        => 20,
-                ]);
+                    $ch = curl_init($nextUrl);
+                    if ($ch === false) {
+                        throw new Exception('Failed to initialize cURL');
+                    }
 
-                $response   = curl_exec($ch);
-                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-                $curlError  = curl_error($ch);
-                curl_close($ch);
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_HTTPHEADER     => $headers,
+                        CURLOPT_HEADER         => true,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_TIMEOUT        => 25,
+                    ]);
 
-                if ($httpCode === 200 && $response) {
-                    $headersStr = substr($response, 0, $headerSize);
-                    $bodyStr    = substr($response, $headerSize);
-                    $json       = json_decode($bodyStr, true);
+                    $response   = curl_exec($ch);
+                    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                    $curlError  = curl_error($ch);
+                    curl_close($ch);
 
-                    $key = ($endpoint === 'custom_collections') ? 'custom_collections' : 'smart_collections';
-                    if (!empty($json[$key]) && is_array($json[$key])) {
-                        foreach ($json[$key] as $col) {
-                            $col['_type'] = ($endpoint === 'custom_collections') ? 'custom' : 'smart';
-                            $tempCollections[] = $col;
+                    if ($httpCode === 200 && $response !== false) {
+                        $headersStr = substr($response, 0, $headerSize);
+                        $bodyStr    = substr($response, $headerSize);
+                        $json       = json_decode($bodyStr, true);
+
+                        $key = ($endpoint === 'custom_collections') ? 'custom_collections' : 'smart_collections';
+                        if (!empty($json[$key]) && is_array($json[$key])) {
+                            foreach ($json[$key] as $col) {
+                                $col['_type'] = ($endpoint === 'custom_collections') ? 'custom' : 'smart';
+                                $tempCollections[] = $col;
+                            }
                         }
-                    }
 
-                    // Link header pagination
-                    $nextUrl = '';
-                    if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
-                        $nextUrl = $match[1];
+                        $nextUrl = '';
+                        if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
+                            $nextUrl = $match[1];
+                        }
+                    } else {
+                        $bodyStr   = is_string($response) ? substr($response, $headerSize) : '';
+                        $errorData = json_decode($bodyStr, true);
+                        $apiError  = "HTTP {$httpCode} on {$domain}/{$endpoint}";
+                        if ($curlError) {
+                            $apiError .= " | cURL: {$curlError}";
+                        }
+                        if (!empty($errorData['errors'])) {
+                            $apiError .= " | " . json_encode($errorData['errors']);
+                        } elseif ($bodyStr) {
+                            $apiError .= " | " . substr($bodyStr, 0, 300);
+                        }
+                        $domainSuccess = false;
+                        break 2;
                     }
-                } else {
-                    $bodyStr   = substr($response, $headerSize);
-                    $errorData = json_decode($bodyStr, true);
-                    $apiError  = "HTTP {$httpCode} on {$domain}/{$endpoint}";
-                    if ($curlError) {
-                        $apiError .= " | cURL: {$curlError}";
-                    }
-                    if (!empty($errorData['errors'])) {
-                        $apiError .= " | " . json_encode($errorData['errors']);
-                    }
-                    $domainSuccess = false;
-                    break 2; // break both loops, try next domain
                 }
             }
+
+            if ($domainSuccess) {
+                $allCollections   = $tempCollections;
+                $successfulDomain = $domain;
+                break;
+            }
         }
 
-        if ($domainSuccess) {
-            $allCollections   = $tempCollections;
-            $successfulDomain = $domain;
-            break;
-        }
-    }
+        if ($db && !empty($allCollections)) {
+            $insertStmt = $db->prepare("
+                INSERT INTO shopify_collections (
+                    store_key, shopify_collection_id, collection_type, collection_title,
+                    image_url, image_name, collection_url,
+                    title, meta_description, handle, item_count,
+                    status, seo_score, last_synced_at
+                ) VALUES (
+                    :store, :cid, :ctype, :cname,
+                    :img_url, :img_name, :curl,
+                    :title, :meta_desc, :handle, :item_count,
+                    :status, :seo_score, NOW()
+                )
+                ON DUPLICATE KEY UPDATE
+                    collection_title  = VALUES(collection_title),
+                    collection_type   = VALUES(collection_type),
+                    image_url         = VALUES(image_url),
+                    image_name        = VALUES(image_name),
+                    collection_url    = VALUES(collection_url),
+                    title             = IF(shopify_collections.status = 'draft' AND shopify_collections.title != '', shopify_collections.title, VALUES(title)),
+                    meta_description  = IF(shopify_collections.status = 'draft' AND shopify_collections.meta_description != '', shopify_collections.meta_description, VALUES(meta_description)),
+                    handle            = IF(shopify_collections.status = 'draft' AND shopify_collections.handle != '', shopify_collections.handle, VALUES(handle)),
+                    item_count        = VALUES(item_count),
+                    seo_score         = VALUES(seo_score),
+                    status            = VALUES(status),
+                    last_synced_at    = NOW()
+            ");
 
-    // Persist
-    if ($db && !empty($allCollections)) {
-        $insertStmt = $db->prepare("
-            INSERT INTO shopify_collections (
-                store_key, shopify_collection_id, collection_type, collection_title,
-                image_url, image_name, collection_url,
-                title, meta_description, handle, item_count,
-                status, seo_score, last_synced_at
-            ) VALUES (
-                :store, :cid, :ctype, :cname,
-                :img_url, :img_name, :curl,
-                :title, :meta_desc, :handle, :item_count,
-                :status, :seo_score, NOW()
-            )
-            ON DUPLICATE KEY UPDATE
-                collection_title  = VALUES(collection_title),
-                collection_type   = VALUES(collection_type),
-                image_url         = VALUES(image_url),
-                image_name        = VALUES(image_name),
-                collection_url    = VALUES(collection_url),
-                title             = IF(shopify_collections.status = 'draft' AND shopify_collections.title != '', shopify_collections.title, VALUES(title)),
-                meta_description  = IF(shopify_collections.status = 'draft' AND shopify_collections.meta_description != '', shopify_collections.meta_description, VALUES(meta_description)),
-                handle            = IF(shopify_collections.status = 'draft' AND shopify_collections.handle != '', shopify_collections.handle, VALUES(handle)),
-                item_count        = VALUES(item_count),
-                seo_score         = VALUES(seo_score),
-                status            = VALUES(status),
-                last_synced_at    = NOW()
-        ");
+            foreach ($allCollections as $c) {
+                $cid    = $c['id'] ?? 0;
+                $cname  = $c['title'] ?? 'Untitled Collection';
+                $handle = $c['handle'] ?? '';
+                $ctype  = $c['_type'] ?? 'custom';
 
-        foreach ($allCollections as $c) {
-            $cid    = $c['id'];
-            $cname  = $c['title'] ?? 'Untitled Collection';
-            $handle = $c['handle'] ?? '';
-            $ctype  = $c['_type'] ?? 'custom';
+                $rawImg = !empty($c['image']['src']) ? $c['image']['src'] : '';
+                if (empty($rawImg)) {
+                    $imgUrl  = 'https://images.unsplash.com/photo-1540518614846-7ede433c4550?w=600&auto=format&fit=crop&q=80';
+                    $imgName = ($handle ?: 'collection') . '.jpg';
+                } else {
+                    $imgUrl  = $rawImg;
+                    $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: (($handle ?: 'collection') . '.jpg'));
+                }
 
-            // Image
-            $rawImg = !empty($c['image']['src']) ? $c['image']['src'] : '';
-            if (empty($rawImg)) {
-                $imgUrl  = 'https://images.unsplash.com/photo-1540518614846-7ede433c4550?w=600&auto=format&fit=crop&q=80';
-                $imgName = $handle . '.jpg';
-            } else {
-                $imgUrl  = $rawImg;
-                $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: ($handle . '.jpg'));
+                $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/collections/" . $handle;
+
+                $title     = $c['title'] ?? $cname;
+                $bodyClean = strip_tags($c['body_html'] ?? '');
+                $metaDesc  = mb_substr($bodyClean, 0, 160);
+                if (empty($metaDesc)) {
+                    $metaDesc = "Explore our {$cname} collection at Uratex. Quality products designed for comfort and lasting support.";
+                }
+
+                $itemCount = (int)($c['products_count'] ?? 0);
+
+                if (function_exists('calculateSeoHealth')) {
+                    $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                    $score       = $seoAnalysis['score'];
+                } else {
+                    $score = 85;
+                }
+
+                $status = mapCollectionStatus($c['published_at'] ?? null);
+
+                $insertStmt->execute([
+                    ':store'      => $activeStore,
+                    ':cid'        => $cid,
+                    ':ctype'      => $ctype,
+                    ':cname'      => $cname,
+                    ':img_url'    => $imgUrl,
+                    ':img_name'   => $imgName,
+                    ':curl'       => $colUrl,
+                    ':title'      => $title,
+                    ':meta_desc'  => $metaDesc,
+                    ':handle'     => $handle,
+                    ':item_count' => $itemCount,
+                    ':status'     => $status,
+                    ':seo_score'  => $score
+                ]);
+                $syncedCount++;
             }
 
-            $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/collections/" . $handle;
-
-            // SEO title & meta – prefer existing body_html / description if available
-            $title    = $c['title'] ?? $cname;
-            $bodyClean = strip_tags($c['body_html'] ?? '');
-            $metaDesc  = mb_substr($bodyClean, 0, 160);
-            if (empty($metaDesc)) {
-                $metaDesc = "Explore our {$cname} collection at Uratex. Quality products designed for comfort and lasting support.";
-            }
-
-            $itemCount = (int)($c['products_count'] ?? 0);
-
-            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
-            $score       = $seoAnalysis['score'];
-
-            // ★ REAL status from Shopify
-            $status = mapCollectionStatus($c['published_at'] ?? null);
-
-            $insertStmt->execute([
-                ':store'      => $activeStore,
-                ':cid'        => $cid,
-                ':ctype'      => $ctype,
-                ':cname'      => $cname,
-                ':img_url'    => $imgUrl,
-                ':img_name'   => $imgName,
-                ':curl'       => $colUrl,
-                ':title'      => $title,
-                ':meta_desc'  => $metaDesc,
-                ':handle'     => $handle,
-                ':item_count' => $itemCount,
-                ':status'     => $status,
-                ':seo_score'  => $score
-            ]);
-            $syncedCount++;
-        }
-
-        $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> collections from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
-        recordUserLog('sync_success', 'collections', "Synced {$syncedCount} collections from {$successfulDomain}", 'collection', null, 'success');
-    } else {
-        if ($apiError) {
-            $message = "ERROR: Shopify API failed for {$shopCfg['name']}. {$apiError}";
+            $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> collections from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
+            recordUserLog('sync_success', 'collections', "Synced {$syncedCount} collections from {$successfulDomain}", 'collection', null, 'success');
         } else {
-            $message = "ERROR: No collections were returned from the Shopify API for {$shopCfg['name']}. Please check your API credentials and store configuration.";
+            if ($apiError) {
+                $message = "ERROR: Shopify API failed for {$shopCfg['name']}. {$apiError}";
+            } else {
+                $message = "ERROR: No collections were returned from the Shopify API for {$shopCfg['name']}. Please check your API credentials and store configuration.";
+            }
+            recordUserLog('sync_error', 'collections', $message, 'collection', null, 'error');
         }
-        recordUserLog('sync_error', 'collections', $message, 'collection', null, 'error');
+    } catch (Throwable $e) {
+        // Catch ANY fatal / exception so the page never dies with HTTP 500
+        $message = "ERROR: Sync crashed – " . htmlspecialchars($e->getMessage()) .
+                   " (file: " . basename($e->getFile()) . " line " . $e->getLine() . ")";
+        recordUserLog('sync_crash', 'collections', $message, 'collection', null, 'error');
     }
 }
 
 // C. SAVE DRAFT
 if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
-    $collectionId    = (int)($_POST['collection_id'] ?? 0);
-    $title           = trim($_POST['title'] ?? '');
-    $metaDescription = trim($_POST['meta_description'] ?? '');
-    $handle          = trim($_POST['handle'] ?? '');
+    try {
+        $collectionId    = (int)($_POST['collection_id'] ?? 0);
+        $title           = trim($_POST['title'] ?? '');
+        $metaDescription = trim($_POST['meta_description'] ?? '');
+        $handle          = trim($_POST['handle'] ?? '');
 
-    if ($collectionId && !empty($title) && $db) {
-        $stmt = $db->prepare("
-            UPDATE shopify_collections
-            SET title = :title,
-                meta_description = :meta_desc,
-                handle = :handle,
-                status = 'draft',
-                updated_by = :user,
-                updated_at = NOW()
-            WHERE id = :id AND store_key = :store
-        ");
-        $stmt->execute([
-            ':title'     => $title,
-            ':meta_desc' => $metaDescription,
-            ':handle'    => $handle,
-            ':user'      => $currentUser,
-            ':id'        => $collectionId,
-            ':store'     => $activeStore
-        ]);
-        $message = "SEO Draft saved successfully for collection #{$collectionId}.";
+        if ($collectionId && !empty($title) && $db) {
+            $stmt = $db->prepare("
+                UPDATE shopify_collections
+                SET title = :title,
+                    meta_description = :meta_desc,
+                    handle = :handle,
+                    status = 'draft',
+                    updated_by = :user,
+                    updated_at = NOW()
+                WHERE id = :id AND store_key = :store
+            ");
+            $stmt->execute([
+                ':title'     => $title,
+                ':meta_desc' => $metaDescription,
+                ':handle'    => $handle,
+                ':user'      => $currentUser,
+                ':id'        => $collectionId,
+                ':store'     => $activeStore
+            ]);
+            $message = "SEO Draft saved successfully for collection #{$collectionId}.";
+        }
+    } catch (Throwable $e) {
+        $message = "ERROR: Save draft failed – " . htmlspecialchars($e->getMessage());
     }
 }
 
 // D. PUSH TO SHOPIFY
 if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
-    $collectionId    = (int)($_POST['collection_id'] ?? 0);
-    $title           = trim($_POST['title'] ?? '');
-    $metaDescription = trim($_POST['meta_description'] ?? '');
-    $handle          = trim($_POST['handle'] ?? '');
+    try {
+        $collectionId    = (int)($_POST['collection_id'] ?? 0);
+        $title           = trim($_POST['title'] ?? '');
+        $metaDescription = trim($_POST['meta_description'] ?? '');
+        $handle          = trim($_POST['handle'] ?? '');
 
-    if ($collectionId && $db) {
-        $stmt = $db->prepare("SELECT * FROM shopify_collections WHERE id = :id AND store_key = :store LIMIT 1");
-        $stmt->execute([':id' => $collectionId, ':store' => $activeStore]);
-        $col = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($collectionId && $db) {
+            $stmt = $db->prepare("SELECT * FROM shopify_collections WHERE id = :id AND store_key = :store LIMIT 1");
+            $stmt->execute([':id' => $collectionId, ':store' => $activeStore]);
+            $col = $stmt->fetch(PDO::FETCH_ASSOC);
 
-        if ($col) {
-            $shopifyCid  = $col['shopify_collection_id'];
-            $colType     = $col['collection_type'] ?? 'custom';
-            $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
-            $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+            if ($col) {
+                $shopifyCid  = $col['shopify_collection_id'];
+                $colType     = $col['collection_type'] ?? 'custom';
+                $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
+                $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
 
-            // Choose correct endpoint
-            $endpoint = ($colType === 'smart') ? 'smart_collections' : 'custom_collections';
-            $putUrl   = "https://{$adminDomain}/admin/api/{$version}/{$endpoint}/{$shopifyCid}.json";
+                $endpoint   = ($colType === 'smart') ? 'smart_collections' : 'custom_collections';
+                $putUrl     = "https://{$adminDomain}/admin/api/{$version}/{$endpoint}/{$shopifyCid}.json";
+                $payloadKey = ($colType === 'smart') ? 'smart_collection' : 'custom_collection';
 
-            $payloadKey = ($colType === 'smart') ? 'smart_collection' : 'custom_collection';
+                $payload = json_encode([
+                    $payloadKey => [
+                        "id"                                => $shopifyCid,
+                        "title"                             => $title ?: $col['title'],
+                        "handle"                            => $handle ?: $col['handle'],
+                        "body_html"                         => $metaDescription ?: $col['meta_description'],
+                        "metafields_global_title_tag"       => $title ?: $col['title'],
+                        "metafields_global_description_tag" => $metaDescription ?: $col['meta_description']
+                    ]
+                ]);
 
-            $payload = json_encode([
-                $payloadKey => [
-                    "id"          => $shopifyCid,
-                    "title"       => $title ?: $col['title'],
-                    "handle"      => $handle ?: $col['handle'],
-                    "body_html"   => $metaDescription ?: $col['meta_description'],
-                    // Note: SEO title/description are often handled via metafields in newer themes
-                    // For classic metafields:
-                    "metafields_global_title_tag"       => $title ?: $col['title'],
-                    "metafields_global_description_tag" => $metaDescription ?: $col['meta_description']
-                ]
-            ]);
+                $ch = curl_init($putUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_CUSTOMREQUEST  => "PUT",
+                    CURLOPT_POSTFIELDS     => $payload,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: " . ($shopCfg['access_token'] ?? ''),
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+                $res      = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
 
-            $ch = curl_init($putUrl);
-            curl_setopt_array($ch, [
-                CURLOPT_CUSTOMREQUEST  => "PUT",
-                CURLOPT_POSTFIELDS     => $payload,
-                CURLOPT_HTTPHEADER     => [
-                    "X-Shopify-Access-Token: " . ($shopCfg['access_token'] ?? ''),
-                    "Content-Type: application/json"
-                ],
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_TIMEOUT        => 15,
-            ]);
-            $res      = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
+                $upStmt = $db->prepare("
+                    UPDATE shopify_collections
+                    SET title = :title,
+                        meta_description = :meta_desc,
+                        handle = :handle,
+                        status = 'published',
+                        last_pushed_at = NOW(),
+                        updated_by = :user
+                    WHERE id = :id
+                ");
+                $upStmt->execute([
+                    ':title'     => $title ?: $col['title'],
+                    ':meta_desc' => $metaDescription ?: $col['meta_description'],
+                    ':handle'    => $handle ?: $col['handle'],
+                    ':user'      => $currentUser,
+                    ':id'        => $collectionId
+                ]);
 
-            $upStmt = $db->prepare("
-                UPDATE shopify_collections
-                SET title = :title,
-                    meta_description = :meta_desc,
-                    handle = :handle,
-                    status = 'published',
-                    last_pushed_at = NOW(),
-                    updated_by = :user
-                WHERE id = :id
-            ");
-            $upStmt->execute([
-                ':title'     => $title ?: $col['title'],
-                ':meta_desc' => $metaDescription ?: $col['meta_description'],
-                ':handle'    => $handle ?: $col['handle'],
-                ':user'      => $currentUser,
-                ':id'        => $collectionId
-            ]);
-
-            if ($httpCode >= 200 && $httpCode < 300) {
-                $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
-            } else {
-                $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
+                if ($httpCode >= 200 && $httpCode < 300) {
+                    $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
+                } else {
+                    $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
+                }
             }
         }
+    } catch (Throwable $e) {
+        $message = "ERROR: Push failed – " . htmlspecialchars($e->getMessage());
     }
 }
 
 // E. BULK APPROVE & PUSH
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
-    if ($db) {
-        $bStmt = $db->prepare("
-            UPDATE shopify_collections
-            SET status = 'published',
-                last_pushed_at = NOW(),
-                updated_by = :user
-            WHERE store_key = :store AND status = 'draft'
-        ");
-        $bStmt->execute([
-            ':user'  => $currentUser,
-            ':store' => $activeStore
-        ]);
-        $affected = $bStmt->rowCount();
-        $message  = "Bulk approved & published {$affected} draft collections for {$shopCfg['name']}.";
+    try {
+        if ($db) {
+            $bStmt = $db->prepare("
+                UPDATE shopify_collections
+                SET status = 'published',
+                    last_pushed_at = NOW(),
+                    updated_by = :user
+                WHERE store_key = :store AND status = 'draft'
+            ");
+            $bStmt->execute([
+                ':user'  => $currentUser,
+                ':store' => $activeStore
+            ]);
+            $affected = $bStmt->rowCount();
+            $message  = "Bulk approved & published {$affected} draft collections for {$shopCfg['name']}.";
+        }
+    } catch (Throwable $e) {
+        $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());
     }
 }
 
@@ -496,21 +533,25 @@ $publishedCount   = 0;
 $avgScore         = 0;
 
 if ($db) {
-    $countStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE {$whereSql}");
-    $countStmt->execute($params);
-    $totalCollections = (int)$countStmt->fetchColumn();
+    try {
+        $countStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE {$whereSql}");
+        $countStmt->execute($params);
+        $totalCollections = (int)$countStmt->fetchColumn();
 
-    $dStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE store_key = :store AND status = 'draft'");
-    $dStmt->execute([':store' => $activeStore]);
-    $draftCount = (int)$dStmt->fetchColumn();
+        $dStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE store_key = :store AND status = 'draft'");
+        $dStmt->execute([':store' => $activeStore]);
+        $draftCount = (int)$dStmt->fetchColumn();
 
-    $pStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE store_key = :store AND status = 'published'");
-    $pStmt->execute([':store' => $activeStore]);
-    $publishedCount = (int)$pStmt->fetchColumn();
+        $pStmt = $db->prepare("SELECT COUNT(*) FROM shopify_collections WHERE store_key = :store AND status = 'published'");
+        $pStmt->execute([':store' => $activeStore]);
+        $publishedCount = (int)$pStmt->fetchColumn();
 
-    $sStmt = $db->prepare("SELECT AVG(seo_score) FROM shopify_collections WHERE store_key = :store");
-    $sStmt->execute([':store' => $activeStore]);
-    $avgScore = (int)round((float)$sStmt->fetchColumn());
+        $sStmt = $db->prepare("SELECT AVG(seo_score) FROM shopify_collections WHERE store_key = :store");
+        $sStmt->execute([':store' => $activeStore]);
+        $avgScore = (int)round((float)$sStmt->fetchColumn());
+    } catch (Throwable $e) {
+        // silent – page still loads
+    }
 }
 
 $totalPages = max(1, ceil($totalCollections / $itemsPerPage));
@@ -521,10 +562,14 @@ if ($currentPage > $totalPages) {
 // Current page
 $collectionsList = [];
 if ($db) {
-    $querySql = "SELECT * FROM shopify_collections WHERE {$whereSql} ORDER BY id ASC LIMIT {$itemsPerPage} OFFSET {$offset}";
-    $stmt     = $db->prepare($querySql);
-    $stmt->execute($params);
-    $collectionsList = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    try {
+        $querySql = "SELECT * FROM shopify_collections WHERE {$whereSql} ORDER BY id ASC LIMIT {$itemsPerPage} OFFSET {$offset}";
+        $stmt     = $db->prepare($querySql);
+        $stmt->execute($params);
+        $collectionsList = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        $collectionsList = [];
+    }
 }
 
 $pageTitle = 'Collections SEO Module';
@@ -781,7 +826,7 @@ include __DIR__ . '/../includes/sidebar.php';
           <div class="d-flex flex-column flex-lg-row justify-content-between align-items-center gap-3">
             <div class="small text-muted">
               Showing page <strong><?php echo $currentPage; ?></strong> of <strong><?php echo $totalPages; ?></strong>
-              (<strong><?php echo $totalCollections; ?></strong> total collections
+              <strong><?php echo $totalCollections; ?></strong> total collections
             </div>
             <nav>
               <ul class="pagination pagination-sm m-0">
