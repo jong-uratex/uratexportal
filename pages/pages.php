@@ -10,8 +10,9 @@
  *  5. 20 Pages Per Page Pagination
  *  6. Single & Bulk Save Drafts / Push to Shopify API
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
- *  8. CSV / JSON export of all stored pages
- *  9. Defensive error handling – never dies with HTTP 500
+ *  8. Live View button next to the page title
+ *  9. CSV / JSON export of all stored pages
+ * 10. Defensive error handling – never dies with HTTP 500
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -64,8 +65,8 @@ function mapPageStatus(?string $publishedAt): string
 // EXPORT HANDLER
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && in_array($_GET['export'], ['csv', 'json'])) {
-    $expFormat = $_GET['export'];
-    $expStore  = $_GET['store'] ?? $activeStore;
+    $expFormat  = $_GET['export'];
+    $expStore   = $_GET['store'] ?? $activeStore;
     $allDbPages = [];
 
     if ($db) {
@@ -124,7 +125,7 @@ if (isset($_GET['export']) && in_array($_GET['export'], ['csv', 'json'])) {
 }
 
 // -----------------------------------------------------------------------------
-// AUTO-CREATE / MIGRATE TABLE
+// AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
 if ($db) {
     try {
@@ -344,7 +345,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
                     $metaDesc = "Learn more about {$pname} at Uratex Philippines.";
                 }
 
-                // Simple page type classification from template_suffix or title
                 $pageType = 'General Page';
                 if (!empty($p['template_suffix'])) {
                     $pageType = ucwords(str_replace(['-', '_'], ' ', $p['template_suffix']));
@@ -365,7 +365,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
                     $score = 85;
                 }
 
-                // ★ REAL status from Shopify
                 $status = mapPageStatus($p['published_at'] ?? null);
 
                 $insertStmt->execute([
@@ -778,10 +777,11 @@ include __DIR__ . '/../includes/sidebar.php';
             <div class="col-md-6 mb-4">
               <div class="card shadow-sm h-100 border-0" style="border-radius: 12px; overflow: hidden; border-top: 4px solid #003087 !important;">
 
+                <!-- HEADER with Live View -->
                 <div class="card-header bg-white d-flex justify-content-between align-items-center py-3 border-bottom">
-                  <div class="d-flex align-items-center text-truncate mr-2">
-                    <i class="fas fa-file-alt text-primary mr-2"></i>
-                    <div>
+                  <div class="d-flex align-items-center text-truncate mr-2" style="max-width: 65%;">
+                    <i class="fas fa-file-alt text-primary mr-2 flex-shrink-0"></i>
+                    <div class="text-truncate mr-2">
                       <h6 class="font-weight-bold mb-0 text-truncate text-dark" title="<?php echo htmlspecialchars($pgName); ?>">
                         <?php echo htmlspecialchars($pgName); ?>
                       </h6>
@@ -790,8 +790,15 @@ include __DIR__ . '/../includes/sidebar.php';
                         &bull; <i class="fas fa-user-edit ml-1"></i><?php echo htmlspecialchars($pgAuthor); ?>
                       </span>
                     </div>
+                    <a href="<?php echo htmlspecialchars($pgUrl); ?>"
+                       target="_blank" rel="noreferrer"
+                       class="btn btn-sm btn-info shadow-sm flex-shrink-0"
+                       title="Live View"
+                       style="padding: 0.2rem 0.5rem; font-size: 0.75rem;">
+                      <i class="fas fa-eye"></i> <span class="d-none d-md-inline ml-1">Live View</span>
+                    </a>
                   </div>
-                  <div class="d-flex align-items-center">
+                  <div class="d-flex align-items-center flex-shrink-0">
                     <span class="badge badge-info mr-1" style="font-size: 10px;"><?php echo $score; ?>% SEO</span>
                     <span class="badge <?php echo $statusBadge; ?> text-uppercase" style="font-size: 10px;">
                       <?php echo htmlspecialchars(ucfirst($status)); ?>
