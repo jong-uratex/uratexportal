@@ -3,7 +3,6 @@
  * Uratex Shopify Dynamic SEO Partner Portal
  * Configuration File: Shopify API & Database Credentials
  */
-
 session_start();
 
 // Database Credentials (MySQL)
@@ -41,7 +40,12 @@ $shopConfig = [
     ]
 ];
 
-// Load all credentials from database settings table
+/**
+ * Load all credentials from the database settings table.
+ * IMPORTANT: In the actual table the column meanings are swapped:
+ *   - `handle`  = setting name  (e.g. "recaptcha_site_key", "retail_access_token")
+ *   - `keys`    = setting value (e.g. the actual key / token)
+ */
 function loadSettingsFromDatabase() {
     $db = getDbConnection();
     if (!$db) {
@@ -49,39 +53,47 @@ function loadSettingsFromDatabase() {
     }
 
     try {
-        // Get all settings rows that match our prefixes - values are stored in 'handle' column
-        $stmt = $db->query("SELECT `keys`, `handle` FROM `settings` WHERE `keys` LIKE 'recaptcha_%' OR `keys` LIKE 'retail_%' OR `keys` LIKE 'business_%'");
+        // FIXED: select handle (name) and keys (value)
+        $stmt = $db->query("
+            SELECT `handle`, `keys`
+            FROM `settings`
+            WHERE `handle` LIKE 'recaptcha_%'
+               OR `handle` LIKE 'retail_%'
+               OR `handle` LIKE 'business_%'
+        ");
         $settings = $stmt->fetchAll();
-        
+
         if (empty($settings)) {
             return; // No matching settings found
         }
 
         // Process reCAPTCHA settings
         foreach ($settings as $setting) {
-            $key = $setting['keys'];
-            $value = $setting['handle'] ?? '';
-            
+            $key   = $setting['handle'];          // e.g. "recaptcha_site_key"
+            $value = $setting['keys'] ?? '';
+
             if (strpos($key, 'recaptcha_') === 0) {
-                $constName = strtoupper($key);
-                define($constName, $value);
+                $constName = strtoupper($key);    // RECAPTCHA_SITE_KEY / RECAPTCHA_SECRET_KEY
+                if (!defined($constName)) {
+                    define($constName, $value);
+                }
             }
         }
 
         // Process store settings
         global $shopConfig;
         foreach ($settings as $setting) {
-            $key = $setting['keys'];
-            $value = $setting['handle'] ?? '';
-            
+            $key   = $setting['handle'];
+            $value = $setting['keys'] ?? '';
+
             if (strpos($key, 'retail_') === 0) {
                 $field = str_replace('retail_', '', $key);
-                if (isset($shopConfig['retail'][$field])) {
+                if (array_key_exists($field, $shopConfig['retail'])) {
                     $shopConfig['retail'][$field] = $value;
                 }
             } elseif (strpos($key, 'business_') === 0) {
                 $field = str_replace('business_', '', $key);
-                if (isset($shopConfig['business'][$field])) {
+                if (array_key_exists($field, $shopConfig['business'])) {
                     $shopConfig['business'][$field] = $value;
                 }
             }
@@ -123,10 +135,15 @@ function setActiveStore($storeKey) {
 // Database Connection Helper
 function getDbConnection() {
     try {
-        $pdo = new PDO("mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4", DB_USER, DB_PASS, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
-        ]);
+        $pdo = new PDO(
+            "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4",
+            DB_USER,
+            DB_PASS,
+            [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC
+            ]
+        );
         return $pdo;
     } catch (PDOException $e) {
         // Fallback for local sandbox without live MySQL server
@@ -159,18 +176,18 @@ function shopifyApiRequest($endpoint, $method = 'GET', $data = null) {
 
     return [
         'status' => $httpCode,
-        'data' => json_decode($response, true)
+        'data'   => json_decode($response, true)
     ];
 }
 
 // SEO Health Score Calculation Algorithm
 function calculateSeoHealth($title, $metaDescription, $handle) {
-    $score = 100;
+    $score  = 100;
     $issues = [];
 
     $tLen = mb_strlen(trim($title));
     $dLen = mb_strlen(trim($metaDescription));
-    $h = trim($handle);
+    $h    = trim($handle);
 
     // Title validation (Optimal: 50-60 chars)
     if ($tLen === 0) {
@@ -203,7 +220,7 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
     }
 
     return [
-        'score' => max(10, min(100, $score)),
+        'score'  => max(10, min(100, $score)),
         'issues' => $issues
     ];
 }
@@ -215,12 +232,12 @@ function calculateSeoHealth($title, $metaDescription, $handle) {
  */
 function recordUserLog($action, $targetResource, $changeDetails, $resourceType = 'system', $resourceId = null, $status = 'success', $customUser = null) {
     $db = getDbConnection();
-    
+
     // Resolve user details
-    $userId = $_SESSION['user_id'] ?? null;
+    $userId    = $_SESSION['user_id'] ?? null;
     $userEmail = $customUser ?? ($_SESSION['user_email'] ?? ($_SESSION['user_username'] ?? 'jenor.ricafort@uratex.com.ph'));
-    $userName = $_SESSION['user_name'] ?? 'Jenor Ricafort';
-    $storeKey = $_SESSION['active_store'] ?? 'business';
+    $userName  = $_SESSION['user_name'] ?? 'Jenor Ricafort';
+    $storeKey  = $_SESSION['active_store'] ?? 'business';
     $ipAddress = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
     $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'Uratex Partner Portal';
 
@@ -254,18 +271,18 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
               VALUES (:uid, :uemail, :uname, :skey, :action, :target, :details, :rtype, :rid, :ip, :ua, :status)");
 
             $stmt->execute([
-                ':uid' => $userId,
-                ':uemail' => $userEmail,
-                ':uname' => $userName,
-                ':skey' => $storeKey,
-                ':action' => $action,
-                ':target' => $targetResource,
+                ':uid'     => $userId,
+                ':uemail'  => $userEmail,
+                ':uname'   => $userName,
+                ':skey'    => $storeKey,
+                ':action'  => $action,
+                ':target'  => $targetResource,
                 ':details' => $changeDetails,
-                ':rtype' => $resourceType,
-                ':rid' => $resourceId ? (string)$resourceId : null,
-                ':ip' => $ipAddress,
-                ':ua' => substr($userAgent, 0, 255),
-                ':status' => $status
+                ':rtype'   => $resourceType,
+                ':rid'     => $resourceId ? (string)$resourceId : null,
+                ':ip'      => $ipAddress,
+                ':ua'      => substr($userAgent, 0, 255),
+                ':status'  => $status
             ]);
             return true;
         } catch (Exception $e) {
@@ -277,21 +294,22 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
     if (!isset($_SESSION['user_logs_fallback'])) {
         $_SESSION['user_logs_fallback'] = [];
     }
+
     array_unshift($_SESSION['user_logs_fallback'], [
-        'id' => time() . '-' . rand(100, 999),
-        'user_id' => $userId,
-        'user_email' => $userEmail,
-        'user_name' => $userName,
-        'store_key' => $storeKey,
-        'action' => $action,
+        'id'              => time() . '-' . rand(100, 999),
+        'user_id'         => $userId,
+        'user_email'      => $userEmail,
+        'user_name'       => $userName,
+        'store_key'       => $storeKey,
+        'action'          => $action,
         'target_resource' => $targetResource,
-        'change_details' => $changeDetails,
-        'resource_type' => $resourceType,
-        'resource_id' => $resourceId,
-        'ip_address' => $ipAddress,
-        'user_agent' => $userAgent,
-        'status' => $status,
-        'created_at' => date('Y-m-d H:i:s')
+        'change_details'  => $changeDetails,
+        'resource_type'   => $resourceType,
+        'resource_id'     => $resourceId,
+        'ip_address'      => $ipAddress,
+        'user_agent'      => $userAgent,
+        'status'          => $status,
+        'created_at'      => date('Y-m-d H:i:s')
     ]);
 
     return true;
@@ -302,8 +320,10 @@ function recordUserLog($action, $targetResource, $changeDetails, $resourceType =
  */
 function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
     global $shopConfig;
-    $key = $storeKey ?? ($_SESSION['active_store'] ?? 'business');
+
+    $key   = $storeKey ?? ($_SESSION['active_store'] ?? 'business');
     $store = $shopConfig[$key] ?? $shopConfig['business'];
+
     $url = "https://" . $store['url'] . "/admin/api/" . $store['version'] . "/graphql.json";
 
     $headers = [
@@ -312,7 +332,7 @@ function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
     ];
 
     $payload = json_encode([
-        'query' => $query,
+        'query'     => $query,
         'variables' => (object)$variables
     ]);
 
@@ -324,15 +344,15 @@ function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_TIMEOUT, 30);
 
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $response  = curl_exec($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curlError = curl_error($ch);
     curl_close($ch);
 
     return [
         'status' => $httpCode,
-        'data' => json_decode($response, true),
-        'error' => $curlError
+        'data'   => json_decode($response, true),
+        'error'  => $curlError
     ];
 }
 
@@ -342,9 +362,9 @@ function shopifyGraphQLRequest($query, $variables = [], $storeKey = null) {
  * Loop continues while pageInfo.hasNextPage is true.
  */
 function fetchAllShopifyPagesGraphQL($storeKey = null) {
-    $allPages = [];
+    $allPages   = [];
     $hasNextPage = true;
-    $cursor = null;
+    $cursor     = null;
     $batchCount = 0;
     $maxBatches = 100; // Safeguard up to 25,000 pages
 
@@ -392,6 +412,7 @@ GRAPHQL;
 
     while ($hasNextPage && $batchCount < $maxBatches) {
         $batchCount++;
+
         if ($cursor === null) {
             $res = shopifyGraphQLRequest($initialQuery, [], $storeKey);
         } else {
@@ -403,14 +424,15 @@ GRAPHQL;
         }
 
         $pagesData = $res['data']['data']['pages'];
-        $nodes = $pagesData['nodes'] ?? [];
+        $nodes     = $pagesData['nodes'] ?? [];
+
         foreach ($nodes as $node) {
             $allPages[] = $node;
         }
 
-        $pageInfo = $pagesData['pageInfo'] ?? [];
+        $pageInfo    = $pagesData['pageInfo'] ?? [];
         $hasNextPage = !empty($pageInfo['hasNextPage']);
-        $cursor = !empty($pageInfo['endCursor']) ? (string)$pageInfo['endCursor'] : null;
+        $cursor      = !empty($pageInfo['endCursor']) ? (string)$pageInfo['endCursor'] : null;
 
         if (!$hasNextPage || empty($cursor)) {
             break;
@@ -418,22 +440,21 @@ GRAPHQL;
     }
 
     return [
-        'pages' => $allPages,
+        'pages'      => $allPages,
         'batchCount' => $batchCount,
         'totalCount' => count($allPages)
     ];
 }
 
 /**
- * Executes the Shopify Admin GraphQL Bulk Query Mutation for Blogs and Articles:
- * mutation CreateBulkBlogExport on /admin/api/2026-07/graphql.json (or store version)
+ * Executes the Shopify Admin GraphQL Bulk Query Mutation for Blogs and Articles
  */
 function executeShopifyBulkBlogExport($storeKey = null) {
     global $shopConfig;
-    $key = $storeKey ?? ($_SESSION['active_store'] ?? 'business');
+
+    $key   = $storeKey ?? ($_SESSION['active_store'] ?? 'business');
     $store = $shopConfig[$key] ?? $shopConfig['business'];
-    
-    // GraphQL Bulk Query Mutation specified by user
+
     $mutation = <<<'GRAPHQL'
 mutation CreateBulkBlogExport {
   bulkOperationRunQuery(
@@ -495,6 +516,7 @@ mutation CreateBulkBlogExport {
 GRAPHQL;
 
     $url = "https://" . $store['url'] . "/admin/api/" . $store['version'] . "/graphql.json";
+
     $headers = [
         "Content-Type: application/json",
         "X-Shopify-Access-Token: " . $store['access_token']
@@ -508,18 +530,19 @@ GRAPHQL;
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
     curl_setopt($ch, CURLOPT_TIMEOUT, 30);
 
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $response  = curl_exec($ch);
+    $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $curlError = curl_error($ch);
     curl_close($ch);
 
     $data = json_decode($response, true);
+
     return [
-        'status' => $httpCode,
-        'data' => $data,
-        'error' => $curlError,
+        'status'        => $httpCode,
+        'data'          => $data,
+        'error'         => $curlError,
         'bulkOperation' => $data['data']['bulkOperationRunQuery']['bulkOperation'] ?? null,
-        'userErrors' => $data['data']['bulkOperationRunQuery']['userErrors'] ?? []
+        'userErrors'    => $data['data']['bulkOperationRunQuery']['userErrors'] ?? []
     ];
 }
 
@@ -596,29 +619,30 @@ query GetAllBlogsAndArticles {
 GRAPHQL;
 
     $res = shopifyGraphQLRequest($query, [], $storeKey);
+
     $allArticles = [];
-    $blogs = $res['data']['data']['blogs']['edges'] ?? [];
+    $blogs       = $res['data']['data']['blogs']['edges'] ?? [];
 
     foreach ($blogs as $bEdge) {
-        $blogNode = $bEdge['node'] ?? [];
+        $blogNode  = $bEdge['node'] ?? [];
         $blogTitle = $blogNode['title'] ?? 'News & Guides';
-        $articles = $blogNode['articles']['edges'] ?? [];
+        $articles  = $blogNode['articles']['edges'] ?? [];
 
         foreach ($articles as $aEdge) {
             $aNode = $aEdge['node'] ?? [];
             $allArticles[] = [
-                'article' => $aNode,
-                'blog' => $blogNode,
+                'article'   => $aNode,
+                'blog'      => $blogNode,
                 'blogTitle' => $blogTitle
             ];
         }
     }
 
     return [
-        'articles' => $allArticles,
+        'articles'   => $allArticles,
         'blogsCount' => count($blogs),
         'totalCount' => count($allArticles),
-        'raw' => $res
+        'raw'        => $res
     ];
 }
 ?>
