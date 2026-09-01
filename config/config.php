@@ -25,7 +25,7 @@ $shopConfig = [
         'fallback_url' => 'uratex-ph.myshopify.com',
         'domain' => 'uratex.com.ph',
         'access_token' => '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',
-        'version' => '2026-07',
+        'version' => '2025-10',
         'total_catalog_count' => 500
     ],
     'business' => [
@@ -34,7 +34,7 @@ $shopConfig = [
         'url' => 'uratex-business.myshopify.com',
         'domain' => 'business.uratex.com.ph',
         'access_token' => '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',
-        'version' => '2026-07',
+        'version' => '2025-10',
         'total_catalog_count' => 500
     ]
 ];
@@ -439,7 +439,7 @@ mutation CreateBulkBlogExport {
 }
 GRAPHQL;
 
-    $url = "https://" . $store['url'] . "/admin/api/2026-07/graphql.json";
+    $url = "https://" . $store['url'] . "/admin/api/" . $store['version'] . "/graphql.json";
     $headers = [
         "Content-Type: application/json",
         "X-Shopify-Access-Token: " . $store['access_token']

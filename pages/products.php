@@ -37,6 +37,46 @@ $messageType = 'success';
 // 1. ACTION HANDLERS (SYNC, SAVE DRAFT, PUSH SHOPIFY, BULK APPROVE)
 // -----------------------------------------------------------------------------
 
+// A. TEST SHOPIFY API CONNECTION
+if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
+    $targetUrl = !empty($shopCfg['url']) ? $shopCfg['url'] : ($activeStore === 'business' ? 'uratex-business.myshopify.com' : 'uratex-philippines.myshopify.com');
+    $expectedUrl = ($activeStore === 'retail') ? 'uratex-philippines.myshopify.com' : 'uratex-business.myshopify.com';
+    
+    $testUrl = "https://" . $targetUrl . "/admin/api/" . $shopCfg['version'] . "/shop.json";
+    $headers = [
+        "X-Shopify-Access-Token: " . $shopCfg['access_token'],
+        "Content-Type: application/json"
+    ];
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $testUrl);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HEADER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+    
+    $bodyStr = substr($response, $headerSize);
+    $json = json_decode($bodyStr, true);
+    
+    if ($httpCode === 200 && !empty($json['shop'])) {
+        $shopName = $json['shop']['name'] ?? 'Unknown';
+        $shopDomain = $json['shop']['domain'] ?? $targetUrl;
+        $message = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$shopCfg['version']}";
+    } else {
+        $errorData = json_decode($bodyStr, true);
+        $errorDetails = $errorData['errors'] ?? substr($bodyStr, 0, 500);
+        $message = "❌ Connection FAILED! HTTP {$httpCode}: " . htmlspecialchars(json_encode($errorDetails) ?: substr($bodyStr, 0, 200));
+    }
+    
+    $message .= "<br><small class='text-muted'>URL: {$testUrl}</small>";
+}
+
 // A. SYNC PRODUCTS FROM SHOPIFY REST API (FETCH ALL PRODUCTS WITH PAGINATION)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
     $syncedCount = 0;
@@ -93,19 +133,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
                     $nextUrl = $match[1];
                 }
             } else {
-                // Log API error
+                // Log API error with more details
+                $bodyStr = substr($response, $headerSize);
+                $errorData = json_decode($bodyStr, true);
                 $errorMsg = "Shopify API failed for {$activeStore}: HTTP {$httpCode}";
-                if ($response) {
-                    $bodyStr = substr($response, $headerSize);
-                    $errorData = json_decode($bodyStr, true);
-                    $errorMsg .= " - " . ($errorData['errors'] ?? substr($bodyStr, 0, 200));
+                if ($errorData && isset($errorData['errors'])) {
+                    $errorMsg .= " - " . json_encode($errorData['errors']);
+                } elseif ($bodyStr) {
+                    $errorMsg .= " - " . substr($bodyStr, 0, 500);
                 }
                 recordUserLog('sync_api_error', 'products', $errorMsg, 'product', null, 'error');
+                $message = "Shopify API Error for {$shopCfg['name']}: {$errorMsg}";
                 break;
             }
         }
     } else {
-        // URL doesn't match expected store - log warning
+        // URL doesn't match expected store - log warning and show error to user
+        $message = "ERROR: Shop URL mismatch for {$shopCfg['name']}. Configured: {$targetUrl}, Expected: {$expectedUrl}. Please check your store configuration.";
         recordUserLog('sync_url_mismatch', 'products', "Store {$activeStore} has mismatched URL: {$targetUrl} (expected: {$expectedUrl})", 'product', null, 'warning');
     }
     
@@ -376,8 +420,9 @@ include __DIR__ . '/../includes/sidebar.php';
     <div class="container-fluid">
       
       <?php if (!empty($message)): ?>
-        <div class="alert alert-success alert-dismissible fade show shadow-sm" role="alert">
-          <i class="fas fa-check-circle mr-2"></i> <?php echo htmlspecialchars($message); ?>
+        <div class="alert <?php echo (strpos($message, 'ERROR:') === 0 || strpos($message, 'Shopify API Error') !== false || strpos($message, '❌') !== false) ? 'alert-danger' : (strpos($message, '✅') !== false ? 'alert-success' : 'alert-info'); ?> alert-dismissible fade show shadow-sm" role="alert">
+          <?php echo (strpos($message, '✅') !== false || strpos($message, '❌') !== false) ? '' : '<i class="fas ' . ((strpos($message, 'ERROR:') === 0 || strpos($message, 'Shopify API Error') !== false) ? 'fa-exclamation-circle' : 'fa-check-circle') . ' mr-2"></i>'; ?>
+          <?php echo $message; ?>
           <button type="button" class="close" data-dismiss="alert" aria-label="Close">
             <span aria-hidden="true">&times;</span>
           </button>
@@ -393,8 +438,16 @@ include __DIR__ . '/../includes/sidebar.php';
           </a>
         </div>
         
-        <!-- Header Actions: Yellow Sync Products & Green Bulk Approve -->
+        <!-- Header Actions: Test Connection, Sync Products & Green Bulk Approve -->
         <div class="col-sm-6 text-right d-flex justify-content-end align-items-center gap-2">
+          <!-- Test Connection Button (Blue) -->
+          <form method="POST" class="d-inline mr-2">
+            <input type="hidden" name="action" value="test_connection">
+            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #007bff; border-color: #0069d9;" title="Test API connection before syncing">
+              <i class="fas fa-plug mr-1"></i> Test Connection
+            </button>
+          </form>
+
           <!-- Sync Products Button (Yellow #FFCC00) -->
           <form method="POST" class="d-inline mr-2">
             <input type="hidden" name="action" value="sync_products">
