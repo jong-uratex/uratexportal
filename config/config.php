@@ -49,70 +49,40 @@ function loadSettingsFromDatabase() {
     }
 
     try {
-        // Get all settings rows that match our prefixes
-        $stmt = $db->query("SELECT * FROM `settings` WHERE `keys` LIKE 'recaptcha_%' OR `keys` LIKE 'retail_%' OR `keys` LIKE 'business_%'");
+        // Get all settings rows that match our prefixes - values are stored in 'handle' column
+        $stmt = $db->query("SELECT `keys`, `handle` FROM `settings` WHERE `keys` LIKE 'recaptcha_%' OR `keys` LIKE 'retail_%' OR `keys` LIKE 'business_%'");
         $settings = $stmt->fetchAll();
         
         if (empty($settings)) {
             return; // No matching settings found
         }
-        
-        // Find which column contains the actual values
-        $firstRow = $settings[0];
-        $valueColumn = null;
-        
-        // Check for common value column names
-        foreach (['value', 'settings_value', 'data', 'content'] as $possibleColumn) {
-            if (isset($firstRow[$possibleColumn])) {
-                $valueColumn = $possibleColumn;
-                break;
-            }
-        }
-        
-        // If no dedicated value column, check if handle contains the value
-        if ($valueColumn === null && isset($firstRow['handle']) && !empty($firstRow['handle'])) {
-            $valueColumn = 'handle';
-        }
-        
-        // If we still don't have a value column, try to find any non-key column with data
-        if ($valueColumn === null) {
-            foreach ($firstRow as $column => $val) {
-                if ($column !== 'id' && $column !== 'keys' && $column !== 'created_at' && $column !== 'updated_at' && !empty($val)) {
-                    $valueColumn = $column;
-                    break;
-                }
-            }
-        }
-        
-        // If we found a value column, process the settings
-        if ($valueColumn !== null) {
-            // Process reCAPTCHA settings
-            foreach ($settings as $setting) {
-                $key = $setting['keys'];
-                $value = $setting[$valueColumn] ?? '';
-                
-                if (strpos($key, 'recaptcha_') === 0) {
-                    $constName = strtoupper($key);
-                    define($constName, $value);
-                }
-            }
 
-            // Process store settings
-            global $shopConfig;
-            foreach ($settings as $setting) {
-                $key = $setting['keys'];
-                $value = $setting[$valueColumn] ?? '';
-                
-                if (strpos($key, 'retail_') === 0) {
-                    $field = str_replace('retail_', '', $key);
-                    if (isset($shopConfig['retail'][$field])) {
-                        $shopConfig['retail'][$field] = $value;
-                    }
-                } elseif (strpos($key, 'business_') === 0) {
-                    $field = str_replace('business_', '', $key);
-                    if (isset($shopConfig['business'][$field])) {
-                        $shopConfig['business'][$field] = $value;
-                    }
+        // Process reCAPTCHA settings
+        foreach ($settings as $setting) {
+            $key = $setting['keys'];
+            $value = $setting['handle'] ?? '';
+            
+            if (strpos($key, 'recaptcha_') === 0) {
+                $constName = strtoupper($key);
+                define($constName, $value);
+            }
+        }
+
+        // Process store settings
+        global $shopConfig;
+        foreach ($settings as $setting) {
+            $key = $setting['keys'];
+            $value = $setting['handle'] ?? '';
+            
+            if (strpos($key, 'retail_') === 0) {
+                $field = str_replace('retail_', '', $key);
+                if (isset($shopConfig['retail'][$field])) {
+                    $shopConfig['retail'][$field] = $value;
+                }
+            } elseif (strpos($key, 'business_') === 0) {
+                $field = str_replace('business_', '', $key);
+                if (isset($shopConfig['business'][$field])) {
+                    $shopConfig['business'][$field] = $value;
                 }
             }
         }
