@@ -694,9 +694,14 @@ include __DIR__ . '/../includes/sidebar.php';
                 
                 <!-- Card Header with Title and Badge -->
                 <div class="card-header bg-white d-flex justify-content-between align-items-center py-3 border-bottom">
-                  <h5 class="card-title font-weight-bold mb-0 text-truncate text-dark" style="max-width: 78%; font-size: 15px;" title="<?php echo htmlspecialchars($prod['title']); ?>">
-                    <?php echo htmlspecialchars($prod['title']); ?>
-                  </h5>
+                  <div class="d-flex align-items-center gap-2">
+                    <h5 class="card-title font-weight-bold mb-0 text-truncate text-dark" style="max-width: 70%; font-size: 15px;" title="<?php echo htmlspecialchars($prod['title']); ?>">
+                      <?php echo htmlspecialchars($prod['title']); ?>
+                    </h5>
+                    <a href="<?php echo htmlspecialchars($prod['product_url'] ?: ('https://' . $shopCfg['domain'] . '/products/' . $prod['handle'])); ?>" target="_blank" rel="noreferrer" class="btn btn-sm btn-info shadow-sm" title="Live View" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">
+                      <i class="fas fa-eye"></i> <span class="d-none d-md-inline ml-1">Live View</span>
+                    </a>
+                  </div>
                   <span class="badge <?php echo $prod['status'] === 'published' ? 'badge-primary' : ($prod['status'] === 'needs_optimization' ? 'badge-warning' : 'badge-success'); ?> px-2.5 py-1" style="font-size: 11px; font-weight: 700;">
                     <?php echo $prod['status'] === 'published' ? 'Published' : ($prod['status'] === 'needs_optimization' ? 'Needs Fix' : 'Draft'); ?>
                   </span>
