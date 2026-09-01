@@ -224,11 +224,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
     $syncedCount = 0;
     
     // Call Shopify REST API to fetch products using the official admin URL for the active store
-    $targetUrl = !empty($shopCfg['url']) ? $shopCfg['url'] : ($activeStore === 'business' ? 'uratex-business.myshopify.com' : 'uratex-ph.myshopify.com');
+    $targetUrl = !empty($shopCfg['url']) ? $shopCfg['url'] : ($activeStore === 'business' ? 'uratex-business.myshopify.com' : 'uratex-philippines.myshopify.com');
     $shopifyProducts = [];
     
-    // Attempt live API call with full cursor pagination (requesting limit=500 per page)
-    if (!($activeStore === 'retail' && strpos($targetUrl, 'business') !== false)) {
+    // Verify that the target URL matches the active store to prevent cross-store issues
+    $expectedUrl = ($activeStore === 'retail') ? 'uratex-philippines.myshopify.com' : 'uratex-business.myshopify.com';
+    
+    // Debug: Record which store we're syncing from
+    recordUserLog('sync_started', 'products', "Starting sync for store: {$activeStore} with URL: {$targetUrl}", 'product', null, 'info');
+    
+    if (strpos($targetUrl, $expectedUrl) !== false || $targetUrl === $expectedUrl) {
         $nextUrl = "https://" . $targetUrl . "/admin/api/" . $shopCfg['version'] . "/products.json?limit=500";
         $headers = [
             "X-Shopify-Access-Token: " . $shopCfg['access_token'],
@@ -270,9 +275,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
                     $nextUrl = $match[1];
                 }
             } else {
+                // Log API error
+                $errorMsg = "Shopify API failed for {$activeStore}: HTTP {$httpCode}";
+                if ($response) {
+                    $bodyStr = substr($response, $headerSize);
+                    $errorData = json_decode($bodyStr, true);
+                    $errorMsg .= " - " . ($errorData['errors'] ?? substr($bodyStr, 0, 200));
+                }
+                recordUserLog('sync_api_error', 'products', $errorMsg, 'product', null, 'error');
                 break;
             }
         }
+    } else {
+        // URL doesn't match expected store - log warning
+        recordUserLog('sync_url_mismatch', 'products', "Store {$activeStore} has mismatched URL: {$targetUrl} (expected: {$expectedUrl})", 'product', null, 'warning');
     }
     
     if ($db) {
@@ -372,7 +388,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
                 ]);
                 $syncedCount++;
             }
-            $message = "Shopify Catalog successfully extracted! All {$syncedCount} products for {$shopCfg['name']} are now synchronized with verified product photos and stored in MySQL database.";
+            $message = "Shopify API did not return products for {$shopCfg['name']}. Using pre-defined catalog for {$activeStore} store. All {$syncedCount} products are now synchronized with verified product photos and stored in MySQL database.";
+            recordUserLog('sync_fallback', 'products', "Fell back to catalog for store: {$activeStore}", 'product', null, 'warning');
         }
     } else {
         $message = "Database connection offline, but {$shopCfg['name']} catalog sync request was processed.";

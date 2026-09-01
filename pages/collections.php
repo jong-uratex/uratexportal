@@ -642,11 +642,14 @@ function getStoreCollectionTemplates($storeKey, $shopDomain) {
 // A. SYNC COLLECTIONS FROM SHOPIFY REST API (FETCH ALL WITH PAGINATION & LIMIT=500)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
     $syncedCount = 0;
-    $targetUrl = !empty($shopCfg['url']) ? $shopCfg['url'] : ($activeStore === 'business' ? 'uratex-business.myshopify.com' : 'uratex-ph.myshopify.com');
+    $targetUrl = !empty($shopCfg['url']) ? $shopCfg['url'] : ($activeStore === 'business' ? 'uratex-business.myshopify.com' : 'uratex-philippines.myshopify.com');
     $shopifyCollections = [];
     
+    // Verify that the target URL matches the active store to prevent cross-store issues
+    $expectedUrl = ($activeStore === 'retail') ? 'uratex-philippines.myshopify.com' : 'uratex-business.myshopify.com';
+    
     // Attempt live REST API endpoints (both custom_collections and smart_collections with limit=250/500 cursor pagination)
-    if (!($activeStore === 'retail' && strpos($targetUrl, 'business') !== false)) {
+    if (strpos($targetUrl, $expectedUrl) !== false || $targetUrl === $expectedUrl) {
         $endpoints = ['custom_collections.json?limit=250', 'smart_collections.json?limit=250'];
         $headers = [
             "X-Shopify-Access-Token: " . $shopCfg['access_token'],
