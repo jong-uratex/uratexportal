@@ -12,9 +12,206 @@ if (isset($_GET['switch_store'])) {
     exit;
 }
 
+// Handle token generation callback
+if (isset($_GET['code']) && isset($_GET['hmac']) && isset($_GET['shop'])) {
+    handleShopifyOAuthCallback();
+}
+
+// Function to update settings in database
+function updateSetting($handle, $value) {
+    $db = getDbConnection();
+    if (!$db) {
+        return false;
+    }
+    try {
+        $stmt = $db->prepare("INSERT INTO `settings` (`handle`, `keys`) VALUES (:handle, :value) ON DUPLICATE KEY UPDATE `keys` = :value");
+        $stmt->execute([
+            ':handle' => $handle,
+            ':value' => $value
+        ]);
+        return true;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+// Function to handle Shopify OAuth callback
+function handleShopifyOAuthCallback() {
+    global $shopConfig;
+    
+    $code = $_GET['code'] ?? '';
+    $shop = $_GET['shop'] ?? '';
+    $hmac = $_GET['hmac'] ?? '';
+    
+    if (empty($code) || empty($shop)) {
+        header("Location: dashboard.php?error=missing_params");
+        exit;
+    }
+    
+    // Get client_id and client_secret from database
+    $db = getDbConnection();
+    $clientId = '';
+    $clientSecret = '';
+    
+    if ($db) {
+        try {
+            $stmt = $db->prepare("SELECT `keys` FROM `settings` WHERE `handle` = 'client_id'");
+            $stmt->execute();
+            $result = $stmt->fetch();
+            $clientId = $result['keys'] ?? '';
+            
+            $stmt = $db->prepare("SELECT `keys` FROM `settings` WHERE `handle` = 'secret'");
+            $stmt->execute();
+            $result = $stmt->fetch();
+            $clientSecret = $result['keys'] ?? '';
+        } catch (Exception $e) {
+            header("Location: dashboard.php?error=db_error");
+            exit;
+        }
+    }
+    
+    if (empty($clientId) || empty($clientSecret)) {
+        header("Location: dashboard.php?error=missing_credentials");
+        exit;
+    }
+    
+    // Exchange code for access token
+    $accessTokenUrl = "https://$shop/admin/oauth/access_token";
+    $data = [
+        'client_id' => $clientId,
+        'client_secret' => $clientSecret,
+        'code' => $code
+    ];
+    
+    $ch = curl_init($accessTokenUrl);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    
+    if ($httpCode === 200) {
+        $tokenData = json_decode($response, true);
+        $accessToken = $tokenData['access_token'] ?? '';
+        
+        if (!empty($accessToken)) {
+            // Determine which store this is for
+            $storeKey = 'retail';
+            if (strpos($shop, 'business') !== false) {
+                $storeKey = 'business';
+            }
+            
+            // Update the access token in settings
+            $handle = $storeKey . '_access_token';
+            updateSetting($handle, $accessToken);
+            
+            // Also update the URL if not set
+            if (empty($shopConfig[$storeKey]['url'])) {
+                updateSetting($storeKey . '_url', $shop);
+            }
+            
+            // Reload settings
+            loadSettingsFromDatabase();
+            
+            header("Location: dashboard.php?success=token_updated");
+            exit;
+        }
+    }
+    
+    header("Location: dashboard.php?error=token_failed");
+    exit;
+}
+
+// Function to initiate OAuth flow
+function initiateShopifyOAuth($storeKey) {
+    global $shopConfig;
+    
+    $db = getDbConnection();
+    $clientId = '';
+    $clientSecret = '';
+    
+    if ($db) {
+        try {
+            $stmt = $db->query("SELECT `handle`, `keys` FROM `settings` WHERE `handle` IN ('client_id', 'secret')");
+            $settings = $stmt->fetchAll();
+            foreach ($settings as $setting) {
+                if ($setting['handle'] === 'client_id') {
+                    $clientId = $setting['keys'];
+                } elseif ($setting['handle'] === 'secret') {
+                    $clientSecret = $setting['keys'];
+                }
+            }
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+    
+    if (empty($clientId) || empty($clientSecret)) {
+        return false;
+    }
+    
+    $store = $shopConfig[$storeKey];
+    $shopUrl = $store['url'] ?? '';
+    
+    if (empty($shopUrl)) {
+        return false;
+    }
+    
+    $scopes = 'read_products,write_products,read_collections,write_collections,read_pages,write_pages,read_blogs,write_blogs';
+    
+    // Use protocol-relative URL for the redirect to work in both HTTP and HTTPS
+    $currentProtocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://';
+    $redirectUri = urlencode($currentProtocol . $_SERVER['HTTP_HOST'] . '/pages/dashboard.php');
+    
+    $authUrl = "https://$shopUrl/admin/oauth/authorize?client_id=$clientId&scope=$scopes&redirect_uri=$redirectUri";
+    
+    return $authUrl;
+}
+
 $pageTitle = 'Dashboard - SEO Health & Analytics';
 include __DIR__ . '/../includes/header.php';
 include __DIR__ . '/../includes/sidebar.php';
+
+// Display success/error messages
+if (isset($_GET['success'])) {
+    echo '<div class="alert alert-success alert-dismissible fade show" role="alert">';
+    echo '<i class="fas fa-check-circle mr-2"></i>';
+    if ($_GET['success'] === 'token_updated') {
+        echo 'New access token generated and saved successfully!';
+    }
+    echo '<button type="button" class="close" data-dismiss="alert" aria-label="Close">';
+    echo '<span aria-hidden="true">&times;</span>';
+    echo '</button></div>';
+}
+
+if (isset($_GET['error'])) {
+    echo '<div class="alert alert-danger alert-dismissible fade show" role="alert">';
+    echo '<i class="fas fa-exclamation-circle mr-2"></i>';
+    switch ($_GET['error']) {
+        case 'missing_params':
+            echo 'Missing OAuth parameters. Please try again.';
+            break;
+        case 'missing_credentials':
+            echo 'Shopify app credentials not configured. Please add client_id and secret to settings.';
+            break;
+        case 'db_error':
+            echo 'Database error occurred. Please try again.';
+            break;
+        case 'token_failed':
+            echo 'Failed to generate access token. Please check your credentials.';
+            break;
+        default:
+            echo 'An error occurred during token generation.';
+    }
+    echo '<button type="button" class="close" data-dismiss="alert" aria-label="Close">';
+    echo '<span aria-hidden="true">&times;</span>';
+    echo '</button></div>';
+}
+
 ?>
 
 <!-- Content Wrapper. Contains page content -->
@@ -29,6 +226,15 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
         <div class="col-sm-6 text-right">
           <button class="btn btn-uratex-sync mr-2"><i class="fas fa-sync-alt mr-1"></i> Sync from Shopify</button>
+          <?php
+          $activeStore = $_SESSION['active_store'] ?? 'business';
+          $oauthUrl = initiateShopifyOAuth($activeStore);
+          if ($oauthUrl):
+              echo '<a href="' . htmlspecialchars($oauthUrl) . '" class="btn btn-info mr-2"><i class="fas fa-key mr-1"></i> Generate New Token</a>';
+          else:
+              echo '<button class="btn btn-info mr-2" disabled><i class="fas fa-key mr-1"></i> Generate Token (Setup Required)</button>';
+          endif;
+          ?>
           <button class="btn btn-success"><i class="fas fa-check-double mr-1"></i> Bulk Approve & Push</button>
         </div>
       </div>
