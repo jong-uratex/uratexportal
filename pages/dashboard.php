@@ -28,8 +28,15 @@ include __DIR__ . '/../includes/sidebar.php';
           <p class="text-muted small mb-0">Real-time health scores for Pages, Collections, Products, and Blogs.</p>
         </div>
         <div class="col-sm-6 text-right">
-          <button class="btn btn-uratex-sync mr-2"><i class="fas fa-sync-alt mr-1"></i> Sync from Shopify</button>
-          <button class="btn btn-success"><i class="fas fa-check-double mr-1"></i> Bulk Approve & Push</button>
+          <button type="button" id="renewTokenBtn" class="btn btn-warning text-dark font-weight-bold mr-2">
+            <i class="fas fa-key mr-1"></i> Renew Token
+          </button>
+          <button type="button" class="btn btn-uratex-sync mr-2">
+            <i class="fas fa-sync-alt mr-1"></i> Sync from Shopify
+          </button>
+          <button type="button" class="btn btn-success">
+            <i class="fas fa-check-double mr-1"></i> Bulk Approve & Push
+          </button>
         </div>
       </div>
     </div>
@@ -38,6 +45,9 @@ include __DIR__ . '/../includes/sidebar.php';
   <!-- Main content -->
   <section class="content">
     <div class="container-fluid">
+      <!-- Alert Container for AJAX Responses -->
+      <div id="dashboardAlertContainer"></div>
+
       <!-- API Connection Status -->
       <div class="card card-outline card-primary shadow-sm mb-4">
         <div class="card-header border-0">
@@ -357,5 +367,68 @@ include __DIR__ . '/../includes/sidebar.php';
     </div>
   </section>
 </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  const renewBtn = document.getElementById('renewTokenBtn');
+  const alertContainer = document.getElementById('dashboardAlertContainer');
+
+  if (renewBtn) {
+    renewBtn.addEventListener('click', function() {
+      if (!confirm('Are you sure you want to request a new Shopify access token and save it to the database?')) {
+        return;
+      }
+
+      const originalHtml = renewBtn.innerHTML;
+      renewBtn.disabled = true;
+      renewBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Renewing...';
+
+      fetch('renew_token.php', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          alertContainer.innerHTML = `
+            <div class="alert alert-success alert-dismissible fade show" role="alert">
+              <i class="fas fa-check-circle mr-2"></i> ${data.message}
+              <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>`;
+          setTimeout(() => {
+            window.location.reload();
+          }, 1500);
+        } else {
+          alertContainer.innerHTML = `
+            <div class="alert alert-danger alert-dismissible fade show" role="alert">
+              <i class="fas fa-exclamation-circle mr-2"></i> ${data.message}
+              <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+                <span aria-hidden="true">&times;</span>
+              </button>
+            </div>`;
+        }
+      })
+      .catch(error => {
+        console.error('Error renewing token:', error);
+        alertContainer.innerHTML = `
+          <div class="alert alert-danger alert-dismissible fade show" role="alert">
+            <i class="fas fa-exclamation-triangle mr-2"></i> An error occurred while renewing the access token.
+            <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>`;
+      })
+      .finally(() => {
+        renewBtn.disabled = false;
+        renewBtn.innerHTML = originalHtml;
+      });
+    });
+  }
+});
+</script>
 
 <?php include __DIR__ . '/../includes/footer.php'; ?>
