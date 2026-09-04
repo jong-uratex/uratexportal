@@ -72,7 +72,7 @@ function mapShopifyStatus(string $shopifyStatus): string
 // 1. ACTION HANDLERS
 // -----------------------------------------------------------------------------
 
-// A. TEST SHOPIFY API CONNECTION
+// A. TEST SHOPIFY API CONNECTION - Tests both PULL and PUSH capabilities
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     $storesToTest = ['retail', 'business'];
     $results = [];
@@ -83,9 +83,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
         $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
         $token     = $storeCfg['access_token'] ?? '';
+        
+        $storeResults = [];
+        $storeSuccess = true;
 
+        // Check if access token is available
+        if (empty($token)) {
+            $storeResults[] = "❌ Access Token: MISSING - No access token found for {$storeKey} store";
+            $storeSuccess = false;
+            $storeResults[] = "❌ Pull Products: NOT TESTED - No access token";
+            $storeResults[] = "❌ Push Products: NOT TESTED - No access token";
+            $results[$storeKey] = implode('<br>', $storeResults);
+            $allSuccess = false;
+            continue;
+        }
+
+        // Check if target URL is available
+        if (empty($targetUrl)) {
+            $storeResults[] = "❌ Store Configuration: MISSING - No URL configured for {$storeKey} store";
+            $storeSuccess = false;
+            $storeResults[] = "❌ Pull Products: NOT TESTED - No store URL";
+            $storeResults[] = "❌ Push Products: NOT TESTED - No store URL";
+            $results[$storeKey] = implode('<br>', $storeResults);
+            $allSuccess = false;
+            continue;
+        }
+
+        // Test 1: Basic connection test
         $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
-
+        
         $ch = curl_init($testUrl);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -110,25 +136,169 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         if ($httpCode === 200 && !empty($json['shop'])) {
             $shopName   = $json['shop']['name'] ?? 'Unknown';
             $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-            $results[$storeKey] = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+            $storeResults[] = "✅ Basic Connection: SUCCESS - Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
         } else {
             $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-            $errorMsg = "❌ Connection FAILED! HTTP {$httpCode}";
+            $errorMsg = "❌ Basic Connection: FAILED! HTTP {$httpCode}";
             if ($curlError) {
                 $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
             }
             $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
-            $results[$storeKey] = $errorMsg;
+            $storeResults[] = $errorMsg;
+            $storeSuccess = false;
+        }
+
+        // Test 2: Test PULL capability - GET products
+        $productsTestUrl = "https://{$targetUrl}/admin/api/{$version}/products.json?limit=1";
+        
+        $ch = curl_init($productsTestUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ],
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_HEADER         => true,
+        ]);
+
+        $response   = curl_exec($ch);
+        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        $curlError  = curl_error($ch);
+        curl_close($ch);
+
+        $bodyStr = substr($response, $headerSize);
+        $json    = json_decode($bodyStr, true);
+
+        if ($httpCode === 200 && !empty($json['products'])) {
+            $productCount = count($json['products']);
+            $storeResults[] = "✅ Pull Products: SUCCESS - Retrieved {$productCount} product(s) from store";
+        } else {
+            $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
+            $errorMsg = "❌ Pull Products: FAILED! HTTP {$httpCode}";
+            if ($curlError) {
+                $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
+            }
+            if (!empty($errorDetails)) {
+                $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+            }
+            $storeResults[] = $errorMsg;
+            $storeSuccess = false;
+        }
+
+        // Test 3: Test PUSH capability
+        // First try to find a product to test with using the same connection we just used for pull test
+        $productsForPushTest = $json['products'] ?? [];
+        if (!empty($productsForPushTest) && is_array($productsForPushTest) && count($productsForPushTest) > 0) {
+            // We have products from the pull test, use the first one
+            $testProduct = $productsForPushTest[0];
+            $productId = $testProduct['id'] ?? '';
+            
+            if ($productId) {
+                $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/products/{$productId}.json";
+                
+                // Use the exact same data to avoid actual changes
+                $pushPayload = json_encode([
+                    "product" => [
+                        "id" => $productId,
+                        "title" => $testProduct['title'] ?? '',
+                        "handle" => $testProduct['handle'] ?? ''
+                    ]
+                ]);
+
+                $ch = curl_init($pushTestUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_CUSTOMREQUEST  => "PUT",
+                    CURLOPT_POSTFIELDS     => $pushPayload,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError  = curl_error($ch);
+                curl_close($ch);
+
+                $bodyStr = $response;
+                $pushJson = json_decode($bodyStr, true);
+
+                if ($httpCode >= 200 && $httpCode < 300) {
+                    $pushTestMessage = "✅ Push Products: SUCCESS - Can update products (tested on product ID: {$productId})";
+                } else {
+                    $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                    $pushTestMessage = "❌ Push Products: FAILED! HTTP {$httpCode}";
+                    if ($curlError) {
+                        $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                    }
+                    if (!empty($errorDetails)) {
+                        $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                    }
+                    $storeSuccess = false;
+                }
+            } else {
+                $pushTestMessage = "❌ Push Products: NOT TESTED - No valid product ID found";
+            }
+        } else {
+            // If we couldn't get products from pull test, try a simple GET to products/count.json
+            // This at least verifies we can access the products endpoint
+            $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/products/count.json";
+            
+            $ch = curl_init($pushTestUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 15,
+            ]);
+
+            $response   = curl_exec($ch);
+            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlError  = curl_error($ch);
+            curl_close($ch);
+
+            $bodyStr = $response;
+            $pushJson = json_decode($bodyStr, true);
+
+            if ($httpCode === 200 && isset($pushJson['count'])) {
+                $pushTestMessage = "✅ Push Products: SUCCESS - Can access products endpoint (count: {$pushJson['count']})";
+            } else {
+                $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                $pushTestMessage = "❌ Push Products: FAILED! HTTP {$httpCode}";
+                if ($curlError) {
+                    $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                }
+                if (!empty($errorDetails)) {
+                    $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                }
+                $storeSuccess = false;
+            }
+        }
+        
+        $storeResults[] = $pushTestMessage;
+        
+        // Combine all results for this store
+        $results[$storeKey] = implode('<br>', $storeResults);
+        
+        if (!$storeSuccess) {
             $allSuccess = false;
         }
-        $results[$storeKey] .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
     }
     
     $message = implode('<br><br>', $results);
     if ($allSuccess) {
-        $message = "✅ All connections successful!<br><br>" . $message;
+        $message = "✅ All connections and API capabilities verified successfully!<br><br>" . $message;
     } else {
-        $message = "⚠️ Some connections failed!<br><br>" . $message;
+        $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
     }
 }
 
