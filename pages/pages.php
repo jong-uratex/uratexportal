@@ -166,50 +166,68 @@ if ($db) {
 // A. TEST CONNECTION
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     try {
-        $targetUrl = getShopifyAdminDomain($shopCfg, $activeStore);
-        $version   = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
-        $token     = $shopCfg['access_token'] ?? '';
+        $storesToTest = ['retail', 'business'];
+        $results = [];
+        $allSuccess = true;
+        
+        foreach ($storesToTest as $storeKey) {
+            $storeCfg = $shopConfig[$storeKey] ?? [];
+            $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
+            $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
+            $token     = $storeCfg['access_token'] ?? '';
 
-        if (empty($token)) {
-            throw new Exception('Access token is empty for the active store.');
-        }
-
-        $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
-
-        $ch = curl_init($testUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER     => [
-                "X-Shopify-Access-Token: {$token}",
-                "Content-Type: application/json"
-            ],
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_TIMEOUT        => 15,
-            CURLOPT_HEADER         => true,
-        ]);
-
-        $response   = curl_exec($ch);
-        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-        $curlError  = curl_error($ch);
-        curl_close($ch);
-
-        $bodyStr = substr($response, $headerSize);
-        $json    = json_decode($bodyStr, true);
-
-        if ($httpCode === 200 && !empty($json['shop'])) {
-            $shopName   = $json['shop']['name'] ?? 'Unknown';
-            $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-            $message = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
-        } else {
-            $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-            $message = "❌ Connection FAILED! HTTP {$httpCode}";
-            if ($curlError) {
-                $message .= " | cURL: " . htmlspecialchars($curlError);
+            if (empty($token)) {
+                $results[$storeKey] = "❌ Connection FAILED! Access token is empty for {$storeKey} store.";
+                $allSuccess = false;
+                continue;
             }
-            $message .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+
+            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+
+            $ch = curl_init($testUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 15,
+                CURLOPT_HEADER         => true,
+            ]);
+
+            $response   = curl_exec($ch);
+            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $curlError  = curl_error($ch);
+            curl_close($ch);
+
+            $bodyStr = substr($response, $headerSize);
+            $json    = json_decode($bodyStr, true);
+
+            if ($httpCode === 200 && !empty($json['shop'])) {
+                $shopName   = $json['shop']['name'] ?? 'Unknown';
+                $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
+                $results[$storeKey] = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+            } else {
+                $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
+                $errorMsg = "❌ Connection FAILED! HTTP {$httpCode}";
+                if ($curlError) {
+                    $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
+                }
+                $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                $results[$storeKey] = $errorMsg;
+                $allSuccess = false;
+            }
+            $results[$storeKey] .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
         }
-        $message .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
+        
+        $message = implode('<br><br>', $results);
+        if ($allSuccess) {
+            $message = "✅ All connections successful!<br><br>" . $message;
+        } else {
+            $message = "⚠️ Some connections failed!<br><br>" . $message;
+        }
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
     }
