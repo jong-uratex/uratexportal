@@ -96,6 +96,9 @@ if ($db) {
                 `total_spent` DECIMAL(12,2) DEFAULT 0.00,
                 `shipping_city` VARCHAR(255) NULL DEFAULT NULL,
                 `shipping_zip` VARCHAR(50) NULL DEFAULT NULL,
+                `products_ordered` TEXT NULL DEFAULT NULL,
+                `latest_order_date` DATETIME NULL DEFAULT NULL,
+                `fulfillment_status` VARCHAR(255) NULL DEFAULT NULL,
                 `created_at` DATETIME NULL DEFAULT NULL,
                 `updated_at` DATETIME NULL DEFAULT NULL,
                 `last_synced_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -108,6 +111,15 @@ if ($db) {
                 KEY `idx_accepts_email` (`accepts_email_marketing`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
+
+        // Add new columns to existing table if they don't exist
+        try {
+            $db->exec("ALTER TABLE `shopify_customers` ADD COLUMN IF NOT EXISTS `products_ordered` TEXT NULL DEFAULT NULL");
+            $db->exec("ALTER TABLE `shopify_customers` ADD COLUMN IF NOT EXISTS `latest_order_date` DATETIME NULL DEFAULT NULL");
+            $db->exec("ALTER TABLE `shopify_customers` ADD COLUMN IF NOT EXISTS `fulfillment_status` VARCHAR(255) NULL DEFAULT NULL");
+        } catch (PDOException $e) {
+            // Ignore errors if columns already exist
+        }
 
         $db->exec("
             CREATE TABLE IF NOT EXISTS `shopify_orders` (
@@ -270,6 +282,40 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                 $orderPageNum++;
             }
 
+            // Pre-process orders to aggregate data by customer for products, dates, and fulfillment status
+            $customerOrderData = [];
+            foreach ($allOrders as $order) {
+                $customerId = $order['customer']['id'] ?? 0;
+                if ($customerId == 0) continue;
+                
+                if (!isset($customerOrderData[$customerId])) {
+                    $customerOrderData[$customerId] = [
+                        'products' => [],
+                        'dates' => [],
+                        'statuses' => []
+                    ];
+                }
+                
+                // Extract product names from line_items
+                if (!empty($order['line_items']) && is_array($order['line_items'])) {
+                    foreach ($order['line_items'] as $item) {
+                        if (!empty($item['name'])) {
+                            $customerOrderData[$customerId]['products'][] = $item['name'];
+                        }
+                    }
+                }
+                
+                // Extract order date
+                if (!empty($order['created_at'])) {
+                    $customerOrderData[$customerId]['dates'][] = $order['created_at'];
+                }
+                
+                // Extract fulfillment status
+                if (!empty($order['fulfillment_status'])) {
+                    $customerOrderData[$customerId]['statuses'][] = $order['fulfillment_status'];
+                }
+            }
+
             // Save customers into shopify_customers
             if ($db && !empty($allCustomers)) {
                 $insertStmt = $db->prepare("
@@ -277,11 +323,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                         store_key, shopify_customer_id, email, first_name, last_name,
                         phone, accepts_sms_marketing, accepts_email_marketing,
                         total_orders, total_spent, shipping_city, shipping_zip,
+                        products_ordered, latest_order_date, fulfillment_status,
                         created_at, updated_at, last_synced_at
                     ) VALUES (
                         :store, :cid, :email, :first_name, :last_name,
                         :phone, :sms_marketing, :email_marketing,
                         :total_orders, :total_spent, :shipping_city, :shipping_zip,
+                        :products_ordered, :latest_order_date, :fulfillment_status,
                         :created_at, :updated_at, NOW()
                     )
                     ON DUPLICATE KEY UPDATE
@@ -295,6 +343,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                         total_spent = VALUES(total_spent),
                         shipping_city = VALUES(shipping_city),
                         shipping_zip = VALUES(shipping_zip),
+                        products_ordered = VALUES(products_ordered),
+                        latest_order_date = VALUES(latest_order_date),
+                        fulfillment_status = VALUES(fulfillment_status),
                         created_at = VALUES(created_at),
                         updated_at = VALUES(updated_at),
                         last_synced_at = NOW()
@@ -340,6 +391,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                     $createdAt = !empty($customer['created_at']) ? date('Y-m-d H:i:s', strtotime($customer['created_at'])) : null;
                     $updatedAt = !empty($customer['updated_at']) ? date('Y-m-d H:i:s', strtotime($customer['updated_at'])) : null;
 
+                    // Get aggregated order data for this customer
+                    $orderData = $customerOrderData[$cid] ?? ['products' => [], 'dates' => [], 'statuses' => []];
+                    $productsOrdered = !empty($orderData['products']) ? implode(', ', array_unique($orderData['products'])) : null;
+                    $latestOrderDate = !empty($orderData['dates']) ? date('Y-m-d H:i:s', strtotime(max($orderData['dates']))) : null;
+                    $fulfillmentStatusValue = !empty($orderData['statuses']) ? implode(', ', array_unique($orderData['statuses'])) : null;
+
                     $insertStmt->execute([
                         ':store'           => $activeStore,
                         ':cid'             => $cid,
@@ -353,6 +410,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                         ':total_spent'     => $totalSpent,
                         ':shipping_city'   => $shippingCity,
                         ':shipping_zip'    => $shippingZip,
+                        ':products_ordered' => $productsOrdered,
+                        ':latest_order_date' => $latestOrderDate,
+                        ':fulfillment_status' => $fulfillmentStatusValue,
                         ':created_at'      => $createdAt,
                         ':updated_at'      => $updatedAt
                     ]);
@@ -473,46 +533,62 @@ if ($db) {
         $stmt->execute();
         $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Enrich with order data from shopify_orders
+        // Use stored aggregated fields or enrich with order data if not available
         foreach ($customers as &$customer) {
-            $customerId = $customer['shopify_customer_id'];
+            // Use stored fields if available, otherwise fall back to calculating from orders
+            if (empty($customer['products_ordered']) || empty($customer['fulfillment_status']) || empty($customer['latest_order_date'])) {
+                $customerId = $customer['shopify_customer_id'];
 
-            $orderStmt = $db->prepare("
-                SELECT * FROM shopify_orders
-                WHERE store_key = :store AND customer_id = :customer_id
-                ORDER BY created_at DESC
-            ");
-            $orderStmt->execute([
-                ':store'       => $activeStore,
-                ':customer_id' => $customerId
-            ]);
-            $orders = $orderStmt->fetchAll(PDO::FETCH_ASSOC);
+                $orderStmt = $db->prepare("
+                    SELECT * FROM shopify_orders
+                    WHERE store_key = :store AND customer_id = :customer_id
+                    ORDER BY created_at DESC
+                ");
+                $orderStmt->execute([
+                    ':store'       => $activeStore,
+                    ':customer_id' => $customerId
+                ]);
+                $orders = $orderStmt->fetchAll(PDO::FETCH_ASSOC);
 
-            $productNames        = [];
-            $fulfillmentStatuses = [];
-            $orderDates          = [];
+                $productNames        = [];
+                $fulfillmentStatuses = [];
+                $orderDates          = [];
 
-            foreach ($orders as $order) {
-                $lineItems = json_decode($order['line_items'] ?? '[]', true);
-                if (is_array($lineItems)) {
-                    foreach ($lineItems as $item) {
-                        if (!empty($item['name'])) {
-                            $productNames[] = $item['name'];
+                foreach ($orders as $order) {
+                    $lineItems = json_decode($order['line_items'] ?? '[]', true);
+                    if (is_array($lineItems)) {
+                        foreach ($lineItems as $item) {
+                            if (!empty($item['name'])) {
+                                $productNames[] = $item['name'];
+                            }
                         }
                     }
+                    if (!empty($order['fulfillment_status'])) {
+                        $fulfillmentStatuses[] = $order['fulfillment_status'];
+                    }
+                    if (!empty($order['created_at'])) {
+                        $orderDates[] = $order['created_at'];
+                    }
                 }
-                if (!empty($order['fulfillment_status'])) {
-                    $fulfillmentStatuses[] = $order['fulfillment_status'];
-                }
-                if (!empty($order['created_at'])) {
-                    $orderDates[] = $order['created_at'];
-                }
-            }
 
-            $customer['product_names']      = implode(', ', array_unique($productNames));
-            $customer['fulfillment_status'] = !empty($fulfillmentStatuses) ? implode(', ', array_unique($fulfillmentStatuses)) : 'No Orders';
-            $customer['order_count']        = count($orders);
-            $customer['latest_order_date']  = !empty($orderDates) ? end($orderDates) : '';
+                // Only set if not already stored
+                if (empty($customer['products_ordered'])) {
+                    $customer['product_names'] = !empty($productNames) ? implode(', ', array_unique($productNames)) : 'No products';
+                } else {
+                    $customer['product_names'] = $customer['products_ordered'];
+                }
+                if (empty($customer['fulfillment_status'])) {
+                    $customer['fulfillment_status'] = !empty($fulfillmentStatuses) ? implode(', ', array_unique($fulfillmentStatuses)) : 'No Orders';
+                }
+                if (empty($customer['latest_order_date'])) {
+                    $customer['latest_order_date'] = !empty($orderDates) ? end($orderDates) : '';
+                }
+                $customer['order_count'] = count($orders);
+            } else {
+                // Use stored fields
+                $customer['product_names'] = $customer['products_ordered'];
+                $customer['order_count'] = (int)($customer['total_orders'] ?? 0);
+            }
         }
         unset($customer);
     } catch (Exception $e) {
@@ -647,41 +723,16 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             $allCustomers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             foreach ($allCustomers as $customer) {
-                $customerId = $customer['shopify_customer_id'];
-
-                $orderStmt = $db->prepare("
-                    SELECT * FROM shopify_orders
-                    WHERE store_key = :store AND customer_id = :customer_id
-                    ORDER BY created_at DESC
-                ");
-                $orderStmt->execute([
-                    ':store'       => $activeStore,
-                    ':customer_id' => $customerId
-                ]);
-                $orders = $orderStmt->fetchAll(PDO::FETCH_ASSOC);
-
-                $productNames        = [];
-                $fulfillmentStatuses = [];
-                $orderDates          = [];
-
-                foreach ($orders as $order) {
-                    $lineItems = json_decode($order['line_items'] ?? '[]', true);
-                    if (is_array($lineItems)) {
-                        foreach ($lineItems as $item) {
-                            if (!empty($item['name'])) {
-                                $productNames[] = $item['name'];
-                            }
-                        }
-                    }
-                    if (!empty($order['fulfillment_status'])) {
-                        $fulfillmentStatuses[] = $order['fulfillment_status'];
-                    }
-                    if (!empty($order['created_at'])) {
-                        $orderDates[] = $order['created_at'];
-                    }
+                // Get order count for this customer
+                $orderCount = 0;
+                if (!empty($customer['total_orders'])) {
+                    $orderCount = (int)$customer['total_orders'];
+                } else {
+                    $orderStmt = $db->prepare("SELECT COUNT(*) as cnt FROM shopify_orders WHERE store_key = :store AND customer_id = :customer_id");
+                    $orderStmt->execute([':store' => $activeStore, ':customer_id' => $customer['shopify_customer_id']]);
+                    $result = $orderStmt->fetch(PDO::FETCH_ASSOC);
+                    $orderCount = (int)($result['cnt'] ?? 0);
                 }
-
-                $latestDate = !empty($orderDates) ? end($orderDates) : '';
 
                 fputcsv($output, [
                     $customer['shopify_customer_id'] ?? '',
@@ -691,10 +742,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                     $customer['phone'] ?? '',
                     $customer['shipping_city'] ?? '',
                     $customer['shipping_zip'] ?? '',
-                    !empty($productNames) ? implode(', ', array_unique($productNames)) : 'No products',
-                    count($orders),
-                    $latestDate,
-                    !empty($fulfillmentStatuses) ? implode(', ', array_unique($fulfillmentStatuses)) : 'No Orders',
+                    $customer['products_ordered'] ?? 'No products',
+                    $orderCount,
+                    $customer['latest_order_date'] ?? '',
+                    $customer['fulfillment_status'] ?? 'No Orders',
                     !empty($customer['accepts_sms_marketing']) ? 'Yes' : 'No',
                     !empty($customer['accepts_email_marketing']) ? 'Yes' : 'No'
                 ]);
