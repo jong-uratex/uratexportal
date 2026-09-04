@@ -77,11 +77,10 @@ function buildExtraQuery(string $search, bool $filterSms, bool $filterEmail): st
 }
 
 // -----------------------------------------------------------------------------
-// AUTO-CREATE / MIGRATE TABLE
+// AUTO-CREATE / MIGRATE TABLE (safe – IF NOT EXISTS)
 // -----------------------------------------------------------------------------
 if ($db) {
     try {
-        // Create customers table if it doesn't exist
         $db->exec("
             CREATE TABLE IF NOT EXISTS `shopify_customers` (
                 `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -91,8 +90,8 @@ if ($db) {
                 `first_name` VARCHAR(255) NULL DEFAULT NULL,
                 `last_name` VARCHAR(255) NULL DEFAULT NULL,
                 `phone` VARCHAR(50) NULL DEFAULT NULL,
-                `accepts_sms_marketing` BOOLEAN DEFAULT FALSE,
-                `accepts_email_marketing` BOOLEAN DEFAULT FALSE,
+                `accepts_sms_marketing` TINYINT(1) DEFAULT 0,
+                `accepts_email_marketing` TINYINT(1) DEFAULT 0,
                 `total_orders` INT UNSIGNED DEFAULT 0,
                 `total_spent` DECIMAL(12,2) DEFAULT 0.00,
                 `shipping_city` VARCHAR(255) NULL DEFAULT NULL,
@@ -104,11 +103,12 @@ if ($db) {
                 UNIQUE KEY `uq_store_customer` (`store_key`, `shopify_customer_id`),
                 KEY `idx_customers_store` (`store_key`),
                 KEY `idx_customers_email` (`email`),
-                KEY `idx_customers_name` (`last_name`, `first_name`)
+                KEY `idx_customers_name` (`last_name`, `first_name`),
+                KEY `idx_accepts_sms` (`accepts_sms_marketing`),
+                KEY `idx_accepts_email` (`accepts_email_marketing`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
 
-        // Create orders table if it doesn't exist
         $db->exec("
             CREATE TABLE IF NOT EXISTS `shopify_orders` (
                 `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -138,7 +138,7 @@ if ($db) {
 }
 
 // -----------------------------------------------------------------------------
-// SYNC CUSTOMERS FROM SHOPIFY API (kept for backend use; button removed from UI)
+// SYNC CUSTOMERS DATA FROM SHOPIFY API
 // -----------------------------------------------------------------------------
 if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
     $targetUrl = getShopifyAdminDomain($shopCfg, $activeStore);
@@ -146,18 +146,22 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
     $token     = $shopCfg['access_token'] ?? '';
 
     if (empty($targetUrl) || empty($token)) {
-        $message     = 'Store configuration or access token missing for retail store.';
+        $message     = 'Store configuration or access token missing for retail store. Please check Settings.';
         $messageType = 'danger';
     } else {
         try {
             $allCustomers = [];
-            $cursor       = null;
+            $pageInfo     = null;
             $hasMore      = true;
+            $pageNum      = 1;
 
-            // Fetch customers with cursor pagination
-            while ($hasMore) {
-                $endpoint = '/admin/api/' . $version . '/customers.json?limit=250' . ($cursor ? '&cursor=' . urlencode($cursor) : '');
-                $url      = "https://{$targetUrl}{$endpoint}";
+            // Fetch customers with proper Shopify cursor pagination (Link header)
+            while ($hasMore && $pageNum <= 50) {
+                $endpoint = '/admin/api/' . $version . '/customers.json?limit=250';
+                if ($pageInfo) {
+                    $endpoint .= '&page_info=' . urlencode($pageInfo);
+                }
+                $url = "https://{$targetUrl}{$endpoint}";
 
                 $headers = [
                     "Content-Type: application/json",
@@ -168,33 +172,57 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+                curl_setopt($ch, CURLOPT_HEADER, true);
 
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $rawResponse = curl_exec($ch);
+                $httpCode    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $headerSize  = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
                 curl_close($ch);
 
-                if ($httpCode === 200) {
-                    $data = json_decode($response, true);
-                    if (!empty($data['customers'])) {
-                        $allCustomers = array_merge($allCustomers, $data['customers']);
-                    }
-                    $cursor  = $data['next_page_cursor'] ?? null;
-                    $hasMore = $cursor !== null;
-                } else {
-                    $errorData = json_decode($response, true);
-                    throw new Exception('API Error: ' . ($errorData['errors'] ?? 'HTTP ' . $httpCode));
+                $headerStr = substr($rawResponse, 0, $headerSize);
+                $body      = substr($rawResponse, $headerSize);
+
+                if ($httpCode !== 200) {
+                    $errorData = json_decode($body, true);
+                    throw new Exception('API Error (customers): ' . ($errorData['errors'] ?? 'HTTP ' . $httpCode));
                 }
+
+                $data = json_decode($body, true);
+                if (!empty($data['customers'])) {
+                    $allCustomers = array_merge($allCustomers, $data['customers']);
+                }
+
+                // Parse Link header for next page_info
+                $pageInfo = null;
+                $hasMore  = false;
+                if (preg_match('/<([^>]+)>;\s*rel="next"/i', $headerStr, $m)) {
+                    $nextUrl = $m[1];
+                    if (preg_match('/page_info=([^&]+)/', $nextUrl, $pm)) {
+                        $pageInfo = $pm[1];
+                        $hasMore  = true;
+                    }
+                }
+
+                if (empty($data['customers']) || count($data['customers']) < 250) {
+                    $hasMore = false;
+                }
+
+                $pageNum++;
             }
 
-            // Also fetch orders to get fulfillment status and order details
+            // Fetch orders
             $allOrders     = [];
-            $orderCursor   = null;
+            $orderPageInfo = null;
             $hasMoreOrders = true;
+            $orderPageNum  = 1;
 
-            while ($hasMoreOrders) {
-                $endpoint = '/admin/api/' . $version . '/orders.json?limit=250' . ($orderCursor ? '&cursor=' . urlencode($orderCursor) : '');
-                $url      = "https://{$targetUrl}{$endpoint}";
+            while ($hasMoreOrders && $orderPageNum <= 50) {
+                $endpoint = '/admin/api/' . $version . '/orders.json?limit=250&status=any';
+                if ($orderPageInfo) {
+                    $endpoint .= '&page_info=' . urlencode($orderPageInfo);
+                }
+                $url = "https://{$targetUrl}{$endpoint}";
 
                 $headers = [
                     "Content-Type: application/json",
@@ -205,25 +233,44 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+                curl_setopt($ch, CURLOPT_HEADER, true);
 
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $rawResponse = curl_exec($ch);
+                $httpCode    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $headerSize  = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
                 curl_close($ch);
 
-                if ($httpCode === 200) {
-                    $data = json_decode($response, true);
-                    if (!empty($data['orders'])) {
-                        $allOrders = array_merge($allOrders, $data['orders']);
-                    }
-                    $orderCursor   = $data['next_page_cursor'] ?? null;
-                    $hasMoreOrders = $orderCursor !== null;
-                } else {
-                    break; // Skip orders if we can't fetch them
+                $headerStr = substr($rawResponse, 0, $headerSize);
+                $body      = substr($rawResponse, $headerSize);
+
+                if ($httpCode !== 200) {
+                    break; // Don't fail entire sync if orders fail
                 }
+
+                $data = json_decode($body, true);
+                if (!empty($data['orders'])) {
+                    $allOrders = array_merge($allOrders, $data['orders']);
+                }
+
+                $orderPageInfo = null;
+                $hasMoreOrders = false;
+                if (preg_match('/<([^>]+)>;\s*rel="next"/i', $headerStr, $m)) {
+                    $nextUrl = $m[1];
+                    if (preg_match('/page_info=([^&]+)/', $nextUrl, $pm)) {
+                        $orderPageInfo = $pm[1];
+                        $hasMoreOrders = true;
+                    }
+                }
+
+                if (empty($data['orders']) || count($data['orders']) < 250) {
+                    $hasMoreOrders = false;
+                }
+
+                $orderPageNum++;
             }
 
-            // Save customers to database
+            // Save customers into shopify_customers
             if ($db && !empty($allCustomers)) {
                 $insertStmt = $db->prepare("
                     INSERT INTO shopify_customers (
@@ -254,31 +301,44 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                 ");
 
                 foreach ($allCustomers as $customer) {
-                    $cid          = $customer['id'] ?? 0;
-                    $email        = $customer['email'] ?? '';
-                    $firstName    = $customer['first_name'] ?? '';
-                    $lastName     = $customer['last_name'] ?? '';
-                    $phone        = $customer['phone'] ?? '';
-                    $acceptsSms   = !empty($customer['accepts_sms_marketing']) ? 1 : 0;
-                    $acceptsEmail = !empty($customer['accepts_email_marketing']) ? 1 : 0;
-                    $totalOrders  = (int)($customer['orders_count'] ?? 0);
-                    $totalSpent   = (float)($customer['total_spent'] ?? 0);
+                    $cid       = $customer['id'] ?? 0;
+                    $email     = $customer['email'] ?? '';
+                    $firstName = $customer['first_name'] ?? '';
+                    $lastName  = $customer['last_name'] ?? '';
+                    $phone     = $customer['phone'] ?? '';
 
-                    // Get shipping address
+                    // Marketing consent – support both old and new Shopify fields
+                    $acceptsEmail = 0;
+                    if (isset($customer['email_marketing_consent']['state'])) {
+                        $acceptsEmail = (strtolower($customer['email_marketing_consent']['state']) === 'subscribed') ? 1 : 0;
+                    } elseif (!empty($customer['accepts_marketing'])) {
+                        $acceptsEmail = 1;
+                    } elseif (!empty($customer['accepts_email_marketing'])) {
+                        $acceptsEmail = 1;
+                    }
+
+                    $acceptsSms = 0;
+                    if (isset($customer['sms_marketing_consent']['state'])) {
+                        $acceptsSms = (strtolower($customer['sms_marketing_consent']['state']) === 'subscribed') ? 1 : 0;
+                    } elseif (!empty($customer['accepts_sms_marketing'])) {
+                        $acceptsSms = 1;
+                    }
+
+                    $totalOrders = (int)($customer['orders_count'] ?? 0);
+                    $totalSpent  = (float)($customer['total_spent'] ?? 0);
+
                     $shippingCity = '';
                     $shippingZip  = '';
                     if (!empty($customer['default_address'])) {
-                        $defaultAddress = $customer['default_address'];
-                        $shippingCity   = $defaultAddress['city'] ?? '';
-                        $shippingZip    = $defaultAddress['zip'] ?? '';
-                    } elseif (!empty($customer['addresses']) && is_array($customer['addresses'])) {
-                        $firstAddress = $customer['addresses'][0] ?? [];
-                        $shippingCity = $firstAddress['city'] ?? '';
-                        $shippingZip  = $firstAddress['zip'] ?? '';
+                        $shippingCity = $customer['default_address']['city'] ?? '';
+                        $shippingZip  = $customer['default_address']['zip'] ?? '';
+                    } elseif (!empty($customer['addresses'][0])) {
+                        $shippingCity = $customer['addresses'][0]['city'] ?? '';
+                        $shippingZip  = $customer['addresses'][0]['zip'] ?? '';
                     }
 
-                    $createdAt = $customer['created_at'] ?? null;
-                    $updatedAt = $customer['updated_at'] ?? null;
+                    $createdAt = !empty($customer['created_at']) ? date('Y-m-d H:i:s', strtotime($customer['created_at'])) : null;
+                    $updatedAt = !empty($customer['updated_at']) ? date('Y-m-d H:i:s', strtotime($customer['updated_at'])) : null;
 
                     $insertStmt->execute([
                         ':store'           => $activeStore,
@@ -298,7 +358,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                     ]);
                 }
 
-                // Save orders to database
+                // Save orders into shopify_orders
                 if (!empty($allOrders)) {
                     $insertOrderStmt = $db->prepare("
                         INSERT INTO shopify_orders (
@@ -327,20 +387,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                     foreach ($allOrders as $order) {
                         $oid               = $order['id'] ?? 0;
                         $customerId        = $order['customer']['id'] ?? 0;
-                        $orderNumber       = $order['name'] ?? $order['order_number'] ?? '';
+                        $orderNumber       = $order['name'] ?? ($order['order_number'] ?? '');
                         $totalPrice        = (float)($order['total_price'] ?? 0);
                         $financialStatus   = $order['financial_status'] ?? '';
                         $fulfillmentStatus = $order['fulfillment_status'] ?? '';
-                        $createdAt         = $order['created_at'] ?? null;
-                        $updatedAt         = $order['updated_at'] ?? null;
+                        $createdAt         = !empty($order['created_at']) ? date('Y-m-d H:i:s', strtotime($order['created_at'])) : null;
+                        $updatedAt         = !empty($order['updated_at']) ? date('Y-m-d H:i:s', strtotime($order['updated_at'])) : null;
                         $lineItems         = json_encode($order['line_items'] ?? []);
 
                         $shippingCity = '';
                         $shippingZip  = '';
                         if (!empty($order['shipping_address'])) {
-                            $shippingAddress = $order['shipping_address'];
-                            $shippingCity    = $shippingAddress['city'] ?? '';
-                            $shippingZip     = $shippingAddress['zip'] ?? '';
+                            $shippingCity = $order['shipping_address']['city'] ?? '';
+                            $shippingZip  = $order['shipping_address']['zip'] ?? '';
                         }
 
                         $insertOrderStmt->execute([
@@ -360,11 +419,15 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
                     }
                 }
 
-                $message     = 'Successfully synced ' . count($allCustomers) . ' customers and ' . count($allOrders) . ' orders from retail store.';
+                $message     = 'Successfully synced ' . count($allCustomers) . ' customers and ' . count($allOrders) . ' orders from retail store into the database.';
                 $messageType = 'success';
 
-                // Log the action
-                recordUserLog('Sync Customers', 'Shopify API', "Synced " . count($allCustomers) . " customers and " . count($allOrders) . " orders from retail store");
+                if (function_exists('recordUserLog')) {
+                    recordUserLog('Sync Customers', 'Shopify API', "Synced " . count($allCustomers) . " customers and " . count($allOrders) . " orders from retail store");
+                }
+            } else {
+                $message     = 'No customers returned from Shopify API.';
+                $messageType = 'warning';
             }
         } catch (Exception $e) {
             $message     = 'Error syncing customers: ' . $e->getMessage();
@@ -374,14 +437,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_customers') {
 }
 
 // -----------------------------------------------------------------------------
-// FETCH CUSTOMERS FROM DATABASE
+// FETCH CUSTOMERS FROM DATABASE (shopify_customers table)
 // -----------------------------------------------------------------------------
 $customers = [];
 $totalRows = 0;
 
 if ($db) {
     try {
-        // Base WHERE clause
         $where  = "store_key = :store";
         $params = [':store' => $activeStore];
 
@@ -396,13 +458,11 @@ if ($db) {
             $where .= " AND accepts_email_marketing = 1";
         }
 
-        // Total count for pagination
         $countStmt = $db->prepare("SELECT COUNT(*) as total FROM shopify_customers WHERE {$where}");
         $countStmt->execute($params);
         $countResult = $countStmt->fetch(PDO::FETCH_ASSOC);
         $totalRows   = (int)($countResult['total'] ?? 0);
 
-        // Paginated customers
         $query = "SELECT * FROM shopify_customers WHERE {$where} ORDER BY last_name, first_name LIMIT :limit OFFSET :offset";
         $stmt  = $db->prepare($query);
         $stmt->bindValue(':limit', $perPage, PDO::PARAM_INT);
@@ -413,12 +473,15 @@ if ($db) {
         $stmt->execute();
         $customers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Enrich each customer with order data
+        // Enrich with order data from shopify_orders
         foreach ($customers as &$customer) {
             $customerId = $customer['shopify_customer_id'];
 
-            $orderQuery = "SELECT * FROM shopify_orders WHERE store_key = :store AND customer_id = :customer_id ORDER BY created_at DESC";
-            $orderStmt  = $db->prepare($orderQuery);
+            $orderStmt = $db->prepare("
+                SELECT * FROM shopify_orders
+                WHERE store_key = :store AND customer_id = :customer_id
+                ORDER BY created_at DESC
+            ");
             $orderStmt->execute([
                 ':store'       => $activeStore,
                 ':customer_id' => $customerId
@@ -430,8 +493,8 @@ if ($db) {
             $orderDates          = [];
 
             foreach ($orders as $order) {
-                $lineItems = json_decode($order['line_items'], true);
-                if (!empty($lineItems) && is_array($lineItems)) {
+                $lineItems = json_decode($order['line_items'] ?? '[]', true);
+                if (is_array($lineItems)) {
                     foreach ($lineItems as $item) {
                         if (!empty($item['name'])) {
                             $productNames[] = $item['name'];
@@ -447,17 +510,11 @@ if ($db) {
             }
 
             $customer['product_names']      = implode(', ', array_unique($productNames));
-            $customer['fulfillment_status'] = !empty($fulfillmentStatuses) ? implode(', ', $fulfillmentStatuses) : 'No Orders';
+            $customer['fulfillment_status'] = !empty($fulfillmentStatuses) ? implode(', ', array_unique($fulfillmentStatuses)) : 'No Orders';
             $customer['order_count']        = count($orders);
-            $customer['order_dates']        = !empty($orderDates) ? implode(', ', $orderDates) : '';
             $customer['latest_order_date']  = !empty($orderDates) ? end($orderDates) : '';
-
-            $customer['shipping_info'] = '';
-            if (!empty($customer['shipping_city']) || !empty($customer['shipping_zip'])) {
-                $customer['shipping_info'] = trim($customer['shipping_city'] . ' ' . $customer['shipping_zip']);
-            }
         }
-        unset($customer); // break reference
+        unset($customer);
     } catch (Exception $e) {
         $customers = [];
         $totalRows = 0;
@@ -468,7 +525,7 @@ $totalPages = (int)ceil(max(1, $totalRows) / $perPage);
 $extraQuery = buildExtraQuery($search, $filterSms, $filterEmail);
 
 // -----------------------------------------------------------------------------
-// TEST CONNECTION FUNCTIONALITY
+// TEST CONNECTION
 // -----------------------------------------------------------------------------
 $testResults = [];
 $allSuccess  = true;
@@ -481,24 +538,21 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     $results    = [];
     $allSuccess = true;
 
-    // Test Pull Customers
     if (empty($token)) {
-        $results[]  = "❌ Access Token: MISSING - No access token found for retail store";
+        $results[]  = "❌ Access Token: MISSING – No access token found for retail store";
         $allSuccess = false;
     } else {
+        // Customers count
         $testUrl = "https://{$targetUrl}/admin/api/{$version}/customers/count.json";
-
         $headers = [
             "Content-Type: application/json",
             "X-Shopify-Access-Token: {$token}"
         ];
-
         $ch = curl_init($testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
@@ -506,28 +560,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         if ($httpCode === 200) {
             $data      = json_decode($response, true);
             $count     = $data['count'] ?? 0;
-            $results[] = "✅ Pull Customers: SUCCESS - Found {$count} customers in retail store";
+            $results[] = "✅ Pull Customers: SUCCESS – Found {$count} customers in retail store";
         } else {
-            $results[]  = "❌ Pull Customers: FAILED - HTTP {$httpCode}";
+            $results[]  = "❌ Pull Customers: FAILED – HTTP {$httpCode}";
             $allSuccess = false;
         }
-    }
 
-    // Test Pull Orders
-    if (!empty($token)) {
-        $testUrl = "https://{$targetUrl}/admin/api/{$version}/orders/count.json";
-
-        $headers = [
-            "Content-Type: application/json",
-            "X-Shopify-Access-Token: {$token}"
-        ];
-
+        // Orders count
+        $testUrl = "https://{$targetUrl}/admin/api/{$version}/orders/count.json?status=any";
         $ch = curl_init($testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
@@ -535,25 +580,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         if ($httpCode === 200) {
             $data      = json_decode($response, true);
             $count     = $data['count'] ?? 0;
-            $results[] = "✅ Pull Orders: SUCCESS - Found {$count} orders in retail store";
+            $results[] = "✅ Pull Orders: SUCCESS – Found {$count} orders in retail store";
         } else {
-            $results[]  = "❌ Pull Orders: FAILED - HTTP {$httpCode}";
+            $results[]  = "❌ Pull Orders: FAILED – HTTP {$httpCode}";
             $allSuccess = false;
         }
     }
 
     $testResults = $results;
-    if ($allSuccess) {
-        $message     = 'Connection test passed for retail store!';
-        $messageType = 'success';
-    } else {
-        $message     = 'Connection test failed for retail store.';
-        $messageType = 'danger';
-    }
+    $message     = $allSuccess ? 'Connection test passed for retail store!' : 'Connection test failed for retail store.';
+    $messageType = $allSuccess ? 'success' : 'danger';
 }
 
 // -----------------------------------------------------------------------------
-// CSV EXPORT HANDLER (must run before any HTML output)
+// CSV EXPORT (for the Accepts SMS / Accepts Email buttons only)
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     $filename = 'retail_customers';
@@ -570,7 +610,6 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
 
     $output = fopen('php://output', 'w');
 
-    // CSV Header (same columns as the table view)
     fputcsv($output, [
         'Customer ID',
         'Last Name',
@@ -603,16 +642,18 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                 $where .= " AND accepts_email_marketing = 1";
             }
 
-            $query = "SELECT * FROM shopify_customers WHERE {$where} ORDER BY last_name, first_name";
-            $stmt  = $db->prepare($query);
+            $stmt = $db->prepare("SELECT * FROM shopify_customers WHERE {$where} ORDER BY last_name, first_name");
             $stmt->execute($params);
             $allCustomers = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             foreach ($allCustomers as $customer) {
                 $customerId = $customer['shopify_customer_id'];
 
-                $orderQuery = "SELECT * FROM shopify_orders WHERE store_key = :store AND customer_id = :customer_id ORDER BY created_at DESC";
-                $orderStmt  = $db->prepare($orderQuery);
+                $orderStmt = $db->prepare("
+                    SELECT * FROM shopify_orders
+                    WHERE store_key = :store AND customer_id = :customer_id
+                    ORDER BY created_at DESC
+                ");
                 $orderStmt->execute([
                     ':store'       => $activeStore,
                     ':customer_id' => $customerId
@@ -624,8 +665,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                 $orderDates          = [];
 
                 foreach ($orders as $order) {
-                    $lineItems = json_decode($order['line_items'], true);
-                    if (!empty($lineItems) && is_array($lineItems)) {
+                    $lineItems = json_decode($order['line_items'] ?? '[]', true);
+                    if (is_array($lineItems)) {
                         foreach ($lineItems as $item) {
                             if (!empty($item['name'])) {
                                 $productNames[] = $item['name'];
@@ -653,7 +694,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                     !empty($productNames) ? implode(', ', array_unique($productNames)) : 'No products',
                     count($orders),
                     $latestDate,
-                    !empty($fulfillmentStatuses) ? implode(', ', $fulfillmentStatuses) : 'No Orders',
+                    !empty($fulfillmentStatuses) ? implode(', ', array_unique($fulfillmentStatuses)) : 'No Orders',
                     !empty($customer['accepts_sms_marketing']) ? 'Yes' : 'No',
                     !empty($customer['accepts_email_marketing']) ? 'Yes' : 'No'
                 ]);
@@ -694,6 +735,12 @@ include __DIR__ . '/../includes/sidebar.php';
             <input type="hidden" name="action" value="test_connection">
             <button type="submit" class="btn btn-info btn-sm shadow-sm font-weight-bold" style="background-color: #003399; border-color: #002266;">
               <i class="fas fa-plug mr-1"></i> Test Connection
+            </button>
+          </form>
+          <form method="post" class="d-inline-block mr-2" onsubmit="return confirm('This will pull all customers and orders from Shopify into the database. Continue?');">
+            <input type="hidden" name="action" value="sync_customers">
+            <button type="submit" class="btn btn-warning btn-sm shadow-sm font-weight-bold">
+              <i class="fas fa-sync-alt mr-1"></i> Sync Customers Data
             </button>
           </form>
           <a href="customers.php" class="btn btn-primary btn-sm shadow-sm font-weight-bold" style="background-color: #003399; border-color: #002266;">
@@ -751,7 +798,16 @@ include __DIR__ . '/../includes/sidebar.php';
             <div class="info-box-content">
               <span class="info-box-text text-muted text-uppercase font-weight-bold" style="font-size: 11px;">Total Customers</span>
               <span class="info-box-number font-weight-bold text-dark" style="font-size: 20px;">
-                <?php echo number_format($totalRows); ?>
+                <?php
+                $overallCount = 0;
+                if ($db) {
+                    try {
+                        $r = $db->query("SELECT COUNT(*) as total FROM shopify_customers WHERE store_key = 'retail'")->fetch(PDO::FETCH_ASSOC);
+                        $overallCount = (int)($r['total'] ?? 0);
+                    } catch (Exception $e) {}
+                }
+                echo number_format($overallCount);
+                ?>
               </span>
             </div>
           </div>
@@ -769,9 +825,8 @@ include __DIR__ . '/../includes/sidebar.php';
                 $totalOrders = 0;
                 if ($db) {
                     try {
-                        $orderCount  = $db->query("SELECT COUNT(*) as total FROM shopify_orders WHERE store_key = 'retail'");
-                        $orderResult = $orderCount->fetch(PDO::FETCH_ASSOC);
-                        $totalOrders = (int)($orderResult['total'] ?? 0);
+                        $r = $db->query("SELECT COUNT(*) as total FROM shopify_orders WHERE store_key = 'retail'")->fetch(PDO::FETCH_ASSOC);
+                        $totalOrders = (int)($r['total'] ?? 0);
                     } catch (Exception $e) {}
                 }
                 echo number_format($totalOrders);
@@ -793,9 +848,8 @@ include __DIR__ . '/../includes/sidebar.php';
                 $emailMarketing = 0;
                 if ($db) {
                     try {
-                        $emailCount     = $db->query("SELECT COUNT(*) as total FROM shopify_customers WHERE store_key = 'retail' AND accepts_email_marketing = 1");
-                        $emailResult    = $emailCount->fetch(PDO::FETCH_ASSOC);
-                        $emailMarketing = (int)($emailResult['total'] ?? 0);
+                        $r = $db->query("SELECT COUNT(*) as total FROM shopify_customers WHERE store_key = 'retail' AND accepts_email_marketing = 1")->fetch(PDO::FETCH_ASSOC);
+                        $emailMarketing = (int)($r['total'] ?? 0);
                     } catch (Exception $e) {}
                 }
                 echo number_format($emailMarketing);
@@ -817,9 +871,8 @@ include __DIR__ . '/../includes/sidebar.php';
                 $smsMarketing = 0;
                 if ($db) {
                     try {
-                        $smsCount     = $db->query("SELECT COUNT(*) as total FROM shopify_customers WHERE store_key = 'retail' AND accepts_sms_marketing = 1");
-                        $smsResult    = $smsCount->fetch(PDO::FETCH_ASSOC);
-                        $smsMarketing = (int)($smsResult['total'] ?? 0);
+                        $r = $db->query("SELECT COUNT(*) as total FROM shopify_customers WHERE store_key = 'retail' AND accepts_sms_marketing = 1")->fetch(PDO::FETCH_ASSOC);
+                        $smsMarketing = (int)($r['total'] ?? 0);
                     } catch (Exception $e) {}
                 }
                 echo number_format($smsMarketing);
@@ -862,25 +915,25 @@ include __DIR__ . '/../includes/sidebar.php';
 
             <div class="col-lg-8 col-md-7 col-12 text-md-right mt-2 mt-md-0">
               <div class="d-flex flex-wrap justify-content-md-end" style="gap: 6px;">
-                <!-- View All who Accepts SMS -->
+                <!-- View All who Accepts SMS (reads from DB) -->
                 <a href="customers.php?accepts_sms=1<?php echo $search !== '' ? '&search=' . urlencode($search) : ''; ?>"
                    class="btn btn-sm shadow-sm font-weight-bold <?php echo $filterSms ? 'btn-warning' : 'btn-outline-warning'; ?>">
                   <i class="fas fa-sms mr-1"></i> View All who Accepts SMS
                 </a>
 
-                <!-- View All who Accepts Email -->
+                <!-- View All who Accepts Email (reads from DB) -->
                 <a href="customers.php?accepts_email=1<?php echo $search !== '' ? '&search=' . urlencode($search) : ''; ?>"
                    class="btn btn-sm shadow-sm font-weight-bold <?php echo $filterEmail ? 'btn-info' : 'btn-outline-info'; ?>">
                   <i class="fas fa-envelope mr-1"></i> View All who Accepts Email
                 </a>
 
-                <!-- Export All who Accepts SMS -->
+                <!-- Export All who Accepts SMS (from DB) -->
                 <a href="customers.php?export=csv&accepts_sms=1<?php echo $search !== '' ? '&search=' . urlencode($search) : ''; ?>"
                    class="btn btn-sm shadow-sm font-weight-bold btn-outline-success">
                   <i class="fas fa-file-csv mr-1"></i> Export All who Accepts SMS
                 </a>
 
-                <!-- Export All who Accepts Email -->
+                <!-- Export All who Accepts Email (from DB) -->
                 <a href="customers.php?export=csv&accepts_email=1<?php echo $search !== '' ? '&search=' . urlencode($search) : ''; ?>"
                    class="btn btn-sm shadow-sm font-weight-bold btn-outline-primary">
                   <i class="fas fa-file-csv mr-1"></i> Export All who Accepts Email
@@ -892,12 +945,6 @@ include __DIR__ . '/../includes/sidebar.php';
                     <i class="fas fa-times mr-1"></i> Clear Filter
                   </a>
                 <?php endif; ?>
-
-                <!-- General Export CSV (respects current filters) -->
-                <a href="customers.php?export=csv<?php echo $extraQuery; ?>"
-                   class="btn btn-outline-secondary btn-sm shadow-sm font-weight-bold">
-                  <i class="fas fa-file-csv mr-1 text-success"></i> Export CSV
-                </a>
               </div>
             </div>
           </form>
@@ -953,68 +1000,51 @@ include __DIR__ . '/../includes/sidebar.php';
                     <td colspan="13" class="text-center py-4 text-muted">
                       <i class="fas fa-inbox fa-2x mb-2"></i><br>
                       No customers found<?php echo ($filterSms || $filterEmail || $search !== '') ? ' matching your filters.' : '.'; ?>
+                      <?php if ($totalRows === 0 && !$filterSms && !$filterEmail && $search === ''): ?>
+                        <br><small>Click <strong>Sync Customers Data</strong> to pull customers from Shopify into the database.</small>
+                      <?php endif; ?>
                     </td>
                   </tr>
                 <?php else: ?>
                   <?php foreach ($customers as $customer): ?>
                     <tr style="border-bottom: 1px solid #f1f5f9;">
-                      <!-- Customer ID -->
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <code class="text-muted"><?php echo htmlspecialchars($customer['shopify_customer_id'] ?? ''); ?></code>
                       </td>
-
-                      <!-- Last Name -->
                       <td style="padding: 12px; font-size: 13px;">
                         <?php echo htmlspecialchars($customer['last_name'] ?? ''); ?>
                       </td>
-
-                      <!-- First Name -->
                       <td style="padding: 12px; font-size: 13px;">
                         <?php echo htmlspecialchars($customer['first_name'] ?? ''); ?>
                       </td>
-
-                      <!-- Email -->
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <a href="mailto:<?php echo htmlspecialchars($customer['email'] ?? ''); ?>" class="text-primary">
                           <?php echo htmlspecialchars($customer['email'] ?? ''); ?>
                         </a>
                       </td>
-
-                      <!-- Contact Number -->
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <?php echo htmlspecialchars($customer['phone'] ?? 'N/A'); ?>
                       </td>
-
-                      <!-- Shipping City -->
                       <td style="padding: 12px; font-size: 13px;">
                         <?php echo htmlspecialchars($customer['shipping_city'] ?? 'N/A'); ?>
                       </td>
-
-                      <!-- Shipping Zip -->
                       <td style="padding: 12px; font-size: 13px;">
                         <?php echo htmlspecialchars($customer['shipping_zip'] ?? 'N/A'); ?>
                       </td>
-
-                      <!-- Products Ordered -->
                       <td style="padding: 12px; font-size: 13px; max-width: 200px; word-wrap: break-word;">
                         <?php echo htmlspecialchars($customer['product_names'] ?: 'No products'); ?>
                       </td>
-
-                      <!-- Total Number of Orders -->
                       <td style="padding: 12px; font-size: 13px; text-align: center;">
                         <span class="badge bg-info text-white font-weight-bold" style="font-size: 12px; padding: 4px 8px;">
                           <?php echo (int)($customer['order_count'] ?? 0); ?>
                         </span>
                       </td>
-
-                      <!-- Date/time of order -->
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <?php
-                        $latestDate = $customer['latest_order_date'] ?? ($customer['created_at'] ?? '');
+                        $latestDate = $customer['latest_order_date'] ?? '';
                         if (!empty($latestDate)) {
                             try {
-                                $dateObj = new DateTime($latestDate);
-                                echo $dateObj->format('Y-m-d H:i:s');
+                                echo (new DateTime($latestDate))->format('Y-m-d H:i:s');
                             } catch (Exception $e) {
                                 echo htmlspecialchars($latestDate);
                             }
@@ -1023,8 +1053,6 @@ include __DIR__ . '/../includes/sidebar.php';
                         }
                         ?>
                       </td>
-
-                      <!-- Fulfillment Status -->
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <?php
                         $status     = $customer['fulfillment_status'] ?? 'No Orders';
@@ -1041,8 +1069,6 @@ include __DIR__ . '/../includes/sidebar.php';
                           <?php echo htmlspecialchars($status); ?>
                         </span>
                       </td>
-
-                      <!-- Accepts SMS Marketing -->
                       <td style="padding: 12px; font-size: 13px; text-align: center;">
                         <?php if (!empty($customer['accepts_sms_marketing'])): ?>
                           <i class="fas fa-check-circle text-success fa-lg"></i>
@@ -1050,8 +1076,6 @@ include __DIR__ . '/../includes/sidebar.php';
                           <i class="fas fa-times-circle text-muted fa-lg"></i>
                         <?php endif; ?>
                       </td>
-
-                      <!-- Accepts Email Marketing -->
                       <td style="padding: 12px; font-size: 13px; text-align: center;">
                         <?php if (!empty($customer['accepts_email_marketing'])): ?>
                           <i class="fas fa-check-circle text-success fa-lg"></i>
@@ -1067,7 +1091,7 @@ include __DIR__ . '/../includes/sidebar.php';
           </div>
         </div>
 
-        <!-- Pagination Bar -->
+        <!-- Pagination -->
         <?php if ($totalPages > 1): ?>
           <div class="card-footer bg-white border-top py-3 px-4 d-flex flex-column flex-md-row justify-content-between align-items-center" style="border-radius: 0 0 12px 12px;">
             <div class="text-muted small mb-2 mb-md-0 font-weight-medium">
@@ -1077,42 +1101,27 @@ include __DIR__ . '/../includes/sidebar.php';
             </div>
 
             <ul class="pagination pagination-sm m-0 shadow-none">
-              <!-- Previous Page -->
               <li class="page-item <?php echo ($page <= 1) ? 'disabled' : ''; ?>">
-                <a class="page-link" href="?page=<?php echo max(1, $page - 1); ?><?php echo $extraQuery; ?>">
-                  &laquo; Prev
-                </a>
+                <a class="page-link" href="?page=<?php echo max(1, $page - 1); ?><?php echo $extraQuery; ?>">&laquo; Prev</a>
               </li>
-
               <?php
               $startP = max(1, $page - 3);
               $endP   = min($totalPages, $page + 3);
-
               if ($startP > 1) {
                   echo '<li class="page-item"><a class="page-link" href="?page=1' . $extraQuery . '">1</a></li>';
-                  if ($startP > 2) {
-                      echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
-                  }
+                  if ($startP > 2) echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
               }
-
               for ($p = $startP; $p <= $endP; $p++) {
                   $active = ($p === $page) ? 'active font-weight-bold' : '';
                   echo "<li class=\"page-item {$active}\"><a class=\"page-link\" href=\"?page={$p}{$extraQuery}\">{$p}</a></li>";
               }
-
               if ($endP < $totalPages) {
-                  if ($endP < $totalPages - 1) {
-                      echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
-                  }
+                  if ($endP < $totalPages - 1) echo '<li class="page-item disabled"><span class="page-link">...</span></li>';
                   echo '<li class="page-item"><a class="page-link" href="?page=' . $totalPages . $extraQuery . '">' . $totalPages . '</a></li>';
               }
               ?>
-
-              <!-- Next Page -->
               <li class="page-item <?php echo ($page >= $totalPages) ? 'disabled' : ''; ?>">
-                <a class="page-link" href="?page=<?php echo min($totalPages, $page + 1); ?><?php echo $extraQuery; ?>">
-                  Next &raquo;
-                </a>
+                <a class="page-link" href="?page=<?php echo min($totalPages, $page + 1); ?><?php echo $extraQuery; ?>">Next &raquo;</a>
               </li>
             </ul>
           </div>
