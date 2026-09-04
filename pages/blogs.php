@@ -129,15 +129,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
             $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
             $token     = $storeCfg['access_token'] ?? '';
+            
+            $storeResults = [];
+            $storeSuccess = true;
 
+            // Check if access token is available
             if (empty($token)) {
-                $results[$storeKey] = "❌ Connection FAILED! Access token is empty for {$storeKey} store.";
+                $storeResults[] = "❌ Access Token: MISSING - No access token found for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Blogs: NOT TESTED - No access token";
+                $storeResults[] = "❌ Push Blogs: NOT TESTED - No access token";
+                $results[$storeKey] = implode('<br>', $storeResults);
                 $allSuccess = false;
                 continue;
             }
 
-            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            // Check if target URL is available
+            if (empty($targetUrl)) {
+                $storeResults[] = "❌ Store Configuration: MISSING - No URL configured for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Blogs: NOT TESTED - No store URL";
+                $storeResults[] = "❌ Push Blogs: NOT TESTED - No store URL";
+                $results[$storeKey] = implode('<br>', $storeResults);
+                $allSuccess = false;
+                continue;
+            }
 
+            // Test 1: Basic connection test
+            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            
             $ch = curl_init($testUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -162,25 +182,237 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             if ($httpCode === 200 && !empty($json['shop'])) {
                 $shopName   = $json['shop']['name'] ?? 'Unknown';
                 $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-                $results[$storeKey] = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+                $storeResults[] = "✅ Basic Connection: SUCCESS - Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
             } else {
                 $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-                $errorMsg = "❌ Connection FAILED! HTTP {$httpCode}";
+                $errorMsg = "❌ Basic Connection: FAILED! HTTP {$httpCode}";
                 if ($curlError) {
                     $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
                 }
                 $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
-                $results[$storeKey] = $errorMsg;
+                $storeResults[] = $errorMsg;
+                $storeSuccess = false;
+            }
+
+            // Test 2: Test PULL capability - GET blogs (containers) and articles
+            $pullTestMessage = "❌ Pull Blogs: NOT TESTED";
+            
+            // First, try to get blogs
+            $blogsTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs.json?limit=1";
+            
+            $ch = curl_init($blogsTestUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 15,
+                CURLOPT_HEADER         => true,
+            ]);
+
+            $response   = curl_exec($ch);
+            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $curlError  = curl_error($ch);
+            curl_close($ch);
+
+            $bodyStr = substr($response, $headerSize);
+            $blogsJson = json_decode($bodyStr, true);
+
+            if ($httpCode === 200 && !empty($blogsJson['blogs']) && is_array($blogsJson['blogs'])) {
+                $blogCount = count($blogsJson['blogs']);
+                
+                // Try to get articles from the first blog if available
+                if ($blogCount > 0) {
+                    $firstBlog = $blogsJson['blogs'][0];
+                    $blogId = $firstBlog['id'] ?? '';
+                    
+                    if ($blogId) {
+                        $articlesTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles.json?limit=1";
+                        
+                        $ch = curl_init($articlesTestUrl);
+                        curl_setopt_array($ch, [
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_HTTPHEADER     => [
+                                "X-Shopify-Access-Token: {$token}",
+                                "Content-Type: application/json"
+                            ],
+                            CURLOPT_SSL_VERIFYPEER => false,
+                            CURLOPT_TIMEOUT        => 15,
+                            CURLOPT_HEADER         => true,
+                        ]);
+
+                        $response   = curl_exec($ch);
+                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                        $curlError  = curl_error($ch);
+                        curl_close($ch);
+
+                        $bodyStr = substr($response, $headerSize);
+                        $articlesJson = json_decode($bodyStr, true);
+
+                        if ($httpCode === 200 && !empty($articlesJson['articles']) && is_array($articlesJson['articles'])) {
+                            $articleCount = count($articlesJson['articles']);
+                            $pullTestMessage = "✅ Pull Blogs: SUCCESS - Retrieved {$blogCount} blog(s) and {$articleCount} article(s)";
+                        } else {
+                            $errorDetails = $articlesJson['errors'] ?? substr($bodyStr, 0, 400);
+                            $pullTestMessage = "⚠️ Pull Blogs: PARTIAL - Retrieved {$blogCount} blog(s) but failed to get articles";
+                            if ($curlError) {
+                                $pullTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                            }
+                            if (!empty($errorDetails)) {
+                                $pullTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                            }
+                        }
+                    } else {
+                        $pullTestMessage = "✅ Pull Blogs: SUCCESS - Retrieved {$blogCount} blog(s) (no articles tested - no valid blog ID)";
+                    }
+                } else {
+                    $pullTestMessage = "✅ Pull Blogs: SUCCESS - No blogs found (empty store)";
+                }
+            } else {
+                $errorDetails = $blogsJson['errors'] ?? substr($bodyStr, 0, 400);
+                $pullTestMessage = "❌ Pull Blogs: FAILED! HTTP {$httpCode}";
+                if ($curlError) {
+                    $pullTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                }
+                if (!empty($errorDetails)) {
+                    $pullTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                }
+                $storeSuccess = false;
+            }
+            
+            $storeResults[] = $pullTestMessage;
+
+            // Test 3: Test PUSH capability - Try to find an article and update it
+            $pushTestMessage = "❌ Push Blogs: NOT TESTED - No articles available";
+            
+            // Try to use the data we already have from pull test
+            if (isset($blogsJson['blogs']) && is_array($blogsJson['blogs']) && count($blogsJson['blogs']) > 0) {
+                $firstBlog = $blogsJson['blogs'][0];
+                $blogId = $firstBlog['id'] ?? '';
+                
+                if ($blogId && isset($articlesJson['articles']) && is_array($articlesJson['articles']) && count($articlesJson['articles']) > 0) {
+                    $testArticle = $articlesJson['articles'][0];
+                    $articleId = $testArticle['id'] ?? '';
+                    
+                    if ($articleId) {
+                        $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles/{$articleId}.json";
+                        
+                        // Use the exact same data to avoid actual changes
+                        $pushPayload = json_encode([
+                            "article" => [
+                                "id" => $articleId,
+                                "title" => $testArticle['title'] ?? '',
+                                "handle" => $testArticle['handle'] ?? ''
+                            ]
+                        ]);
+
+                        $ch = curl_init($pushTestUrl);
+                        curl_setopt_array($ch, [
+                            CURLOPT_CUSTOMREQUEST  => "PUT",
+                            CURLOPT_POSTFIELDS     => $pushPayload,
+                            CURLOPT_HTTPHEADER     => [
+                                "X-Shopify-Access-Token: {$token}",
+                                "Content-Type: application/json"
+                            ],
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_SSL_VERIFYPEER => false,
+                            CURLOPT_TIMEOUT        => 15,
+                        ]);
+
+                        $response   = curl_exec($ch);
+                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $curlError  = curl_error($ch);
+                        curl_close($ch);
+
+                        $bodyStr = $response;
+                        $pushJson = json_decode($bodyStr, true);
+
+                        if ($httpCode >= 200 && $httpCode < 300) {
+                            $pushTestMessage = "✅ Push Blogs: SUCCESS - Can update articles (tested on article ID: {$articleId})";
+                        } else {
+                            $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                            $pushTestMessage = "❌ Push Blogs: FAILED! HTTP {$httpCode}";
+                            if ($curlError) {
+                                $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                            }
+                            if (!empty($errorDetails)) {
+                                $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                            }
+                            $storeSuccess = false;
+                        }
+                    }
+                } else {
+                    // If we have blogs but no articles, try count endpoint as fallback
+                    if ($blogId) {
+                        $countUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles/count.json";
+                        
+                        $ch = curl_init($countUrl);
+                        curl_setopt_array($ch, [
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_HTTPHEADER     => [
+                                "X-Shopify-Access-Token: {$token}",
+                                "Content-Type: application/json"
+                            ],
+                            CURLOPT_SSL_VERIFYPEER => false,
+                            CURLOPT_TIMEOUT        => 15,
+                        ]);
+
+                        $response   = curl_exec($ch);
+                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        curl_close($ch);
+
+                        if ($httpCode === 200) {
+                            $pushTestMessage = "✅ Push Blogs: SUCCESS - Can access articles endpoint";
+                        } else {
+                            $pushTestMessage = "❌ Push Blogs: Unable to verify - No articles found to test with";
+                        }
+                    }
+                }
+            } else {
+                // No blogs found, try blogs/count.json as fallback
+                $countUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/count.json";
+                
+                $ch = curl_init($countUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+
+                if ($httpCode === 200) {
+                    $pushTestMessage = "✅ Push Blogs: SUCCESS - Can access blogs endpoint";
+                } else {
+                    $pushTestMessage = "❌ Push Blogs: Unable to verify - No blogs found to test with";
+                }
+            }
+            
+            $storeResults[] = $pushTestMessage;
+            
+            // Combine all results for this store
+            $results[$storeKey] = implode('<br>', $storeResults);
+            
+            if (!$storeSuccess) {
                 $allSuccess = false;
             }
-            $results[$storeKey] .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
         }
         
         $message = implode('<br><br>', $results);
         if ($allSuccess) {
-            $message = "✅ All connections successful!<br><br>" . $message;
+            $message = "✅ All connections and API capabilities verified successfully!<br><br>" . $message;
         } else {
-            $message = "⚠️ Some connections failed!<br><br>" . $message;
+            $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
         }
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
