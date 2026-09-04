@@ -11,8 +11,7 @@
  *  6. Single & Bulk Save Drafts / Push to Shopify API
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
  *  8. Live View button next to the page title
- *  9. CSV / JSON export of all stored pages
- * 10. Defensive error handling – never dies with HTTP 500
+ *  9. Defensive error handling – never dies with HTTP 500
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -62,68 +61,8 @@ function mapPageStatus(?string $publishedAt): string
 }
 
 // -----------------------------------------------------------------------------
-// EXPORT HANDLER
+// EXPORT HANDLER - Removed as CSV and JSON buttons were removed
 // -----------------------------------------------------------------------------
-if (isset($_GET['export']) && in_array($_GET['export'], ['csv', 'json'])) {
-    $expFormat  = $_GET['export'];
-    $expStore   = $_GET['store'] ?? $activeStore;
-    $allDbPages = [];
-
-    if ($db) {
-        try {
-            $stmt = $db->prepare("SELECT * FROM shopify_pages WHERE store_key = :store ORDER BY id ASC");
-            $stmt->execute([':store' => $expStore]);
-            $allDbPages = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        } catch (Exception $e) {
-            $allDbPages = [];
-        }
-    }
-
-    if ($expFormat === 'csv') {
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename=uratex_shopify_pages_' . $expStore . '_' . date('Ymd_His') . '.csv');
-        $out = fopen('php://output', 'w');
-        fprintf($out, chr(0xEF) . chr(0xBB) . chr(0xBF));
-        fputcsv($out, [
-            'ID', 'Store Key', 'Shopify Page ID', 'Page Name', 'Page Type', 'Live URL',
-            'SEO Title', 'Meta Description', 'URL Handle', 'Author', 'Status', 'SEO Score',
-            'Created At', 'Last Synced At'
-        ]);
-        foreach ($allDbPages as $row) {
-            fputcsv($out, [
-                $row['id'] ?? '',
-                $row['store_key'] ?? $expStore,
-                $row['shopify_page_id'] ?? '',
-                $row['page_title'] ?? '',
-                $row['page_type'] ?? '',
-                $row['page_url'] ?? '',
-                $row['title'] ?? '',
-                $row['meta_description'] ?? '',
-                $row['handle'] ?? '',
-                $row['author'] ?? '',
-                $row['status'] ?? '',
-                $row['seo_score'] ?? '',
-                $row['created_at'] ?? '',
-                $row['last_synced_at'] ?? ''
-            ]);
-        }
-        fclose($out);
-        exit;
-    }
-
-    if ($expFormat === 'json') {
-        header('Content-Type: application/json; charset=utf-8');
-        header('Content-Disposition: attachment; filename=uratex_shopify_pages_' . $expStore . '_' . date('Ymd_His') . '.json');
-        echo json_encode([
-            'store'       => $expStore,
-            'exported_at' => date('Y-m-d H:i:s'),
-            'total_pages' => count($allDbPages),
-            'pages'       => $allDbPages
-        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        exit;
-    }
-}
-
 // -----------------------------------------------------------------------------
 // AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
@@ -657,13 +596,6 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
 
         <div class="col-sm-6 text-right d-flex justify-content-end align-items-center gap-2 flex-wrap">
-          <a href="?export=csv&store=<?php echo urlencode($activeStore); ?>" class="btn btn-sm btn-outline-secondary font-weight-bold mr-1">
-            <i class="fas fa-file-csv mr-1"></i> CSV
-          </a>
-          <a href="?export=json&store=<?php echo urlencode($activeStore); ?>" class="btn btn-sm btn-outline-secondary font-weight-bold mr-2">
-            <i class="fas fa-file-code mr-1"></i> JSON
-          </a>
-
           <form method="POST" class="d-inline mr-2">
             <input type="hidden" name="action" value="test_connection">
             <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #007bff;">
