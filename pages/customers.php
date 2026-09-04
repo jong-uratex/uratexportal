@@ -17,12 +17,20 @@ if (!isset($_SESSION['user_logged_in'])) {
     exit;
 }
 
+// User Role Check
+$userRole = $_SESSION['user_role'] ?? 'editor';
+
+// Admin Role Guard - Only accessible to admin users
+if ($userRole !== 'admin') {
+    header("Location: dashboard.php");
+    exit;
+}
+
 // Force retail store only as requested
 $activeStore = 'retail';
 $_SESSION['active_store'] = $activeStore;
 $shopCfg = $shopConfig[$activeStore] ?? [];
 $currentUser = $_SESSION['user_name'] ?? 'Jenor Ricafort';
-$userRole = $_SESSION['user_role'] ?? 'admin';
 $message = '';
 $messageType = 'success';
 
