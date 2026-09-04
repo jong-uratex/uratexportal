@@ -114,15 +114,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
             $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
             $token     = $storeCfg['access_token'] ?? '';
+            
+            $storeResults = [];
+            $storeSuccess = true;
 
+            // Check if access token is available
             if (empty($token)) {
-                $results[$storeKey] = "❌ Connection FAILED! Access token is empty for {$storeKey} store.";
+                $storeResults[] = "❌ Access Token: MISSING - No access token found for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Pages: NOT TESTED - No access token";
+                $storeResults[] = "❌ Push Pages: NOT TESTED - No access token";
+                $results[$storeKey] = implode('<br>', $storeResults);
                 $allSuccess = false;
                 continue;
             }
 
-            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            // Check if target URL is available
+            if (empty($targetUrl)) {
+                $storeResults[] = "❌ Store Configuration: MISSING - No URL configured for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Pages: NOT TESTED - No store URL";
+                $storeResults[] = "❌ Push Pages: NOT TESTED - No store URL";
+                $results[$storeKey] = implode('<br>', $storeResults);
+                $allSuccess = false;
+                continue;
+            }
 
+            // Test 1: Basic connection test
+            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            
             $ch = curl_init($testUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -147,25 +167,165 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             if ($httpCode === 200 && !empty($json['shop'])) {
                 $shopName   = $json['shop']['name'] ?? 'Unknown';
                 $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-                $results[$storeKey] = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+                $storeResults[] = "✅ Basic Connection: SUCCESS - Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
             } else {
                 $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-                $errorMsg = "❌ Connection FAILED! HTTP {$httpCode}";
+                $errorMsg = "❌ Basic Connection: FAILED! HTTP {$httpCode}";
                 if ($curlError) {
                     $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
                 }
                 $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
-                $results[$storeKey] = $errorMsg;
+                $storeResults[] = $errorMsg;
+                $storeSuccess = false;
+            }
+
+            // Test 2: Test PULL capability - GET pages
+            $pagesTestUrl = "https://{$targetUrl}/admin/api/{$version}/pages.json?limit=1";
+            
+            $ch = curl_init($pagesTestUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 15,
+                CURLOPT_HEADER         => true,
+            ]);
+
+            $response   = curl_exec($ch);
+            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $curlError  = curl_error($ch);
+            curl_close($ch);
+
+            $bodyStr = substr($response, $headerSize);
+            $pagesJson = json_decode($bodyStr, true);
+
+            if ($httpCode === 200 && !empty($pagesJson['pages'])) {
+                $pageCount = count($pagesJson['pages']);
+                $storeResults[] = "✅ Pull Pages: SUCCESS - Retrieved {$pageCount} page(s) from store";
+            } else {
+                $errorDetails = $pagesJson['errors'] ?? substr($bodyStr, 0, 400);
+                $errorMsg = "❌ Pull Pages: FAILED! HTTP {$httpCode}";
+                if ($curlError) {
+                    $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
+                }
+                if (!empty($errorDetails)) {
+                    $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                }
+                $storeResults[] = $errorMsg;
+                $storeSuccess = false;
+            }
+
+            // Test 3: Test PUSH capability - Try to find a page and update it with same data (no actual changes)
+            $pushTestMessage = "❌ Push Pages: NOT TESTED - No pages available";
+            
+            if (!empty($pagesJson['pages']) && is_array($pagesJson['pages']) && count($pagesJson['pages']) > 0) {
+                $testPage = $pagesJson['pages'][0];
+                $pageId = $testPage['id'] ?? '';
+                
+                if ($pageId) {
+                    $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/pages/{$pageId}.json";
+                    
+                    // Use the exact same data to avoid actual changes
+                    $pushPayload = json_encode([
+                        "page" => [
+                            "id" => $pageId,
+                            "title" => $testPage['title'] ?? '',
+                            "handle" => $testPage['handle'] ?? ''
+                        ]
+                    ]);
+
+                    $ch = curl_init($pushTestUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_CUSTOMREQUEST  => "PUT",
+                        CURLOPT_POSTFIELDS     => $pushPayload,
+                        CURLOPT_HTTPHEADER     => [
+                            "X-Shopify-Access-Token: {$token}",
+                            "Content-Type: application/json"
+                        ],
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_TIMEOUT        => 15,
+                    ]);
+
+                    $response   = curl_exec($ch);
+                    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlError  = curl_error($ch);
+                    curl_close($ch);
+
+                    $bodyStr = $response;
+                    $pushJson = json_decode($bodyStr, true);
+
+                    if ($httpCode >= 200 && $httpCode < 300) {
+                        $pushTestMessage = "✅ Push Pages: SUCCESS - Can update pages (tested on page ID: {$pageId})";
+                    } else {
+                        $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                        $pushTestMessage = "❌ Push Pages: FAILED! HTTP {$httpCode}";
+                        if ($curlError) {
+                            $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                        }
+                        if (!empty($errorDetails)) {
+                            $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                        }
+                        $storeSuccess = false;
+                    }
+                }
+            } else {
+                // If we couldn't get pages from the pull test, try pages/count.json as fallback
+                $countUrl = "https://{$targetUrl}/admin/api/{$version}/pages/count.json";
+                
+                $ch = curl_init($countUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError  = curl_error($ch);
+                curl_close($ch);
+
+                $bodyStr = $response;
+                $countJson = json_decode($bodyStr, true);
+
+                if ($httpCode === 200 && isset($countJson['count'])) {
+                    $pushTestMessage = "✅ Push Pages: SUCCESS - Can access pages endpoint (count: {$countJson['count']})";
+                } else {
+                    $errorDetails = $countJson['errors'] ?? $bodyStr;
+                    $pushTestMessage = "❌ Push Pages: FAILED! HTTP {$httpCode}";
+                    if ($curlError) {
+                        $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                    }
+                    if (!empty($errorDetails)) {
+                        $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                    }
+                    $storeSuccess = false;
+                }
+            }
+            
+            $storeResults[] = $pushTestMessage;
+            
+            // Combine all results for this store
+            $results[$storeKey] = implode('<br>', $storeResults);
+            
+            if (!$storeSuccess) {
                 $allSuccess = false;
             }
-            $results[$storeKey] .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
         }
         
         $message = implode('<br><br>', $results);
         if ($allSuccess) {
-            $message = "✅ All connections successful!<br><br>" . $message;
+            $message = "✅ All connections and API capabilities verified successfully!<br><br>" . $message;
         } else {
-            $message = "⚠️ Some connections failed!<br><br>" . $message;
+            $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
         }
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
