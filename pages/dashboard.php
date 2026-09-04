@@ -210,7 +210,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   <tbody>
                     <tr>
                       <td><strong>MySQL Database</strong></td>
-                      <td><?php echo DB_HOST . '/' . DB_NAME; ?></td>
+                      <td>**********</td>
                       <td><span class="badge <?php echo $dbConnected ? 'badge-success' : 'badge-danger'; ?>">
                           <?php echo $dbConnected ? 'Connected' : 'Disconnected'; ?>
                         </span></td>
