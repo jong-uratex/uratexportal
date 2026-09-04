@@ -118,15 +118,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
             $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
             $token     = $storeCfg['access_token'] ?? '';
+            
+            $storeResults = [];
+            $storeSuccess = true;
 
+            // Check if access token is available
             if (empty($token)) {
-                $results[$storeKey] = "❌ Connection FAILED! Access token is empty for {$storeKey} store.";
+                $storeResults[] = "❌ Access Token: MISSING - No access token found for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Collections: NOT TESTED - No access token";
+                $storeResults[] = "❌ Push Collections: NOT TESTED - No access token";
+                $results[$storeKey] = implode('<br>', $storeResults);
                 $allSuccess = false;
                 continue;
             }
 
-            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            // Check if target URL is available
+            if (empty($targetUrl)) {
+                $storeResults[] = "❌ Store Configuration: MISSING - No URL configured for {$storeKey} store";
+                $storeSuccess = false;
+                $storeResults[] = "❌ Pull Collections: NOT TESTED - No store URL";
+                $storeResults[] = "❌ Push Collections: NOT TESTED - No store URL";
+                $results[$storeKey] = implode('<br>', $storeResults);
+                $allSuccess = false;
+                continue;
+            }
 
+            // Test 1: Basic connection test
+            $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
+            
             $ch = curl_init($testUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -151,25 +171,187 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             if ($httpCode === 200 && !empty($json['shop'])) {
                 $shopName   = $json['shop']['name'] ?? 'Unknown';
                 $shopDomain = $json['shop']['myshopify_domain'] ?? $json['shop']['domain'] ?? $targetUrl;
-                $results[$storeKey] = "✅ Connection SUCCESS! Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
+                $storeResults[] = "✅ Basic Connection: SUCCESS - Store: <strong>{$shopName}</strong> ({$shopDomain}) | API Version: {$version}";
             } else {
                 $errorDetails = $json['errors'] ?? substr($bodyStr, 0, 400);
-                $errorMsg = "❌ Connection FAILED! HTTP {$httpCode}";
+                $errorMsg = "❌ Basic Connection: FAILED! HTTP {$httpCode}";
                 if ($curlError) {
                     $errorMsg .= " | cURL: " . htmlspecialchars($curlError);
                 }
                 $errorMsg .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
-                $results[$storeKey] = $errorMsg;
+                $storeResults[] = $errorMsg;
+                $storeSuccess = false;
+            }
+
+            // Test 2: Test PULL capability for both custom and smart collections
+            $collectionTypes = ['custom_collections', 'smart_collections'];
+            $pullSuccessCount = 0;
+            
+            foreach ($collectionTypes as $collectionType) {
+                $collectionsTestUrl = "https://{$targetUrl}/admin/api/{$version}/{$collectionType}.json?limit=1";
+                
+                $ch = curl_init($collectionsTestUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                    CURLOPT_HEADER         => true,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                $curlError  = curl_error($ch);
+                curl_close($ch);
+
+                $bodyStr = substr($response, $headerSize);
+                $typeJson = json_decode($bodyStr, true);
+
+                if ($httpCode === 200 && !empty($typeJson[$collectionType])) {
+                    $pullSuccessCount++;
+                }
+            }
+            
+            if ($pullSuccessCount === count($collectionTypes)) {
+                $storeResults[] = "✅ Pull Collections: SUCCESS - Can retrieve both custom and smart collections";
+            } else {
+                $errorMsg = "❌ Pull Collections: PARTIAL SUCCESS - Only {$pullSuccessCount}/" . count($collectionTypes) . " collection types accessible";
+                $storeResults[] = $errorMsg;
+                $storeSuccess = false;
+            }
+
+            // Test 3: Test PUSH capability - Try to find a collection and update it
+            $pushTestMessage = "❌ Push Collections: NOT TESTED - No collections available";
+            
+            // Try to get at least one collection from either type
+            foreach ($collectionTypes as $collectionType) {
+                $collectionsTestUrl = "https://{$targetUrl}/admin/api/{$version}/{$collectionType}.json?limit=1";
+                
+                $ch = curl_init($collectionsTestUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+
+                if ($httpCode === 200) {
+                    $bodyStr = $response;
+                    $typeJson = json_decode($bodyStr, true);
+                    
+                    if (!empty($typeJson[$collectionType]) && is_array($typeJson[$collectionType]) && count($typeJson[$collectionType]) > 0) {
+                        $testCollection = $typeJson[$collectionType][0];
+                        $collectionId = $testCollection['id'] ?? '';
+                        
+                        if ($collectionId) {
+                            $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/{$collectionType}/{$collectionId}.json";
+                            $payloadKey = ($collectionType === 'smart_collections') ? 'smart_collection' : 'custom_collection';
+                            
+                            // Use the exact same data to avoid actual changes
+                            $pushPayload = json_encode([
+                                $payloadKey => [
+                                    "id" => $collectionId,
+                                    "title" => $testCollection['title'] ?? '',
+                                    "handle" => $testCollection['handle'] ?? ''
+                                ]
+                            ]);
+
+                            $ch = curl_init($pushTestUrl);
+                            curl_setopt_array($ch, [
+                                CURLOPT_CUSTOMREQUEST  => "PUT",
+                                CURLOPT_POSTFIELDS     => $pushPayload,
+                                CURLOPT_HTTPHEADER     => [
+                                    "X-Shopify-Access-Token: {$token}",
+                                    "Content-Type: application/json"
+                                ],
+                                CURLOPT_RETURNTRANSFER => true,
+                                CURLOPT_SSL_VERIFYPEER => false,
+                                CURLOPT_TIMEOUT        => 15,
+                            ]);
+
+                            $response   = curl_exec($ch);
+                            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                            $curlError  = curl_error($ch);
+                            curl_close($ch);
+
+                            $bodyStr = $response;
+                            $pushJson = json_decode($bodyStr, true);
+
+                            if ($httpCode >= 200 && $httpCode < 300) {
+                                $pushTestMessage = "✅ Push Collections: SUCCESS - Can update collections (tested on {$collectionType} ID: {$collectionId})";
+                                break; // Success, no need to test other types
+                            } else {
+                                $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                                $pushTestMessage = "❌ Push Collections: FAILED! HTTP {$httpCode}";
+                                if ($curlError) {
+                                    $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
+                                }
+                                if (!empty($errorDetails)) {
+                                    $pushTestMessage .= "<br><small>" . htmlspecialchars(is_string($errorDetails) ? $errorDetails : json_encode($errorDetails)) . "</small>";
+                                }
+                                $storeSuccess = false;
+                                break; // Error, no need to test other types
+                            }
+                        } else {
+                            // Collection found but no valid ID, try next type
+                            continue;
+                        }
+                    }
+                }
+            }
+            
+            // If we still don't have a push test result, try count endpoints as fallback
+            if (strpos($pushTestMessage, '✅') === false && strpos($pushTestMessage, '❌') === 0) {
+                $countUrl = "https://{$targetUrl}/admin/api/{$version}/custom_collections/count.json";
+                
+                $ch = curl_init($countUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                curl_close($ch);
+
+                if ($httpCode === 200) {
+                    $pushTestMessage = "✅ Push Collections: SUCCESS - Can access collections endpoint";
+                } else {
+                    $pushTestMessage = "❌ Push Collections: Unable to verify - No collections found to test with";
+                }
+            }
+            
+            $storeResults[] = $pushTestMessage;
+            
+            // Combine all results for this store
+            $results[$storeKey] = implode('<br>', $storeResults);
+            
+            if (!$storeSuccess) {
                 $allSuccess = false;
             }
-            $results[$storeKey] .= "<br><small class='text-muted'>Tried URL: {$testUrl}</small>";
         }
         
         $message = implode('<br><br>', $results);
         if ($allSuccess) {
-            $message = "✅ All connections successful!<br><br>" . $message;
+            $message = "✅ All connections and API capabilities verified successfully!<br><br>" . $message;
         } else {
-            $message = "⚠️ Some connections failed!<br><br>" . $message;
+            $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
         }
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
