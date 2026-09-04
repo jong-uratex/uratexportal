@@ -269,45 +269,174 @@ include __DIR__ . '/../includes/sidebar.php';
       
       <!-- Info boxes -->
       <div class="row">
-        <div class="col-12 col-sm-6 col-md-3">
-          <div class="info-box shadow-sm">
-            <span class="info-box-icon bg-info elevation-1"><i class="fas fa-tag"></i></span>
-            <div class="info-box-content">
-              <span class="info-box-text">Product SEO Score</span>
-              <span class="info-box-number font-weight-bold text-success">88% <small class="text-muted">Avg Health</small></span>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-12 col-sm-6 col-md-3">
-          <div class="info-box shadow-sm">
-            <span class="info-box-icon bg-success elevation-1"><i class="fas fa-layer-group"></i></span>
-            <div class="info-box-content">
-              <span class="info-box-text">Collections Health</span>
-              <span class="info-box-number font-weight-bold text-success">93% <small class="text-muted">Avg Health</small></span>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-12 col-sm-6 col-md-3">
-          <div class="info-box shadow-sm">
-            <span class="info-box-icon bg-warning elevation-1"><i class="fas fa-file-alt text-white"></i></span>
-            <div class="info-box-content">
-              <span class="info-box-text">Pages SEO Score</span>
-              <span class="info-box-number font-weight-bold text-primary">91% <small class="text-muted">Avg Health</small></span>
-            </div>
-          </div>
-        </div>
-
-        <div class="col-12 col-sm-6 col-md-3">
-          <div class="info-box shadow-sm">
-            <span class="info-box-icon bg-danger elevation-1"><i class="fas fa-newspaper"></i></span>
-            <div class="info-box-content">
-              <span class="info-box-text">Blogs & Articles</span>
-              <span class="info-box-number font-weight-bold text-success">92% <small class="text-muted">Avg Health</small></span>
-            </div>
-          </div>
-        </div>
+        <?php
+        // Resource types configuration - used by both info boxes and health table
+        $resourceTypes = [
+            'products' => [
+                'icon' => 'fa-tag text-primary',
+                'name' => 'Products',
+                'table' => 'shopify_products',
+                'id_field' => 'id',
+                'title_field' => 'title',
+                'meta_field' => 'meta_description',
+                'handle_field' => 'handle',
+                'module' => 'products.php'
+            ],
+            'collections' => [
+                'icon' => 'fa-layer-group text-success',
+                'name' => 'Collections',
+                'table' => 'shopify_collections',
+                'id_field' => 'id',
+                'title_field' => 'title',
+                'meta_field' => 'meta_description',
+                'handle_field' => 'handle',
+                'module' => 'collections.php'
+            ],
+            'pages' => [
+                'icon' => 'fa-file-alt text-warning',
+                'name' => 'Pages',
+                'table' => 'shopify_pages',
+                'id_field' => 'id',
+                'title_field' => 'title',
+                'meta_field' => 'meta_description',
+                'handle_field' => 'handle',
+                'module' => 'pages.php'
+            ],
+            'blogs' => [
+                'icon' => 'fa-newspaper text-danger',
+                'name' => 'Blogs & Articles',
+                'table' => 'shopify_blogs',
+                'id_field' => 'id',
+                'title_field' => 'title',
+                'meta_field' => 'meta_description',
+                'handle_field' => 'handle',
+                'module' => 'blogs.php'
+            ]
+        ];
+        
+        // SEO Health function (replicate from config if not available)
+        if (!function_exists('calculateSeoHealth')) {
+            function calculateSeoHealth($title, $metaDescription, $handle) {
+                $score = 100;
+                $issues = [];
+                
+                $tLen = mb_strlen(trim($title));
+                $dLen = mb_strlen(trim($metaDescription));
+                $h = trim($handle);
+                
+                if ($tLen === 0) {
+                    $score -= 35;
+                    $issues[] = "Missing Page Title";
+                } elseif ($tLen < 35) {
+                    $score -= 15;
+                    $issues[] = "Title too short";
+                } elseif ($tLen > 65) {
+                    $score -= 10;
+                    $issues[] = "Title too long";
+                }
+                
+                if ($dLen === 0) {
+                    $score -= 35;
+                    $issues[] = "Missing Meta Description";
+                } elseif ($dLen < 90) {
+                    $score -= 15;
+                    $issues[] = "Meta description too short";
+                } elseif ($dLen > 165) {
+                    $score -= 10;
+                    $issues[] = "Meta description exceeds 160 chars";
+                }
+                
+                if (empty($h)) {
+                    $score -= 15;
+                    $issues[] = "Missing URL Handle";
+                }
+                
+                return [
+                    'score' => max(10, min(100, $score)),
+                    'issues' => $issues
+                ];
+            }
+        }
+        
+        // Pre-calculate SEO scores for info boxes
+        $seoScoresByResource = [];
+        $activeStore = $_SESSION['active_store'] ?? 'business';
+        $db = getDbConnection();
+        
+        if ($db) {
+            foreach ($resourceTypes as $key => $resource) {
+                $tableName = $resource['table'];
+                $seoScores = [];
+                
+                try {
+                    $itemsStmt = $db->prepare("SELECT `$resource[title_field]`, `$resource[meta_field]`, `$resource[handle_field]` FROM `$tableName` WHERE store_key = :store LIMIT 100");
+                    $itemsStmt->execute([':store' => $activeStore]);
+                    $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    foreach ($items as $item) {
+                        $title = $item[$resource['title_field']] ?? '';
+                        $meta = $item[$resource['meta_field']] ?? '';
+                        $handle = $item[$resource['handle_field']] ?? '';
+                        
+                        $seoAnalysis = calculateSeoHealth($title, $meta, $handle);
+                        $seoScores[] = $seoAnalysis['score'];
+                    }
+                    
+                    $seoScoresByResource[$key] = !empty($seoScores) ? round(array_sum($seoScores) / count($seoScores)) : 100;
+                } catch (Exception $e) {
+                    $seoScoresByResource[$key] = 100; // Default if table doesn't exist
+                }
+            }
+        }
+        
+        // Define info box configurations
+        $infoBoxes = [
+            'products' => [
+                'icon' => 'fa-tag',
+                'bg' => 'bg-info',
+                'text' => 'Product SEO Score',
+                'text_class' => ''
+            ],
+            'collections' => [
+                'icon' => 'fa-layer-group',
+                'bg' => 'bg-success',
+                'text' => 'Collections Health',
+                'text_class' => ''
+            ],
+            'pages' => [
+                'icon' => 'fa-file-alt text-white',
+                'bg' => 'bg-warning',
+                'text' => 'Pages SEO Score',
+                'text_class' => ''
+            ],
+            'blogs' => [
+                'icon' => 'fa-newspaper',
+                'bg' => 'bg-danger',
+                'text' => 'Blogs & Articles',
+                'text_class' => ''
+            ]
+        ];
+        
+        foreach ($infoBoxes as $key => $box) {
+            $score = $seoScoresByResource[$key] ?? 100;
+            $textClass = 'text-success';
+            if ($score < 70) {
+                $textClass = 'text-danger';
+            } elseif ($score < 85) {
+                $textClass = 'text-warning';
+            }
+            
+            echo '<div class="col-12 col-sm-6 col-md-3">';
+            echo '<div class="info-box shadow-sm">';
+            echo '<span class="info-box-icon ' . $box['bg'] . ' elevation-1"><i class="fas ' . $box['icon'] . '"></i></span>';
+            echo '<div class="info-box-content">';
+            echo '<span class="info-box-text">' . $box['text'] . '</span>';
+            echo '<span class="info-box-number font-weight-bold ' . $textClass . '">' . $score . '% <small class="text-muted">Avg Health</small></span>';
+            echo '</div>';
+            echo '</div>';
+            echo '</div>';
+        }
+        ?>
       </div>
 
       <!-- Quick Summary Table -->
@@ -328,38 +457,92 @@ include __DIR__ . '/../includes/sidebar.php';
               </tr>
             </thead>
             <tbody>
-              <tr>
-                <td><strong><i class="fas fa-tag text-primary mr-2"></i> Products</strong></td>
-                <td>5 Items</td>
-                <td><span class="badge badge-warning font-weight-bold">88%</span></td>
-                <td><span class="text-danger"><i class="fas fa-exclamation-triangle mr-1"></i> 2 Items need character optimization</span></td>
-                <td><span class="badge badge-secondary">2 Drafts</span></td>
-                <td><a href="products.php" class="btn btn-sm btn-primary">Open Module</a></td>
-              </tr>
-              <tr>
-                <td><strong><i class="fas fa-layer-group text-success mr-2"></i> Collections</strong></td>
-                <td>4 Collections</td>
-                <td><span class="badge badge-success font-weight-bold">93%</span></td>
-                <td><span class="text-success"><i class="fas fa-check-circle mr-1"></i> 0 Critical issues</span></td>
-                <td><span class="badge badge-secondary">1 Draft</span></td>
-                <td><a href="collections.php" class="btn btn-sm btn-primary">Open Module</a></td>
-              </tr>
-              <tr>
-                <td><strong><i class="fas fa-file-alt text-warning mr-2"></i> Pages</strong></td>
-                <td>3 Pages</td>
-                <td><span class="badge badge-success font-weight-bold">91%</span></td>
-                <td><span class="text-success"><i class="fas fa-check-circle mr-1"></i> All meta tags active</span></td>
-                <td><span class="badge badge-secondary">1 Draft</span></td>
-                <td><a href="pages.php" class="btn btn-sm btn-primary">Open Module</a></td>
-              </tr>
-              <tr>
-                <td><strong><i class="fas fa-newspaper text-danger mr-2"></i> Blogs & Articles</strong></td>
-                <td>2 Articles</td>
-                <td><span class="badge badge-success font-weight-bold">92%</span></td>
-                <td><span class="text-success"><i class="fas fa-check-circle mr-1"></i> High CTR Meta Tags</span></td>
-                <td><span class="badge badge-secondary">1 Draft</span></td>
-                <td><a href="blogs.php" class="btn btn-sm btn-primary">Open Module</a></td>
-              </tr>
+              <?php
+              // Store Health Audit Breakdown - Dynamic Data
+              // Reuse the resourceTypes and calculateSeoHealth from above
+              $db = getDbConnection(); // Re-establish db connection for this section
+              foreach ($resourceTypes as $key => $resource) {
+                  $tableName = $resource['table'];
+                  $totalItems = 0;
+                  $draftCount = 0;
+                  $seoScores = [];
+                  $allIssues = [];
+                  $itemsWithIssues = 0;
+                  
+                  if ($db) {
+                      try {
+                          // Count total items for this store
+                          $countStmt = $db->prepare("SELECT COUNT(*) FROM `$tableName` WHERE store_key = :store");
+                          $countStmt->execute([':store' => $activeStore]);
+                          $totalItems = (int)$countStmt->fetchColumn();
+                          
+                          // Count drafts
+                          $draftStmt = $db->prepare("SELECT COUNT(*) FROM `$tableName` WHERE store_key = :store AND status = 'draft'");
+                          $draftStmt->execute([':store' => $activeStore]);
+                          $draftCount = (int)$draftStmt->fetchColumn();
+                          
+                          // Get items for SEO analysis (limit to first 100 for performance)
+                          if ($totalItems > 0) {
+                              $itemsStmt = $db->prepare("SELECT `$resource[title_field]`, `$resource[meta_field]`, `$resource[handle_field]` FROM `$tableName` WHERE store_key = :store LIMIT 100");
+                              $itemsStmt->execute([':store' => $activeStore]);
+                              $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+                              
+                              foreach ($items as $item) {
+                                  $title = $item[$resource['title_field']] ?? '';
+                                  $meta = $item[$resource['meta_field']] ?? '';
+                                  $handle = $item[$resource['handle_field']] ?? '';
+                                  
+                                  $seoAnalysis = calculateSeoHealth($title, $meta, $handle);
+                                  $seoScores[] = $seoAnalysis['score'];
+                                  
+                                  if (!empty($seoAnalysis['issues'])) {
+                                      $allIssues = array_merge($allIssues, $seoAnalysis['issues']);
+                                      $itemsWithIssues++;
+                                  }
+                              }
+                          }
+                      } catch (Exception $e) {
+                          // Table doesn't exist or other error
+                          $totalItems = 0;
+                          $draftCount = 0;
+                          $seoScores = [];
+                      }
+                  }
+                  
+                  // Calculate average SEO score
+                  $avgSeoScore = !empty($seoScores) ? round(array_sum($seoScores) / count($seoScores)) : 100;
+                  
+                  // Determine score badge class
+                  $scoreBadgeClass = 'badge-success';
+                  if ($avgSeoScore < 70) {
+                      $scoreBadgeClass = 'badge-danger';
+                  } elseif ($avgSeoScore < 85) {
+                      $scoreBadgeClass = 'badge-warning';
+                  }
+                  
+                  // Generate issue summary
+                  if (empty($allIssues) && $itemsWithIssues === 0) {
+                      $issueSummary = '<span class="text-success"><i class="fas fa-check-circle mr-1"></i> 0 Critical issues</span>';
+                  } else {
+                      $uniqueIssues = array_unique($allIssues);
+                      $issueText = implode(', ', array_slice($uniqueIssues, 0, 3)); // Show first 3 issues
+                      if (count($uniqueIssues) > 3) {
+                          $issueText .= '...';
+                      }
+                      $issueSummary = '<span class="text-danger"><i class="fas fa-exclamation-triangle mr-1"></i> ' . $itemsWithIssues . ' Items need optimization</span>';
+                  }
+                  
+                  // Display row
+                  echo '<tr>';
+                  echo '<td><strong><i class="fas ' . $resource['icon'] . ' mr-2"></i> ' . $resource['name'] . '</strong></td>';
+                  echo '<td>' . $totalItems . ' ' . ($key === 'blogs' ? 'Articles' : ($key === 'collections' ? 'Collections' : 'Items')) . '</td>';
+                  echo '<td><span class="badge ' . $scoreBadgeClass . ' font-weight-bold">' . $avgSeoScore . '%</span></td>';
+                  echo '<td>' . $issueSummary . '</td>';
+                  echo '<td><span class="badge badge-secondary">' . $draftCount . ' Draft' . ($draftCount !== 1 ? 's' : '') . '</span></td>';
+                  echo '<td><a href="' . $resource['module'] . '" class="btn btn-sm btn-primary">Open Module</a></td>';
+                  echo '</tr>';
+              }
+              ?>
             </tbody>
           </table>
         </div>
