@@ -9,6 +9,8 @@
  *  4. Shows customer details, order details, and fulfillment status
  *  5. Filter orders by status
  *  6. Admin-only access
+ *  7. Syncs Accepts Email / SMS Marketing from customer data
+ *  8. Export with Email / Export with SMS
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -77,8 +79,19 @@ function buildExtraQuery(string $search, string $filterStatus): string
     return $params ? '&' . implode('&', $params) : '';
 }
 
+/**
+ * Normalize marketing consent value to "yes" / "no"
+ */
+function normalizeMarketingConsent($value): string
+{
+    if ($value === true || $value === 1 || $value === '1' || strtolower((string)$value) === 'true' || strtolower((string)$value) === 'yes' || strtolower((string)$value) === 'subscribed') {
+        return 'yes';
+    }
+    return 'no';
+}
+
 // -----------------------------------------------------------------------------
-// AUTO-CREATE / MIGRATE TABLE (safe - IF NOT EXISTS)
+// AUTO-CREATE / MIGRATE TABLE (safe - IF NOT EXISTS + add missing columns)
 // -----------------------------------------------------------------------------
 if ($db) {
     try {
@@ -91,6 +104,8 @@ if ($db) {
                 `full_name` VARCHAR(255) NULL DEFAULT NULL,
                 `email` VARCHAR(255) NULL DEFAULT NULL,
                 `phone` VARCHAR(50) NULL DEFAULT NULL,
+                `accepts_email_marketing` VARCHAR(10) NULL DEFAULT NULL,
+                `accepts_sms_marketing` VARCHAR(10) NULL DEFAULT NULL,
                 `shipping_address` TEXT NULL DEFAULT NULL,
                 `billing_address` TEXT NULL DEFAULT NULL,
                 `order_number` VARCHAR(50) NULL DEFAULT NULL,
@@ -112,6 +127,15 @@ if ($db) {
                 KEY `idx_orders_financial` (`financial_status`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
+
+        // Ensure new columns exist even if table was created earlier
+        $cols = $db->query("SHOW COLUMNS FROM `shopify_orders`")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('accepts_email_marketing', $cols, true)) {
+            $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `accepts_email_marketing` VARCHAR(10) NULL DEFAULT NULL COMMENT 'yes / no' AFTER `phone`");
+        }
+        if (!in_array('accepts_sms_marketing', $cols, true)) {
+            $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `accepts_sms_marketing` VARCHAR(10) NULL DEFAULT NULL COMMENT 'yes / no' AFTER `accepts_email_marketing`");
+        }
     } catch (PDOException $e) {
         // keep going
     }
@@ -138,15 +162,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             $pageNum   = 1;
             $syncCount = 0;
 
-            // Prepare the upsert statement once
+            // Prepare the upsert statement once (includes marketing columns)
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
+                    accepts_email_marketing, accepts_sms_marketing,
                     shipping_address, billing_address, order_number, total_price,
                     financial_status, fulfillment_status, fulfillment_details,
                     created_at, updated_at, line_items, shipping_city, shipping_zip, last_synced_at
                 ) VALUES (
                     :store_key, :shopify_order_id, :customer_id, :full_name, :email, :phone,
+                    :accepts_email_marketing, :accepts_sms_marketing,
                     :shipping_address, :billing_address, :order_number, :total_price,
                     :financial_status, :fulfillment_status, :fulfillment_details,
                     :created_at, :updated_at, :line_items, :shipping_city, :shipping_zip, NOW()
@@ -156,6 +182,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     full_name = VALUES(full_name),
                     email = VALUES(email),
                     phone = VALUES(phone),
+                    accepts_email_marketing = VALUES(accepts_email_marketing),
+                    accepts_sms_marketing = VALUES(accepts_sms_marketing),
                     shipping_address = VALUES(shipping_address),
                     billing_address = VALUES(billing_address),
                     order_number = VALUES(order_number),
@@ -240,13 +268,31 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                         $fullName = '';
                         $email    = '';
                         $phone    = '';
+                        $acceptsEmail = 'no';
+                        $acceptsSms   = 'no';
+
                         if (!empty($order['customer'])) {
+                            $c = $order['customer'];
+
                             $fullName = trim(
-                                ($order['customer']['first_name'] ?? '') . ' ' .
-                                ($order['customer']['last_name'] ?? '')
+                                ($c['first_name'] ?? '') . ' ' .
+                                ($c['last_name'] ?? '')
                             );
-                            $email = $order['customer']['email'] ?? '';
-                            $phone = $order['customer']['phone'] ?? '';
+                            $email = $c['email'] ?? '';
+                            $phone = $c['phone'] ?? '';
+
+                            // Email marketing consent
+                            // Prefer newer email_marketing_consent.state, fall back to accepts_marketing
+                            if (isset($c['email_marketing_consent']['state'])) {
+                                $acceptsEmail = normalizeMarketingConsent($c['email_marketing_consent']['state']);
+                            } elseif (isset($c['accepts_marketing'])) {
+                                $acceptsEmail = normalizeMarketingConsent($c['accepts_marketing']);
+                            }
+
+                            // SMS marketing consent
+                            if (isset($c['sms_marketing_consent']['state'])) {
+                                $acceptsSms = normalizeMarketingConsent($c['sms_marketing_consent']['state']);
+                            }
                         }
 
                         // Shipping address
@@ -303,24 +349,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                         $shippingZip  = $order['shipping_address']['zip'] ?? '';
 
                         $insertStmt->execute([
-                            ':store_key'           => $activeStore,
-                            ':shopify_order_id'    => $shopifyOrderId,
-                            ':customer_id'         => $customerId,
-                            ':full_name'           => $fullName,
-                            ':email'               => $email,
-                            ':phone'               => $phone,
-                            ':shipping_address'    => $shippingAddress,
-                            ':billing_address'     => $billingAddress,
-                            ':order_number'        => $orderNumber,
-                            ':total_price'         => $totalPrice,
-                            ':financial_status'    => $financialStatus,
-                            ':fulfillment_status'  => $fulfillmentStatus,
-                            ':fulfillment_details' => $fulfillmentDetails,
-                            ':created_at'          => $createdAt,
-                            ':updated_at'          => $updatedAt,
-                            ':line_items'          => $lineItems,
-                            ':shipping_city'       => $shippingCity,
-                            ':shipping_zip'        => $shippingZip
+                            ':store_key'                => $activeStore,
+                            ':shopify_order_id'         => $shopifyOrderId,
+                            ':customer_id'              => $customerId,
+                            ':full_name'                => $fullName,
+                            ':email'                    => $email,
+                            ':phone'                    => $phone,
+                            ':accepts_email_marketing'  => $acceptsEmail,
+                            ':accepts_sms_marketing'    => $acceptsSms,
+                            ':shipping_address'         => $shippingAddress,
+                            ':billing_address'          => $billingAddress,
+                            ':order_number'             => $orderNumber,
+                            ':total_price'              => $totalPrice,
+                            ':financial_status'         => $financialStatus,
+                            ':fulfillment_status'       => $fulfillmentStatus,
+                            ':fulfillment_details'      => $fulfillmentDetails,
+                            ':created_at'               => $createdAt,
+                            ':updated_at'               => $updatedAt,
+                            ':line_items'               => $lineItems,
+                            ':shipping_city'            => $shippingCity,
+                            ':shipping_zip'             => $shippingZip
                         ]);
                     }
                 }
@@ -419,7 +467,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $results[]  = "❌ Access Token: MISSING – No access token found for {$activeStore} store";
         $allSuccess = false;
     } else {
-        // Orders count - no status parameter needed for count endpoint
         $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json";
         $headers = [
             "Content-Type: application/json",
@@ -457,10 +504,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 }
 
 // -----------------------------------------------------------------------------
-// CSV EXPORT
+// CSV EXPORT – Email Marketing (accepts_email_marketing = yes)
 // -----------------------------------------------------------------------------
-if (isset($_GET['export']) && $_GET['export'] === 'csv') {
-    $filename = $activeStore . '_orders_' . date('Y-m-d') . '.csv';
+if (isset($_GET['export']) && $_GET['export'] === 'email') {
+    $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -474,6 +521,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         'Full Name',
         'Email',
         'Phone',
+        'Accepts Email Marketing',
+        'Accepts SMS Marketing',
         'Shipping Address',
         'Billing Address',
         'Total Price',
@@ -485,7 +534,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
 
     if ($db) {
         try {
-            $where  = "store_key = :store";
+            $where  = "store_key = :store AND accepts_email_marketing = 'yes'";
             $params = [':store' => $activeStore];
 
             if ($search !== '') {
@@ -509,6 +558,83 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
                     $order['full_name'] ?? '',
                     $order['email'] ?? '',
                     $order['phone'] ?? '',
+                    $order['accepts_email_marketing'] ?? '',
+                    $order['accepts_sms_marketing'] ?? '',
+                    $order['shipping_address'] ?? '',
+                    $order['billing_address'] ?? '',
+                    $order['total_price'] ?? '',
+                    $order['financial_status'] ?? '',
+                    $order['fulfillment_status'] ?? '',
+                    $order['created_at'] ?? '',
+                    $order['updated_at'] ?? ''
+                ]);
+            }
+        } catch (Exception $e) {
+            // silent
+        }
+    }
+
+    fclose($output);
+    exit;
+}
+
+// -----------------------------------------------------------------------------
+// CSV EXPORT – SMS Marketing (accepts_sms_marketing = yes)
+// -----------------------------------------------------------------------------
+if (isset($_GET['export']) && $_GET['export'] === 'sms') {
+    $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+
+    $output = fopen('php://output', 'w');
+
+    fputcsv($output, [
+        'Order ID',
+        'Order Number',
+        'Customer ID',
+        'Full Name',
+        'Email',
+        'Phone',
+        'Accepts Email Marketing',
+        'Accepts SMS Marketing',
+        'Shipping Address',
+        'Billing Address',
+        'Total Price',
+        'Financial Status',
+        'Fulfillment Status',
+        'Created At',
+        'Updated At'
+    ]);
+
+    if ($db) {
+        try {
+            $where  = "store_key = :store AND accepts_sms_marketing = 'yes'";
+            $params = [':store' => $activeStore];
+
+            if ($search !== '') {
+                $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search)";
+                $params[':search'] = "%{$search}%";
+            }
+            if ($filterStatus !== '') {
+                $where .= " AND fulfillment_status = :status";
+                $params[':status'] = $filterStatus;
+            }
+
+            $stmt = $db->prepare("SELECT * FROM shopify_orders WHERE {$where} ORDER BY created_at DESC");
+            $stmt->execute($params);
+            $allOrders = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            foreach ($allOrders as $order) {
+                fputcsv($output, [
+                    $order['shopify_order_id'] ?? '',
+                    $order['order_number'] ?? '',
+                    $order['customer_id'] ?? '',
+                    $order['full_name'] ?? '',
+                    $order['email'] ?? '',
+                    $order['phone'] ?? '',
+                    $order['accepts_email_marketing'] ?? '',
+                    $order['accepts_sms_marketing'] ?? '',
                     $order['shipping_address'] ?? '',
                     $order['billing_address'] ?? '',
                     $order['total_price'] ?? '',
@@ -562,8 +688,11 @@ include __DIR__ . '/../includes/sidebar.php';
               <i class="fas fa-sync-alt mr-1"></i> Sync Orders Data
             </button>
           </form>
-          <a href="orders.php?export=csv<?php echo $extraQuery; ?>" class="btn btn-success btn-sm shadow-sm font-weight-bold">
-            <i class="fas fa-file-csv mr-1"></i> Export CSV
+          <a href="orders.php?export=email<?php echo $extraQuery; ?>" class="btn btn-success btn-sm shadow-sm font-weight-bold mr-1">
+            <i class="fas fa-envelope mr-1"></i> Export with Email
+          </a>
+          <a href="orders.php?export=sms<?php echo $extraQuery; ?>" class="btn btn-primary btn-sm shadow-sm font-weight-bold">
+            <i class="fas fa-sms mr-1"></i> Export with SMS
           </a>
         </div>
       </div>
@@ -784,6 +913,8 @@ include __DIR__ . '/../includes/sidebar.php';
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Customer</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Email</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Phone</th>
+                  <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Email Mkt</th>
+                  <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">SMS Mkt</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Address</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Total</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Financial Status</th>
@@ -794,7 +925,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <tbody>
                 <?php if (empty($orders)): ?>
                   <tr>
-                    <td colspan="10" class="text-center py-4 text-muted">
+                    <td colspan="12" class="text-center py-4 text-muted">
                       <i class="fas fa-inbox fa-2x mb-2"></i><br>
                       No orders found<?php echo ($filterStatus !== '' || $search !== '') ? ' matching your filters.' : '.'; ?>
                       <?php if ($totalRows === 0 && $filterStatus === '' && $search === ''): ?>
@@ -822,6 +953,24 @@ include __DIR__ . '/../includes/sidebar.php';
                       </td>
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <?php echo htmlspecialchars($order['phone'] ?? 'N/A'); ?>
+                      </td>
+                      <td style="padding: 12px; font-size: 13px; text-align: center;">
+                        <?php
+                        $emailMkt = strtolower($order['accepts_email_marketing'] ?? 'no');
+                        $emailBadge = ($emailMkt === 'yes') ? 'bg-success' : 'bg-secondary';
+                        ?>
+                        <span class="badge <?php echo $emailBadge; ?> font-weight-bold" style="font-size: 11px; padding: 4px 8px;">
+                          <?php echo htmlspecialchars($order['accepts_email_marketing'] ?? 'no'); ?>
+                        </span>
+                      </td>
+                      <td style="padding: 12px; font-size: 13px; text-align: center;">
+                        <?php
+                        $smsMkt = strtolower($order['accepts_sms_marketing'] ?? 'no');
+                        $smsBadge = ($smsMkt === 'yes') ? 'bg-success' : 'bg-secondary';
+                        ?>
+                        <span class="badge <?php echo $smsBadge; ?> font-weight-bold" style="font-size: 11px; padding: 4px 8px;">
+                          <?php echo htmlspecialchars($order['accepts_sms_marketing'] ?? 'no'); ?>
+                        </span>
                       </td>
                       <td style="padding: 12px; font-size: 13px; max-width: 200px;">
                         <?php
