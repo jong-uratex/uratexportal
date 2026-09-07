@@ -133,9 +133,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
 
             // Fetch orders with proper Shopify cursor pagination (Link header)
             while ($hasMore && $pageNum <= 50) {
-                $endpoint = '/admin/api/' . $version . '/orders.json?limit=250&status=any';
+                $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
+                    // When using page_info, don't include status parameter (Shopify REST API restriction)
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
+                } else {
+                    // Only include status on first request
+                    $endpoint .= '&status=any';
                 }
                 $url = "https://" . trim($targetUrl, '/') . $endpoint;
 
@@ -406,8 +410,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $results[]  = "❌ Access Token: MISSING – No access token found for {$activeStore} store";
         $allSuccess = false;
     } else {
-        // Orders count
-        $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json?status=any";
+        // Orders count - no status parameter needed for count endpoint
+        $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json";
         $headers = [
             "Content-Type: application/json",
             "X-Shopify-Access-Token: {$token}"
