@@ -119,7 +119,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
     $token     = $shopCfg['access_token'] ?? '';
 
     if (empty($targetUrl) || empty($token)) {
-        $message     = 'Store configuration or access token missing for ' . $activeStore . ' store. Please check Settings.';
+        $missing = [];
+        if (empty($targetUrl)) $missing[] = 'Store URL';
+        if (empty($token)) $missing[] = 'Access Token';
+        $message     = 'Missing configuration: ' . implode(', ', $missing) . ' for ' . $activeStore . ' store. Please check Settings.';
         $messageType = 'danger';
     } else {
         try {
@@ -134,7 +137,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 if ($pageInfo) {
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
                 }
-                $url = "https://{$targetUrl}{$endpoint}";
+                $url = "https://" . trim($targetUrl, '/') . $endpoint;
 
                 $headers = [
                     "Content-Type: application/json",
@@ -158,7 +161,28 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
 
                 if ($httpCode !== 200) {
                     $errorData = json_decode($body, true);
-                    throw new Exception('API Error (orders): ' . ($errorData['errors'] ?? 'HTTP ' . $httpCode));
+                    $errorMsg = 'HTTP ' . $httpCode;
+                    
+                    if (is_array($errorData)) {
+                        if (!empty($errorData['errors'])) {
+                            if (is_string($errorData['errors'])) {
+                                $errorMsg = $errorData['errors'];
+                            } elseif (is_array($errorData['errors'])) {
+                                $errorMsg = json_encode($errorData['errors']);
+                            }
+                        } elseif (!empty($errorData['error_description'])) {
+                            $errorMsg = $errorData['error_description'];
+                        } elseif (!empty($errorData['error'])) {
+                            $errorMsg = $errorData['error'];
+                        }
+                    }
+                    
+                    // If we still have a non-string error, convert it
+                    if (!is_string($errorMsg)) {
+                        $errorMsg = print_r($errorData, true) ?: ('HTTP ' . $httpCode);
+                    }
+                    
+                    throw new Exception('API Error (orders): ' . $errorMsg . ' | URL: ' . $url);
                 }
 
                 $data = json_decode($body, true);
@@ -383,7 +407,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $allSuccess = false;
     } else {
         // Orders count
-        $testUrl = "https://{$targetUrl}/admin/api/{$version}/orders/count.json?status=any";
+        $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json?status=any";
         $headers = [
             "Content-Type: application/json",
             "X-Shopify-Access-Token: {$token}"
@@ -402,7 +426,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             $count     = $data['count'] ?? 0;
             $results[] = "✅ Pull Orders: SUCCESS – Found {$count} orders in {$activeStore} store";
         } else {
-            $results[]  = "❌ Pull Orders: FAILED – HTTP {$httpCode}";
+            $errorData = json_decode($response, true);
+            $errorMsg = 'HTTP ' . $httpCode;
+            if (is_array($errorData) && !empty($errorData['errors'])) {
+                $errorMsg = is_string($errorData['errors']) ? $errorData['errors'] : json_encode($errorData['errors']);
+            } elseif (is_array($errorData) && !empty($errorData['error'])) {
+                $errorMsg = $errorData['error'];
+            }
+            $results[]  = "❌ Pull Orders: FAILED – {$errorMsg} | URL: {$testUrl}";
             $allSuccess = false;
         }
     }
