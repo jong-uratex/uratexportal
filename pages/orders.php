@@ -8,12 +8,19 @@
  *  3. 20 Orders Per Page Pagination
  *  4. Shows customer details, order details, and fulfillment status
  *  5. Filter orders by status
+ *  6. Admin-only access
  */
 require_once __DIR__ . '/../config/config.php';
 
-// Auth Guard
+// Auth Guard – login required
 if (!isset($_SESSION['user_logged_in'])) {
     header("Location: ../login.php");
+    exit;
+}
+
+// Admin-only access
+if (($_SESSION['user_role'] ?? 'editor') !== 'admin') {
+    header("Location: dashboard.php");
     exit;
 }
 
