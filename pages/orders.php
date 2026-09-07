@@ -132,6 +132,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             $pageNum   = 1;
 
             // Fetch orders with proper Shopify cursor pagination (Link header)
+            // Process in batches to avoid memory issues on shared hosting
+            $syncCount = 0;
             while ($hasMore && $pageNum <= 50) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
@@ -152,8 +154,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
                 curl_setopt($ch, CURLOPT_HEADER, true);
+                curl_setopt($ch, CURLOPT_failonerror, false);
 
                 $rawResponse = curl_exec($ch);
                 $httpCode    = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -191,7 +194,93 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
 
                 $data = json_decode($body, true);
                 if (!empty($data['orders'])) {
-                    $allOrders = array_merge($allOrders, $data['orders']);
+                    // Process and save this batch immediately to reduce memory usage
+                    foreach ($data['orders'] as $order) {
+                        $syncCount++;
+                        // Process and save single order immediately
+                        $shopifyOrderId = $order['id'] ?? 0;
+                        $customerId = $order['customer']['id'] ?? 0;
+                        $fullName = '';
+                        $email = '';
+                        $phone = '';
+
+                        // Get customer info
+                        if (!empty($order['customer'])) {
+                            $fullName = ($order['customer']['first_name'] ?? '') . ' ' . ($order['customer']['last_name'] ?? '');
+                            $fullName = trim($fullName);
+                            $email = $order['customer']['email'] ?? '';
+                            $phone = $order['customer']['phone'] ?? '';
+                        }
+
+                        // Shipping address
+                        $shippingAddress = '';
+                        if (!empty($order['shipping_address'])) {
+                            $sa = $order['shipping_address'];
+                            $shippingAddress = ($sa['first_name'] ?? '') . ' ' . ($sa['last_name'] ?? '') . '\n';
+                            $shippingAddress .= ($sa['address1'] ?? '') . '\n';
+                            $shippingAddress .= ($sa['address2'] ?? '') . '\n';
+                            $shippingAddress .= ($sa['city'] ?? '') . ', ' . ($sa['province'] ?? '') . ' ' . ($sa['zip'] ?? '') . '\n';
+                            $shippingAddress .= ($sa['country'] ?? '');
+                        }
+
+                        // Billing address
+                        $billingAddress = '';
+                        if (!empty($order['billing_address'])) {
+                            $ba = $order['billing_address'];
+                            $billingAddress = ($ba['first_name'] ?? '') . ' ' . ($ba['last_name'] ?? '') . '\n';
+                            $billingAddress .= ($ba['address1'] ?? '') . '\n';
+                            $billingAddress .= ($ba['address2'] ?? '') . '\n';
+                            $billingAddress .= ($ba['city'] ?? '') . ', ' . ($ba['province'] ?? '') . ' ' . ($ba['zip'] ?? '') . '\n';
+                            $billingAddress .= ($ba['country'] ?? '');
+                        }
+
+                        $orderNumber = $order['name'] ?? ($order['order_number'] ?? '');
+                        $totalPrice = (float)($order['total_price'] ?? 0);
+                        $financialStatus = $order['financial_status'] ?? '';
+                        $fulfillmentStatus = $order['fulfillment_status'] ?? '';
+
+                        // Fulfillment details
+                        $fulfillmentDetails = '';
+                        if (!empty($order['fulfillments']) && is_array($order['fulfillments'])) {
+                            foreach ($order['fulfillments'] as $fulfillment) {
+                                $fulfillmentDetails .= 'Created: ' . ($fulfillment['created_at'] ?? 'N/A') . '\n';
+                                $fulfillmentDetails .= 'Status: ' . ($fulfillment['status'] ?? 'N/A') . '\n';
+                                if (!empty($fulfillment['line_items']) && is_array($fulfillment['line_items'])) {
+                                    foreach ($fulfillment['line_items'] as $item) {
+                                        $fulfillmentDetails .= '  - ' . ($item['name'] ?? 'N/A') . ': ' . ($item['quantity'] ?? 0) . '\n';
+                                    }
+                                }
+                                $fulfillmentDetails .= '\n';
+                            }
+                        }
+
+                        $createdAt = !empty($order['created_at']) ? date('Y-m-d H:i:s', strtotime($order['created_at'])) : null;
+                        $updatedAt = !empty($order['updated_at']) ? date('Y-m-d H:i:s', strtotime($order['updated_at'])) : null;
+                        $lineItems = json_encode($order['line_items'] ?? []);
+                        $shippingCity = $order['shipping_address']['city'] ?? '';
+                        $shippingZip = $order['shipping_address']['zip'] ?? '';
+
+                        $insertStmt->execute([
+                            ':store_key' => $activeStore,
+                            ':shopify_order_id' => $shopifyOrderId,
+                            ':customer_id' => $customerId,
+                            ':full_name' => $fullName,
+                            ':email' => $email,
+                            ':phone' => $phone,
+                            ':shipping_address' => $shippingAddress,
+                            ':billing_address' => $billingAddress,
+                            ':order_number' => $orderNumber,
+                            ':total_price' => $totalPrice,
+                            ':financial_status' => $financialStatus,
+                            ':fulfillment_status' => $fulfillmentStatus,
+                            ':fulfillment_details' => $fulfillmentDetails,
+                            ':created_at' => $createdAt,
+                            ':updated_at' => $updatedAt,
+                            ':line_items' => $lineItems,
+                            ':shipping_city' => $shippingCity,
+                            ':shipping_zip' => $shippingZip
+                        ]);
+                    }
                 }
 
                 // Parse Link header for next page_info
@@ -212,9 +301,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 $pageNum++;
             }
 
-            // Save orders into shopify_orders
-            if ($db && !empty($allOrders)) {
-                $insertStmt = $db->prepare("
+            // All orders have been saved in batches above
+            if ($db) {
                     INSERT INTO shopify_orders (
                         store_key, shopify_order_id, customer_id, full_name, email, phone,
                         shipping_address, billing_address, order_number, total_price,
