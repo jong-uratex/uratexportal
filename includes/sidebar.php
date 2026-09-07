@@ -63,6 +63,12 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Blogs & Articles</p>
           </a>
         </li>
+        <li class="nav-item">
+          <a href="orders.php" class="nav-link <?php echo ($currentScript === 'orders.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-shopping-cart"></i>
+            <p>Orders</p>
+          </a>
+        </li>
         <li class="nav-header text-uppercase text-secondary font-weight-bold" style="font-size: 11px;">Tools & Utilities</li>
         <li class="nav-item">
           <a href="#" class="nav-link">
