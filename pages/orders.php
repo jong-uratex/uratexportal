@@ -6,11 +6,12 @@
  *  1. Displays all orders from Shopify REST API
  *  2. Saves & persists orders in MySQL table `shopify_orders`
  *  3. 20 Orders Per Page Pagination
- *  4. Shows customer details, order details, and fulfillment status
+ *  4. Shows customer details, order details (products), and fulfillment status
  *  5. Filter orders by status
  *  6. Admin-only access
  *  7. Syncs Accepts Email / SMS Marketing from customer data
  *  8. Export with Email / Export with SMS
+ *  9. Syncs & displays Order Details (product names + qty)
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -90,6 +91,23 @@ function normalizeMarketingConsent($value): string
     return 'no';
 }
 
+/**
+ * Build a human-readable Order Details string from Shopify line_items.
+ * Example: "Uratex Foam Mattress x2\nPillow Set x1"
+ */
+function buildOrderDetails(array $lineItems): string
+{
+    $parts = [];
+    foreach ($lineItems as $item) {
+        $name = trim($item['name'] ?? $item['title'] ?? 'Unknown Product');
+        $qty  = (int)($item['quantity'] ?? 1);
+        if ($name !== '') {
+            $parts[] = $name . ' x' . $qty;
+        }
+    }
+    return implode("\n", $parts);
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE / MIGRATE TABLE (safe - IF NOT EXISTS + add missing columns)
 // -----------------------------------------------------------------------------
@@ -116,6 +134,7 @@ if ($db) {
                 `created_at` DATETIME NULL DEFAULT NULL,
                 `updated_at` DATETIME NULL DEFAULT NULL,
                 `line_items` JSON NULL DEFAULT NULL,
+                `order_details` TEXT NULL DEFAULT NULL,
                 `shipping_city` VARCHAR(255) NULL DEFAULT NULL,
                 `shipping_zip` VARCHAR(50) NULL DEFAULT NULL,
                 `last_synced_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -128,13 +147,17 @@ if ($db) {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
 
-        // Ensure new columns exist even if table was created earlier
+        // Ensure columns exist even if table was created earlier
         $cols = $db->query("SHOW COLUMNS FROM `shopify_orders`")->fetchAll(PDO::FETCH_COLUMN);
+
         if (!in_array('accepts_email_marketing', $cols, true)) {
             $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `accepts_email_marketing` VARCHAR(10) NULL DEFAULT NULL COMMENT 'yes / no' AFTER `phone`");
         }
         if (!in_array('accepts_sms_marketing', $cols, true)) {
             $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `accepts_sms_marketing` VARCHAR(10) NULL DEFAULT NULL COMMENT 'yes / no' AFTER `accepts_email_marketing`");
+        }
+        if (!in_array('order_details', $cols, true)) {
+            $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `order_details` TEXT NULL DEFAULT NULL COMMENT 'Product name(s) + qty' AFTER `line_items`");
         }
     } catch (PDOException $e) {
         // keep going
@@ -162,20 +185,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             $pageNum   = 1;
             $syncCount = 0;
 
-            // Prepare the upsert statement once (includes marketing columns)
+            // Prepare the upsert statement once (includes marketing + order_details)
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
                     accepts_email_marketing, accepts_sms_marketing,
                     shipping_address, billing_address, order_number, total_price,
                     financial_status, fulfillment_status, fulfillment_details,
-                    created_at, updated_at, line_items, shipping_city, shipping_zip, last_synced_at
+                    created_at, updated_at, line_items, order_details, shipping_city, shipping_zip, last_synced_at
                 ) VALUES (
                     :store_key, :shopify_order_id, :customer_id, :full_name, :email, :phone,
                     :accepts_email_marketing, :accepts_sms_marketing,
                     :shipping_address, :billing_address, :order_number, :total_price,
                     :financial_status, :fulfillment_status, :fulfillment_details,
-                    :created_at, :updated_at, :line_items, :shipping_city, :shipping_zip, NOW()
+                    :created_at, :updated_at, :line_items, :order_details, :shipping_city, :shipping_zip, NOW()
                 )
                 ON DUPLICATE KEY UPDATE
                     customer_id = VALUES(customer_id),
@@ -194,6 +217,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     created_at = VALUES(created_at),
                     updated_at = VALUES(updated_at),
                     line_items = VALUES(line_items),
+                    order_details = VALUES(order_details),
                     shipping_city = VALUES(shipping_city),
                     shipping_zip = VALUES(shipping_zip),
                     last_synced_at = NOW()
@@ -202,10 +226,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             while ($hasMore && $pageNum <= 50) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
-                    // When using page_info, don't include status parameter (Shopify REST API restriction)
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
                 } else {
-                    // Only include status on first request
                     $endpoint .= '&status=any';
                 }
                 $url = "https://" . trim($targetUrl, '/') . $endpoint;
@@ -282,7 +304,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             $phone = $c['phone'] ?? '';
 
                             // Email marketing consent
-                            // Prefer newer email_marketing_consent.state, fall back to accepts_marketing
                             if (isset($c['email_marketing_consent']['state'])) {
                                 $acceptsEmail = normalizeMarketingConsent($c['email_marketing_consent']['state']);
                             } elseif (isset($c['accepts_marketing'])) {
@@ -344,7 +365,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ? date('Y-m-d H:i:s', strtotime($order['updated_at']))
                             : null;
 
-                        $lineItems    = json_encode($order['line_items'] ?? []);
+                        $rawLineItems = $order['line_items'] ?? [];
+                        $lineItems    = json_encode($rawLineItems);
+                        $orderDetails = buildOrderDetails(is_array($rawLineItems) ? $rawLineItems : []);
+
                         $shippingCity = $order['shipping_address']['city'] ?? '';
                         $shippingZip  = $order['shipping_address']['zip'] ?? '';
 
@@ -367,6 +391,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ':created_at'               => $createdAt,
                             ':updated_at'               => $updatedAt,
                             ':line_items'               => $lineItems,
+                            ':order_details'            => $orderDetails,
                             ':shipping_city'            => $shippingCity,
                             ':shipping_zip'             => $shippingZip
                         ]);
@@ -417,7 +442,7 @@ if ($db) {
         $params = [':store' => $activeStore];
 
         if ($search !== '') {
-            $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search)";
+            $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search OR order_details LIKE :search)";
             $params[':search'] = "%{$search}%";
         }
         if ($filterStatus !== '') {
@@ -523,6 +548,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
         'Phone',
         'Accepts Email Marketing',
         'Accepts SMS Marketing',
+        'Order Details',
         'Shipping Address',
         'Billing Address',
         'Total Price',
@@ -538,7 +564,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
             $params = [':store' => $activeStore];
 
             if ($search !== '') {
-                $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search)";
+                $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search OR order_details LIKE :search)";
                 $params[':search'] = "%{$search}%";
             }
             if ($filterStatus !== '') {
@@ -560,6 +586,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
                     $order['phone'] ?? '',
                     $order['accepts_email_marketing'] ?? '',
                     $order['accepts_sms_marketing'] ?? '',
+                    $order['order_details'] ?? '',
                     $order['shipping_address'] ?? '',
                     $order['billing_address'] ?? '',
                     $order['total_price'] ?? '',
@@ -598,6 +625,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
         'Phone',
         'Accepts Email Marketing',
         'Accepts SMS Marketing',
+        'Order Details',
         'Shipping Address',
         'Billing Address',
         'Total Price',
@@ -613,7 +641,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
             $params = [':store' => $activeStore];
 
             if ($search !== '') {
-                $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search)";
+                $where .= " AND (order_number LIKE :search OR full_name LIKE :search OR email LIKE :search OR phone LIKE :search OR shipping_city LIKE :search OR order_details LIKE :search)";
                 $params[':search'] = "%{$search}%";
             }
             if ($filterStatus !== '') {
@@ -635,6 +663,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
                     $order['phone'] ?? '',
                     $order['accepts_email_marketing'] ?? '',
                     $order['accepts_sms_marketing'] ?? '',
+                    $order['order_details'] ?? '',
                     $order['shipping_address'] ?? '',
                     $order['billing_address'] ?? '',
                     $order['total_price'] ?? '',
@@ -672,7 +701,7 @@ include __DIR__ . '/../includes/sidebar.php';
             <i class="fas fa-shopping-cart mr-2"></i><?php echo ucfirst($activeStore); ?> Orders
           </h1>
           <p class="text-muted small mb-0 mt-1">
-            View and manage all orders with customer details, order information, and fulfillment status.
+            View and manage all orders with customer details, products bought, and fulfillment status.
           </p>
         </div>
         <div class="col-sm-4 text-right">
@@ -844,7 +873,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   type="text"
                   name="search"
                   class="form-control border-left-0 text-sm"
-                  placeholder="Search by order #, name, email, phone..."
+                  placeholder="Search by order #, name, email, phone, product..."
                   value="<?php echo htmlspecialchars($search); ?>"
                 >
                 <?php if ($filterStatus !== ''): ?>
@@ -915,6 +944,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Phone</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Email Mkt</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">SMS Mkt</th>
+                  <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Order Details</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Address</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Total</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Financial Status</th>
@@ -925,7 +955,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <tbody>
                 <?php if (empty($orders)): ?>
                   <tr>
-                    <td colspan="12" class="text-center py-4 text-muted">
+                    <td colspan="13" class="text-center py-4 text-muted">
                       <i class="fas fa-inbox fa-2x mb-2"></i><br>
                       No orders found<?php echo ($filterStatus !== '' || $search !== '') ? ' matching your filters.' : '.'; ?>
                       <?php if ($totalRows === 0 && $filterStatus === '' && $search === ''): ?>
@@ -971,6 +1001,16 @@ include __DIR__ . '/../includes/sidebar.php';
                         <span class="badge <?php echo $smsBadge; ?> font-weight-bold" style="font-size: 11px; padding: 4px 8px;">
                           <?php echo htmlspecialchars($order['accepts_sms_marketing'] ?? 'no'); ?>
                         </span>
+                      </td>
+                      <td style="padding: 12px; font-size: 13px; max-width: 220px;">
+                        <?php
+                        $details = $order['order_details'] ?? '';
+                        if (!empty($details)) {
+                            echo nl2br(htmlspecialchars($details));
+                        } else {
+                            echo '<span class="text-muted">N/A</span>';
+                        }
+                        ?>
                       </td>
                       <td style="padding: 12px; font-size: 13px; max-width: 200px;">
                         <?php
