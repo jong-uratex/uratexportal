@@ -10,7 +10,7 @@
  *  5. Filter orders by status
  *  6. Admin-only access
  *  7. Syncs Accepts Email / SMS Marketing from customer data
- *  8. Export with Email / Export with SMS
+ *  8. Export with Email / Export with SMS (custom columns)
  *  9. Syncs & displays Order Details (product names + qty)
  */
 require_once __DIR__ . '/../config/config.php';
@@ -185,7 +185,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             $pageNum   = 1;
             $syncCount = 0;
 
-            // Prepare the upsert statement once (includes marketing + order_details)
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
@@ -303,14 +302,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             $email = $c['email'] ?? '';
                             $phone = $c['phone'] ?? '';
 
-                            // Email marketing consent
                             if (isset($c['email_marketing_consent']['state'])) {
                                 $acceptsEmail = normalizeMarketingConsent($c['email_marketing_consent']['state']);
                             } elseif (isset($c['accepts_marketing'])) {
                                 $acceptsEmail = normalizeMarketingConsent($c['accepts_marketing']);
                             }
 
-                            // SMS marketing consent
                             if (isset($c['sms_marketing_consent']['state'])) {
                                 $acceptsSms = normalizeMarketingConsent($c['sms_marketing_consent']['state']);
                             }
@@ -530,6 +527,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 
 // -----------------------------------------------------------------------------
 // CSV EXPORT – Email Marketing (accepts_email_marketing = yes)
+// Columns: Order ID, Order Number, Customer Name, Address, Email,
+//          Order Details, Date of purchase, Financial Status, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
@@ -542,20 +541,13 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
     fputcsv($output, [
         'Order ID',
         'Order Number',
-        'Customer ID',
-        'Full Name',
+        'Customer Name',
+        'Address',
         'Email',
-        'Phone',
-        'Accepts Email Marketing',
-        'Accepts SMS Marketing',
-        'Order Details',
-        'Shipping Address',
-        'Billing Address',
-        'Total Price',
+        'Order Details (Product name)',
+        'Date of purchase (Created at)',
         'Financial Status',
-        'Fulfillment Status',
-        'Created At',
-        'Updated At'
+        'Fulfillment Status'
     ]);
 
     if ($db) {
@@ -580,20 +572,13 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
                 fputcsv($output, [
                     $order['shopify_order_id'] ?? '',
                     $order['order_number'] ?? '',
-                    $order['customer_id'] ?? '',
                     $order['full_name'] ?? '',
-                    $order['email'] ?? '',
-                    $order['phone'] ?? '',
-                    $order['accepts_email_marketing'] ?? '',
-                    $order['accepts_sms_marketing'] ?? '',
-                    $order['order_details'] ?? '',
                     $order['shipping_address'] ?? '',
-                    $order['billing_address'] ?? '',
-                    $order['total_price'] ?? '',
-                    $order['financial_status'] ?? '',
-                    $order['fulfillment_status'] ?? '',
+                    $order['email'] ?? '',
+                    $order['order_details'] ?? '',
                     $order['created_at'] ?? '',
-                    $order['updated_at'] ?? ''
+                    $order['financial_status'] ?? '',
+                    $order['fulfillment_status'] ?? ''
                 ]);
             }
         } catch (Exception $e) {
@@ -607,6 +592,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
 
 // -----------------------------------------------------------------------------
 // CSV EXPORT – SMS Marketing (accepts_sms_marketing = yes)
+// Columns: Order ID, Order Number, Customer Name, Address, Phone Number,
+//          Order Details, Date of purchase, Financial Status, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
@@ -619,20 +606,13 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     fputcsv($output, [
         'Order ID',
         'Order Number',
-        'Customer ID',
-        'Full Name',
-        'Email',
-        'Phone',
-        'Accepts Email Marketing',
-        'Accepts SMS Marketing',
-        'Order Details',
-        'Shipping Address',
-        'Billing Address',
-        'Total Price',
+        'Customer Name',
+        'Address',
+        'Phone Number',
+        'Order Details (Product name)',
+        'Date of purchase (Created at)',
         'Financial Status',
-        'Fulfillment Status',
-        'Created At',
-        'Updated At'
+        'Fulfillment Status'
     ]);
 
     if ($db) {
@@ -657,20 +637,13 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
                 fputcsv($output, [
                     $order['shopify_order_id'] ?? '',
                     $order['order_number'] ?? '',
-                    $order['customer_id'] ?? '',
                     $order['full_name'] ?? '',
-                    $order['email'] ?? '',
-                    $order['phone'] ?? '',
-                    $order['accepts_email_marketing'] ?? '',
-                    $order['accepts_sms_marketing'] ?? '',
-                    $order['order_details'] ?? '',
                     $order['shipping_address'] ?? '',
-                    $order['billing_address'] ?? '',
-                    $order['total_price'] ?? '',
-                    $order['financial_status'] ?? '',
-                    $order['fulfillment_status'] ?? '',
+                    $order['phone'] ?? '',
+                    $order['order_details'] ?? '',
                     $order['created_at'] ?? '',
-                    $order['updated_at'] ?? ''
+                    $order['financial_status'] ?? '',
+                    $order['fulfillment_status'] ?? ''
                 ]);
             }
         } catch (Exception $e) {
