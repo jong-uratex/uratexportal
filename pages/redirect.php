@@ -77,6 +77,81 @@ function isValidRedirectTarget(string $target): bool
     return (bool)preg_match('#^https?://[^\s/$.?#].[^\s]*$#i', $target);
 }
 
+/**
+ * Add a new URL redirect: validates input, creates it live on Shopify
+ * (POST /admin/api/{version}/redirects.json), then caches it locally.
+ *
+ * @return array{success: bool, message: string, shopify_id: int}
+ */
+function createShopifyRedirect($db, array $shopCfg, string $activeStore, string $currentUser, string $path, string $target): array
+{
+    $path   = normaliseRedirectPath($path);
+    $target = trim($target);
+
+    if ($path === '' || $target === '') {
+        throw new Exception('Both "From URL" (path) and "To URL" (target) are required.');
+    }
+    if (!isValidRedirectTarget($target)) {
+        throw new Exception('Invalid target. Use a path starting with "/" or a full https:// URL.');
+    }
+
+    $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
+    $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+    $postUrl     = "https://{$adminDomain}/admin/api/{$version}/redirects.json";
+    $payload     = json_encode(['redirect' => ['path' => $path, 'target' => $target]]);
+
+    $ch = curl_init($postUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $payload,
+        CURLOPT_HTTPHEADER     => [
+            "X-Shopify-Access-Token: " . ($shopCfg['access_token'] ?? ''),
+            "Content-Type: application/json"
+        ],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $res      = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $rJson = json_decode(is_string($res) ? $res : '', true);
+
+    if ($httpCode < 200 || $httpCode >= 300 || empty($rJson['redirect']['id'])) {
+        $errDetail = $rJson['errors'] ?? substr(is_string($res) ? $res : '', 0, 300);
+        throw new Exception("Shopify API returned HTTP {$httpCode}. " . (is_string($errDetail) ? $errDetail : json_encode($errDetail)));
+    }
+
+    $shopifyId = (int)$rJson['redirect']['id'];
+    $savedPath   = $rJson['redirect']['path'] ?? $path;
+    $savedTarget = $rJson['redirect']['target'] ?? $target;
+
+    if ($db) {
+        $stmt = $db->prepare("
+            INSERT INTO shopify_redirects (store_key, shopify_redirect_id, `path`, `target`, last_synced_at, last_pushed_at, updated_by)
+            VALUES (:store, :rid, :path, :target, NOW(), NOW(), :user)
+            ON DUPLICATE KEY UPDATE `path` = VALUES(`path`), `target` = VALUES(`target`),
+                last_synced_at = NOW(), last_pushed_at = NOW(), updated_by = VALUES(updated_by)
+        ");
+        $stmt->execute([
+            ':store'  => $activeStore,
+            ':rid'    => $shopifyId,
+            ':path'   => $savedPath,
+            ':target' => $savedTarget,
+            ':user'   => $currentUser,
+        ]);
+    }
+
+    recordUserLog('redirect_created', 'redirects', "Created {$savedPath} → {$savedTarget}", 'redirect', (string)$shopifyId, 'success');
+
+    return [
+        'success'    => true,
+        'message'    => "Redirect created: {$savedPath} → {$savedTarget}",
+        'shopify_id' => $shopifyId,
+    ];
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
@@ -400,64 +475,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
     }
 }
 
-// C. CREATE REDIRECT (Shopify POST + local insert)
+// C. CREATE REDIRECT (uses createShopifyRedirect() helper)
 if (isset($_POST['action']) && $_POST['action'] === 'create_redirect') {
     try {
-        $path   = normaliseRedirectPath((string)($_POST['path'] ?? ''));
-        $target = trim((string)($_POST['target'] ?? ''));
-
-        if ($path === '' || $target === '') {
-            throw new Exception('Both "From URL" (path) and "To URL" (target) are required.');
-        }
-        if (!isValidRedirectTarget($target)) {
-            throw new Exception('Invalid target. Use a path starting with "/" or a full https:// URL.');
-        }
-
-        $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
-        $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
-        $postUrl     = "https://{$adminDomain}/admin/api/{$version}/redirects.json";
-        $payload     = json_encode(['redirect' => ['path' => $path, 'target' => $target]]);
-
-        $ch = curl_init($postUrl);
-        curl_setopt_array($ch, [
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => $payload,
-            CURLOPT_HTTPHEADER     => [
-                "X-Shopify-Access-Token: " . ($shopCfg['access_token'] ?? ''),
-                "Content-Type: application/json"
-            ],
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_TIMEOUT        => 15,
-        ]);
-        $res      = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        $rJson = json_decode(is_string($res) ? $res : '', true);
-
-        if ($httpCode >= 200 && $httpCode < 300 && !empty($rJson['redirect']['id'])) {
-            if ($db) {
-                $stmt = $db->prepare("
-                    INSERT INTO shopify_redirects (store_key, shopify_redirect_id, `path`, `target`, last_synced_at, last_pushed_at, updated_by)
-                    VALUES (:store, :rid, :path, :target, NOW(), NOW(), :user)
-                    ON DUPLICATE KEY UPDATE `path` = VALUES(`path`), `target` = VALUES(`target`),
-                        last_synced_at = NOW(), last_pushed_at = NOW(), updated_by = VALUES(updated_by)
-                ");
-                $stmt->execute([
-                    ':store'  => $activeStore,
-                    ':rid'    => (int)$rJson['redirect']['id'],
-                    ':path'   => $rJson['redirect']['path'] ?? $path,
-                    ':target' => $rJson['redirect']['target'] ?? $target,
-                    ':user'   => $currentUser,
-                ]);
-            }
-            $message = "✅ Redirect created: <strong>" . htmlspecialchars($path) . "</strong> → <strong>" . htmlspecialchars($target) . "</strong>";
-            recordUserLog('redirect_created', 'redirects', "Created {$path} → {$target}", 'redirect', (string)($rJson['redirect']['id'] ?? ''), 'success');
-        } else {
-            $errDetail = $rJson['errors'] ?? substr(is_string($res) ? $res : '', 0, 300);
-            throw new Exception("Shopify API returned HTTP {$httpCode}. " . (is_string($errDetail) ? $errDetail : json_encode($errDetail)));
-        }
+        $result  = createShopifyRedirect(
+            $db,
+            $shopCfg,
+            $activeStore,
+            $currentUser,
+            (string)($_POST['path'] ?? ''),
+            (string)($_POST['target'] ?? '')
+        );
+        $message = "✅ " . htmlspecialchars($result['message']);
     } catch (Throwable $e) {
         $message = "ERROR: Create failed – " . htmlspecialchars($e->getMessage());
         recordUserLog('redirect_create_failed', 'redirects', $message, 'redirect', null, 'error');
@@ -730,6 +759,34 @@ include __DIR__ . '/../includes/sidebar.php';
             <h6 class="font-weight-bold mb-0 text-info mt-2"><?php echo $lastSyncedAt ? htmlspecialchars($lastSyncedAt) : 'Never'; ?></h6>
           </div>
         </div>
+      </div>
+
+      <!-- Add New Redirect (inline form — same createShopifyRedirect() backend as the modal) -->
+      <div class="card p-3 mb-4 shadow-sm border-0" style="border-radius: 12px; border-top: 4px solid #16a34a !important;">
+        <form method="POST" action="redirect.php" class="row align-items-end">
+          <input type="hidden" name="action" value="create_redirect">
+          <div class="col-md-12 mb-2">
+            <h5 class="font-weight-bold mb-0 text-dark"><i class="fas fa-plus-circle text-success mr-2"></i>Add New URL Redirect</h5>
+            <small class="text-muted">Creates the redirect live on <strong><?php echo htmlspecialchars($shopCfg['name'] ?? $activeStore); ?></strong> via the Shopify API.</small>
+          </div>
+          <div class="col-md-5 mb-2 mb-md-0">
+            <label class="font-weight-bold small text-secondary mb-1">From URL (old path)</label>
+            <input type="text" name="path" class="form-control font-mono" placeholder="/old-page-url"
+                   value="<?php echo isset($_POST['action'], $_POST['path']) && $_POST['action'] === 'create_redirect' ? htmlspecialchars((string)$_POST['path']) : ''; ?>" required>
+            <small class="form-text text-muted">Must start with <code>/</code>.</small>
+          </div>
+          <div class="col-md-5 mb-2 mb-md-0">
+            <label class="font-weight-bold small text-secondary mb-1">To URL (target)</label>
+            <input type="text" name="target" class="form-control font-mono" placeholder="/new-page-url or https://..."
+                   value="<?php echo isset($_POST['action'], $_POST['target']) && $_POST['action'] === 'create_redirect' ? htmlspecialchars((string)$_POST['target']) : ''; ?>" required>
+            <small class="form-text text-muted">A <code>/path</code> or full <code>https://</code> URL.</small>
+          </div>
+          <div class="col-md-2">
+            <button type="submit" class="btn btn-block font-weight-bold text-white" style="background-color: #16a34a;">
+              <i class="fas fa-plus mr-1"></i> Add
+            </button>
+          </div>
+        </form>
       </div>
 
       <!-- Search -->
