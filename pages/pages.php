@@ -26,6 +26,7 @@ if (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['store'];
 } elseif (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['switch_store'];
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Pages module.", 'system', null, 'success');
 }
 
 $db          = getDbConnection();
@@ -327,6 +328,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         } else {
             $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
         }
+        recordUserLog('Test Connection', 'Pages API', "Tested Shopify API connection (pages) for retail + business stores — " . ($allSuccess ? 'all checks passed.' : 'some checks failed.'), 'page', null, $allSuccess ? 'success' : 'error');
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
     }
@@ -545,6 +547,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
                 ':store'     => $activeStore
             ]);
             $message = "SEO Draft saved successfully for page #{$pageId}.";
+            recordUserLog('Draft Saved', $title, "Saved SEO draft for page #{$pageId} (store: {$activeStore}). Title, meta description and handle updated locally.", 'page', $pageId, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Save draft failed – " . htmlspecialchars($e->getMessage());
@@ -616,10 +619,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                     ':id'        => $pageId
                 ]);
 
+                $pushedTitle = $title ?: $pg['title'];
                 if ($httpCode >= 200 && $httpCode < 300) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
+                    recordUserLog('Shopify Push', $pushedTitle, "Pushed page #{$pageId} live to {$shopCfg['name']} (Shopify ID: {$shopifyPid}). Title, handle and meta tags updated.", 'page', $pageId, 'success');
                 } else {
                     $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
+                    recordUserLog('Shopify Push Failed', $pushedTitle, "Push of page #{$pageId} to {$shopCfg['name']} returned HTTP {$httpCode}. Local draft kept — verify on Shopify.", 'page', $pageId, 'error');
                 }
             }
         }
@@ -645,6 +651,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
             ]);
             $affected = $bStmt->rowCount();
             $message  = "Bulk approved & published {$affected} draft pages for {$shopCfg['name']}.";
+            recordUserLog('Bulk Approve & Push', 'Pages', "Bulk approved & published {$affected} draft page(s) for {$shopCfg['name']} (store: {$activeStore}).", 'page', null, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());

@@ -23,6 +23,7 @@ if (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['store'];
 } elseif (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['switch_store'];
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Products module.", 'system', null, 'success');
 }
 
 $db          = getDbConnection();
@@ -300,6 +301,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     } else {
         $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
     }
+    recordUserLog('Test Connection', 'Products API', "Tested Shopify API connection (products) for retail + business stores — " . ($allSuccess ? 'all checks passed.' : 'some checks failed.'), 'product', null, $allSuccess ? 'success' : 'error');
 }
 
 // B. SYNC PRODUCTS FROM SHOPIFY REST API
@@ -506,6 +508,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
             ':store'     => $activeStore
         ]);
         $message = "SEO Draft saved successfully for product #{$productId}.";
+        recordUserLog('Draft Saved', $title, "Saved SEO draft for product #{$productId} (store: {$activeStore}). Title, meta description and handle updated locally.", 'product', $productId, 'success');
     }
 }
 
@@ -574,10 +577,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                 ':id'        => $productId
             ]);
 
+            $pushedTitle = $title ?: $prod['title'];
             if ($httpCode >= 200 && $httpCode < 300) {
                 $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
+                recordUserLog('Shopify Push', $pushedTitle, "Pushed product #{$productId} live to {$shopCfg['name']} (Shopify ID: {$shopifyPid}). Title, handle and meta tags updated.", 'product', $productId, 'success');
             } else {
                 $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
+                recordUserLog('Shopify Push Failed', $pushedTitle, "Push of product #{$productId} to {$shopCfg['name']} returned HTTP {$httpCode}. Local draft kept — verify on Shopify.", 'product', $productId, 'error');
             }
         }
     }
@@ -599,6 +605,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
         ]);
         $affected = $bStmt->rowCount();
         $message  = "Bulk approved & published {$affected} draft products for {$shopCfg['name']}.";
+        recordUserLog('Bulk Approve & Push', 'Products', "Bulk approved & published {$affected} draft product(s) for {$shopCfg['name']} (store: {$activeStore}).", 'product', null, 'success');
     }
 }
 

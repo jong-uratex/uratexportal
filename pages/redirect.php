@@ -23,6 +23,7 @@ if (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['store'];
 } elseif (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['switch_store'];
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from URL Redirects module.", 'system', null, 'success');
 }
 
 $db          = getDbConnection();
@@ -316,6 +317,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $message = ($allSuccess
             ? "✅ All connections and API capabilities verified successfully!<br><br>"
             : "⚠️ Some API capabilities failed!<br><br>") . $message;
+        recordUserLog('Test Connection', 'Redirects API', "Tested Shopify API connection (url redirects) for retail + business stores — " . ($allSuccess ? 'all checks passed.' : 'some checks failed.'), 'redirect', null, $allSuccess ? 'success' : 'error');
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
     }
@@ -564,6 +566,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'update_redirect') {
         }
     } catch (Throwable $e) {
         $message = "ERROR: Update failed – " . htmlspecialchars($e->getMessage());
+        recordUserLog('redirect_update_failed', 'redirects', "Redirect update failed: " . $e->getMessage(), 'redirect', null, 'error');
     }
 }
 
@@ -615,6 +618,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_redirect') {
         }
     } catch (Throwable $e) {
         $message = "ERROR: Delete failed – " . htmlspecialchars($e->getMessage());
+        recordUserLog('redirect_delete_failed', 'redirects', "Redirect delete failed: " . $e->getMessage(), 'redirect', null, 'error');
     }
 }
 

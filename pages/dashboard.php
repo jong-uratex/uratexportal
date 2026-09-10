@@ -8,6 +8,7 @@ if (!isset($_SESSION['user_logged_in'])) {
 
 if (isset($_GET['switch_store'])) {
     setActiveStore($_GET['switch_store']);
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Dashboard.", 'system', null, 'success');
     header("Location: dashboard.php");
     exit;
 }

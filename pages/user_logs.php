@@ -15,6 +15,7 @@ if (!isset($_SESSION['user_logged_in'])) {
 // Active Store Handling
 if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     setActiveStore($_GET['switch_store']);
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Activity Logs.", 'system', null, 'success');
     header("Location: user_logs.php");
     exit;
 }
@@ -91,6 +92,31 @@ if ($db) {
 // CSV EXPORT HANDLER
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+    // Respect the same filters as the on-screen table so exports match what you see
+    $expSearch  = trim($_GET['search'] ?? '');
+    $expAction  = trim($_GET['action_filter'] ?? '');
+    $expStore   = trim($_GET['store_filter'] ?? '');
+    $expUser    = trim($_GET['user_filter'] ?? '');
+    $expWhere   = "WHERE 1=1";
+    $expParams  = [];
+
+    if ($expSearch !== '') {
+        $expWhere .= " AND (user_email LIKE :search OR user_name LIKE :search OR action LIKE :search OR target_resource LIKE :search OR change_details LIKE :search)";
+        $expParams[':search'] = "%{$expSearch}%";
+    }
+    if ($expAction !== '') {
+        $expWhere .= " AND action = :action_filter";
+        $expParams[':action_filter'] = $expAction;
+    }
+    if ($expStore !== '' && in_array($expStore, ['business', 'retail'])) {
+        $expWhere .= " AND store_key = :store_filter";
+        $expParams[':store_filter'] = $expStore;
+    }
+    if ($expUser !== '') {
+        $expWhere .= " AND user_email = :user_filter";
+        $expParams[':user_filter'] = $expUser;
+    }
+
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename=uratex_user_audit_logs_' . date('Y-m-d_His') . '.csv');
     
@@ -98,7 +124,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
     fputcsv($out, ['Log ID', 'Timestamp', 'Partner Agent Email', 'Agent Name', 'Store Context', 'Action Type', 'Target Resource', 'Change Details', 'Resource Type', 'Status', 'IP Address']);
     
     if ($db) {
-        $exportStmt = $db->query("SELECT * FROM user_logs ORDER BY created_at DESC");
+        $exportStmt = $db->prepare("SELECT * FROM user_logs {$expWhere} ORDER BY created_at DESC");
+        $exportStmt->execute($expParams);
         while ($row = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
             fputcsv($out, [
                 $row['id'],
@@ -142,6 +169,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
 $search = trim($_GET['search'] ?? '');
 $filterAction = trim($_GET['action_filter'] ?? '');
 $filterStore = trim($_GET['store_filter'] ?? '');
+$filterUser = trim($_GET['user_filter'] ?? '');
 
 $perPage = 100; // STRICTLY 100 ROWS PER PAGE AS REQUESTED
 $page = max(1, (int)($_GET['page'] ?? 1));
@@ -170,6 +198,12 @@ if ($db) {
             $params[':store_filter'] = $filterStore;
         }
 
+        // User filter: empty = ALL users (default). Otherwise scope to one agent's activities.
+        if (!empty($filterUser)) {
+            $whereSql .= " AND user_email = :user_filter";
+            $params[':user_filter'] = $filterUser;
+        }
+
         // Count Total Records
         $countStmt = $db->prepare("SELECT COUNT(*) FROM user_logs {$whereSql}");
         $countStmt->execute($params);
@@ -187,6 +221,19 @@ if ($db) {
 
     } catch (Exception $e) {
         $logs = [];
+    }
+
+    // Distinct users for the "All Users" filter dropdown (shows EVERY agent with logged activity)
+    $allUsers = [];
+    $allActions = [];
+    try {
+        $uStmt = $db->query("SELECT DISTINCT user_email, user_name FROM user_logs ORDER BY user_email ASC");
+        $allUsers = $uStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $aStmt = $db->query("SELECT DISTINCT action FROM user_logs ORDER BY action ASC");
+        $allActions = array_column($aStmt->fetchAll(PDO::FETCH_ASSOC), 'action');
+    } catch (Exception $e) {
+        // dropdowns fall back to defaults below
     }
 }
 
@@ -256,7 +303,7 @@ include __DIR__ . '/../includes/sidebar.php';
           </p>
         </div>
         <div class="col-sm-5 text-right">
-          <a href="user_logs.php?export=csv<?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?>" class="btn btn-outline-secondary btn-sm mr-2 shadow-sm font-weight-bold">
+          <a href="user_logs.php?export=csv<?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?><?php echo !empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : ''; ?><?php echo !empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : ''; ?><?php echo !empty($filterUser) ? '&user_filter=' . urlencode($filterUser) : ''; ?>" class="btn btn-outline-secondary btn-sm mr-2 shadow-sm font-weight-bold">
             <i class="fas fa-file-csv mr-1 text-success"></i> Export CSV
           </a>
           <a href="user_logs.php" class="btn btn-primary btn-sm shadow-sm font-weight-bold" style="background-color: #003399; border-color: #002266;">
@@ -318,7 +365,7 @@ include __DIR__ . '/../includes/sidebar.php';
       <div class="card shadow-sm border-0 mb-3" style="border-radius: 12px;">
         <div class="card-body p-3">
           <form method="get" action="user_logs.php" class="row align-items-center">
-            <div class="col-md-5 col-12 mb-2 mb-md-0">
+            <div class="col-md-4 col-12 mb-2 mb-md-0">
               <div class="input-group">
                 <div class="input-group-prepend">
                   <span class="input-group-text bg-white border-right-0 text-muted"><i class="fas fa-search"></i></span>
@@ -334,14 +381,30 @@ include __DIR__ . '/../includes/sidebar.php';
             </div>
 
             <div class="col-md-3 col-6 mb-2 mb-md-0">
+              <select name="user_filter" class="form-control text-sm" onchange="this.form.submit()" title="Filter by agent — empty shows ALL users">
+                <option value="">All Users (every agent)</option>
+                <?php foreach ($allUsers as $u): ?>
+                  <option value="<?php echo htmlspecialchars($u['user_email']); ?>" <?php echo ($filterUser === $u['user_email']) ? 'selected' : ''; ?>>
+                    <?php echo htmlspecialchars(!empty($u['user_name']) ? $u['user_name'] . ' — ' . $u['user_email'] : $u['user_email']); ?>
+                  </option>
+                <?php endforeach; ?>
+                <?php if (!empty($filterUser) && !in_array($filterUser, array_column($allUsers, 'user_email'))): ?>
+                  <option value="<?php echo htmlspecialchars($filterUser); ?>" selected><?php echo htmlspecialchars($filterUser); ?></option>
+                <?php endif; ?>
+              </select>
+            </div>
+
+            <div class="col-md-2 col-6 mb-2 mb-md-0">
               <select name="action_filter" class="form-control text-sm" onchange="this.form.submit()">
                 <option value="">All Action Types</option>
-                <option value="Draft Saved" <?php echo ($filterAction === 'Draft Saved') ? 'selected' : ''; ?>>Draft Saved</option>
-                <option value="Shopify Push" <?php echo ($filterAction === 'Shopify Push') ? 'selected' : ''; ?>>Shopify Push</option>
-                <option value="Shopify Sync" <?php echo ($filterAction === 'Shopify Sync') ? 'selected' : ''; ?>>Shopify Sync</option>
-                <option value="Login" <?php echo ($filterAction === 'Login') ? 'selected' : ''; ?>>Login</option>
-                <option value="Logout" <?php echo ($filterAction === 'Logout') ? 'selected' : ''; ?>>Logout</option>
-                <option value="AI Optimize" <?php echo ($filterAction === 'AI Optimize') ? 'selected' : ''; ?>>AI Optimize</option>
+                <?php
+                  $defaultActions = ['Draft Saved', 'Shopify Push', 'Shopify Sync', 'Login', 'Logout', 'AI Optimize'];
+                  $actionOptions = array_unique(array_merge($defaultActions, $allActions));
+                  sort($actionOptions);
+                  foreach ($actionOptions as $opt):
+                ?>
+                  <option value="<?php echo htmlspecialchars($opt); ?>" <?php echo ($filterAction === $opt) ? 'selected' : ''; ?>><?php echo htmlspecialchars($opt); ?></option>
+                <?php endforeach; ?>
               </select>
             </div>
 
@@ -353,13 +416,23 @@ include __DIR__ . '/../includes/sidebar.php';
               </select>
             </div>
 
-            <div class="col-md-2 col-12 text-right">
+            <div class="col-md-1 col-12 text-right">
               <button type="submit" class="btn btn-dark btn-sm px-3 font-weight-bold">Filter</button>
-              <?php if (!empty($search) || !empty($filterAction) || !empty($filterStore)): ?>
+              <?php if (!empty($search) || !empty($filterAction) || !empty($filterStore) || !empty($filterUser)): ?>
                 <a href="user_logs.php" class="btn btn-outline-danger btn-sm ml-1" title="Reset Filters"><i class="fas fa-times"></i></a>
               <?php endif; ?>
             </div>
           </form>
+          <?php if (!empty($filterUser)): ?>
+            <div class="mt-2 small text-muted">
+              Showing activities for <strong class="text-dark"><?php echo htmlspecialchars($filterUser); ?></strong> only.
+              <a href="user_logs.php" class="ml-1">View ALL users</a>
+            </div>
+          <?php else: ?>
+            <div class="mt-2 small text-muted">
+              Showing activities from <strong class="text-dark">ALL users</strong> across both stores.
+            </div>
+          <?php endif; ?>
         </div>
       </div>
 
@@ -433,6 +506,9 @@ include __DIR__ . '/../includes/sidebar.php';
                         <div>
                           <div class="font-weight-bold text-dark" style="font-size: 13px;">
                             <?php echo htmlspecialchars($log['user_email']); ?>
+                            <?php if (($log['user_email'] ?? '') === $currentUserEmail): ?>
+                              <span class="badge badge-primary ml-1" style="font-size: 10px;">You</span>
+                            <?php endif; ?>
                           </div>
                           <?php if (!empty($log['store_key'])): ?>
                             <span class="badge badge-light border text-muted" style="font-size: 10px;">
@@ -480,7 +556,7 @@ include __DIR__ . '/../includes/sidebar.php';
             <ul class="pagination pagination-sm m-0 shadow-none">
               <!-- Previous Page -->
               <li class="page-item <?php echo ($page <= 1) ? 'disabled' : ''; ?>">
-                <a class="page-link" href="?page=<?php echo $page - 1; ?><?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?><?php echo !empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : ''; ?><?php echo !empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : ''; ?>">
+                <a class="page-link" href="?page=<?php echo $page - 1; ?><?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?><?php echo !empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : ''; ?><?php echo !empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : ''; ?><?php echo !empty($filterUser) ? '&user_filter=' . urlencode($filterUser) : ''; ?>">
                   &laquo; Prev
                 </a>
               </li>
@@ -498,6 +574,7 @@ include __DIR__ . '/../includes/sidebar.php';
                          (!empty($search) ? '&search=' . urlencode($search) : '') . 
                          (!empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : '') . 
                          (!empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : '') . 
+                         (!empty($filterUser) ? '&user_filter=' . urlencode($filterUser) : '') . 
                          "'>{$p}</a></li>";
                 }
                 if ($endP < $totalPages) {
@@ -508,7 +585,7 @@ include __DIR__ . '/../includes/sidebar.php';
 
               <!-- Next Page -->
               <li class="page-item <?php echo ($page >= $totalPages) ? 'disabled' : ''; ?>">
-                <a class="page-link" href="?page=<?php echo $page + 1; ?><?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?><?php echo !empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : ''; ?><?php echo !empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : ''; ?>">
+                <a class="page-link" href="?page=<?php echo $page + 1; ?><?php echo !empty($search) ? '&search=' . urlencode($search) : ''; ?><?php echo !empty($filterAction) ? '&action_filter=' . urlencode($filterAction) : ''; ?><?php echo !empty($filterStore) ? '&store_filter=' . urlencode($filterStore) : ''; ?><?php echo !empty($filterUser) ? '&user_filter=' . urlencode($filterUser) : ''; ?>">
                   Next &raquo;
                 </a>
               </li>

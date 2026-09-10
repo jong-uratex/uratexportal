@@ -318,6 +318,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $isAdmin) {
     }
 }
 
+// Blocked POST attempts by non-admins (RBAC audit)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$isAdmin) {
+    $blockedAction = $_POST['action'] ?? 'unknown';
+    recordUserLog(
+        'Forbidden Action',
+        'User Management',
+        "Non-admin account attempted restricted action '{$blockedAction}'. Access denied.",
+        'system',
+        null,
+        'failed'
+    );
+    $message = 'Access denied: Administrator role required.';
+    $messageType = 'danger';
+}
+
 // -----------------------------------------------------------------------------
 // FETCH USERS LIST WITH SEARCH & FILTERS
 // -----------------------------------------------------------------------------

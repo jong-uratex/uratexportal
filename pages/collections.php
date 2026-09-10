@@ -27,6 +27,7 @@ if (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['store'];
 } elseif (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'])) {
     $_SESSION['active_store'] = $_GET['switch_store'];
+    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Collections module.", 'system', null, 'success');
 }
 
 $db          = getDbConnection();
@@ -353,6 +354,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         } else {
             $message = "⚠️ Some API capabilities failed!<br><br>" . $message;
         }
+        recordUserLog('Test Connection', 'Collections API', "Tested Shopify API connection (collections) for retail + business stores — " . ($allSuccess ? 'all checks passed.' : 'some checks failed.'), 'collection', null, $allSuccess ? 'success' : 'error');
     } catch (Throwable $e) {
         $message = "ERROR: Test connection failed – " . htmlspecialchars($e->getMessage());
     }
@@ -568,6 +570,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
                 ':store'     => $activeStore
             ]);
             $message = "SEO Draft saved successfully for collection #{$collectionId}.";
+            recordUserLog('Draft Saved', $title, "Saved SEO draft for collection #{$collectionId} (store: {$activeStore}). Title, meta description and handle updated locally.", 'collection', $collectionId, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Save draft failed – " . htmlspecialchars($e->getMessage());
@@ -642,10 +645,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                     ':id'        => $collectionId
                 ]);
 
+                $pushedTitle = $title ?: $col['title'];
                 if ($httpCode >= 200 && $httpCode < 300) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
+                    recordUserLog('Shopify Push', $pushedTitle, "Pushed collection #{$collectionId} live to {$shopCfg['name']} (Shopify ID: {$shopifyCid}). Title, handle and meta tags updated.", 'collection', $collectionId, 'success');
                 } else {
                     $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
+                    recordUserLog('Shopify Push Failed', $pushedTitle, "Push of collection #{$collectionId} to {$shopCfg['name']} returned HTTP {$httpCode}. Local draft kept — verify on Shopify.", 'collection', $collectionId, 'error');
                 }
             }
         }
@@ -671,6 +677,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
             ]);
             $affected = $bStmt->rowCount();
             $message  = "Bulk approved & published {$affected} draft collections for {$shopCfg['name']}.";
+            recordUserLog('Bulk Approve & Push', 'Collections', "Bulk approved & published {$affected} draft collection(s) for {$shopCfg['name']} (store: {$activeStore}).", 'collection', null, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());

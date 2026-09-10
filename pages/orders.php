@@ -178,6 +178,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
         if (empty($token)) $missing[] = 'Access Token';
         $message     = 'Missing configuration: ' . implode(', ', $missing) . ' for ' . $activeStore . ' store. Please check Settings.';
         $messageType = 'danger';
+        recordUserLog('Sync Orders Failed', 'Shopify API', "Orders sync aborted for {$activeStore} store — missing: " . implode(', ', $missing) . '.', 'system', null, 'error');
     } else {
         try {
             $pageInfo  = null;
@@ -423,6 +424,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
         } catch (Exception $e) {
             $message     = 'Error syncing orders: ' . $e->getMessage();
             $messageType = 'danger';
+            recordUserLog('Sync Orders Failed', 'Shopify API', "Orders sync failed for {$activeStore} store: " . $e->getMessage(), 'system', null, 'error');
         }
     }
 }
@@ -523,6 +525,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     $testResults = $results;
     $message     = $allSuccess ? 'Connection test passed for ' . $activeStore . ' store!' : 'Connection test failed for ' . $activeStore . ' store.';
     $messageType = $allSuccess ? 'success' : 'danger';
+    recordUserLog('Test Connection', 'Orders API', "Tested Shopify API connection (orders) for {$activeStore} store — " . ($allSuccess ? 'check passed.' : 'check failed.'), 'system', null, $allSuccess ? 'success' : 'error');
 }
 
 // -----------------------------------------------------------------------------
@@ -532,6 +535,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
+    recordUserLog('Export Orders CSV', 'Email Marketing Export', "Exported email-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "').", 'system', null, 'success');
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -597,6 +601,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
+    recordUserLog('Export Orders CSV', 'SMS Marketing Export', "Exported sms-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "').", 'system', null, 'success');
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
