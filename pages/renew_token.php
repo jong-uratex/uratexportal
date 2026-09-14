@@ -1,9 +1,13 @@
 <?php
 require_once __DIR__ . '/../config/config.php';
 
-header('Content-Type: application/json');
+$isCli = PHP_SAPI === 'cli';
 
-if (!isset($_SESSION['user_logged_in'])) {
+if (!$isCli) {
+    header('Content-Type: application/json');
+}
+
+if (!$isCli && !isset($_SESSION['user_logged_in'])) {
     echo json_encode(['success' => false, 'message' => 'Unauthorized access.']);
     exit;
 }
@@ -99,9 +103,17 @@ try {
         'results' => $results
     ]);
 
+    if ($isCli && !$allSuccess) {
+        exit(1);
+    }
+
 } catch (Exception $e) {
     echo json_encode([
         'success' => false,
         'message' => 'Exception occurred: ' . $e->getMessage()
     ]);
+
+    if ($isCli) {
+        exit(1);
+    }
 }
