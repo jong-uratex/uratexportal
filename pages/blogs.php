@@ -158,37 +158,47 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_blogs') {
       $blogsStmt = $db->prepare('SELECT id FROM shopify_blogs WHERE store_key = :store ORDER BY id ASC');
       $blogsStmt->execute([':store' => $activeStore]);
       $blogIds = $blogsStmt->fetchAll(PDO::FETCH_COLUMN);
+      $blogCount = count($blogIds);
       $updateStmt = $db->prepare("UPDATE shopify_blogs SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
       $rowIndex = 0;
 
-      while (($row = fgetcsv($handle)) !== false) {
-        $title = trim($row[$headerMap['Article SEO Title']] ?? '');
-        $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
-        $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+      try {
+        $db->beginTransaction();
+        while (($row = fgetcsv($handle)) !== false) {
+          $title = trim($row[$headerMap['Article SEO Title']] ?? '');
+          $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+          $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-        if ($title === '' || $urlHandle === '' || !isset($blogIds[$rowIndex])) {
-          $skippedCount++;
+          if ($title === '' || $urlHandle === '' || $rowIndex >= $blogCount) {
+            $skippedCount++;
+            $rowIndex++;
+            continue;
+          }
+
+          $updateStmt->execute([
+            ':title' => $title,
+            ':meta_description' => $metaDescription,
+            ':handle' => $urlHandle,
+            ':user' => $currentUser,
+            ':id' => $blogIds[$rowIndex]
+          ]);
+          $importedCount++;
           $rowIndex++;
-          continue;
         }
-
-        $updateStmt->execute([
-          ':title' => $title,
-          ':meta_description' => $metaDescription,
-          ':handle' => $urlHandle,
-          ':user' => $currentUser,
-          ':id' => $blogIds[$rowIndex]
-        ]);
-        $importedCount++;
-        $rowIndex++;
+        $db->commit();
+        fclose($handle);
+        $message = "Imported <strong>{$importedCount}</strong> article(s) into the {$shopCfg['name']} database. No new articles were added.";
+        if ($skippedCount > 0) {
+          $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching article row.";
+        }
+        recordUserLog('Article Import', 'Blogs & Articles', "Updated {$importedCount} existing article SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'article', null, 'success');
+      } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+          $db->rollBack();
+        }
+        fclose($handle);
+        $message = 'ERROR: Article import failed. No database records were changed.';
       }
-
-      fclose($handle);
-      $message = "Imported <strong>{$importedCount}</strong> article(s) into the {$shopCfg['name']} database.";
-      if ($skippedCount > 0) {
-        $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching article row.";
-      }
-      recordUserLog('Article Import', 'Blogs & Articles', "Imported {$importedCount} article SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'article', null, 'success');
     }
   }
 }

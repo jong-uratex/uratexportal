@@ -144,37 +144,47 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_pages') {
       $pagesStmt = $db->prepare('SELECT id FROM shopify_pages WHERE store_key = :store ORDER BY id ASC');
       $pagesStmt->execute([':store' => $activeStore]);
       $pageIds = $pagesStmt->fetchAll(PDO::FETCH_COLUMN);
+      $pageCount = count($pageIds);
       $updateStmt = $db->prepare("UPDATE shopify_pages SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
       $rowIndex = 0;
 
-      while (($row = fgetcsv($handle)) !== false) {
-        $title = trim($row[$headerMap['Page SEO Title']] ?? '');
-        $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
-        $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+      try {
+        $db->beginTransaction();
+        while (($row = fgetcsv($handle)) !== false) {
+          $title = trim($row[$headerMap['Page SEO Title']] ?? '');
+          $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+          $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-        if ($title === '' || $urlHandle === '' || !isset($pageIds[$rowIndex])) {
-          $skippedCount++;
+          if ($title === '' || $urlHandle === '' || $rowIndex >= $pageCount) {
+            $skippedCount++;
+            $rowIndex++;
+            continue;
+          }
+
+          $updateStmt->execute([
+            ':title' => $title,
+            ':meta_description' => $metaDescription,
+            ':handle' => $urlHandle,
+            ':user' => $currentUser,
+            ':id' => $pageIds[$rowIndex]
+          ]);
+          $importedCount++;
           $rowIndex++;
-          continue;
         }
-
-        $updateStmt->execute([
-          ':title' => $title,
-          ':meta_description' => $metaDescription,
-          ':handle' => $urlHandle,
-          ':user' => $currentUser,
-          ':id' => $pageIds[$rowIndex]
-        ]);
-        $importedCount++;
-        $rowIndex++;
+        $db->commit();
+        fclose($handle);
+        $message = "Imported <strong>{$importedCount}</strong> page(s) into the {$shopCfg['name']} database. No new pages were added.";
+        if ($skippedCount > 0) {
+          $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching page row.";
+        }
+        recordUserLog('Page Import', 'Pages', "Updated {$importedCount} existing page SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'page', null, 'success');
+      } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+          $db->rollBack();
+        }
+        fclose($handle);
+        $message = 'ERROR: Page import failed. No database records were changed.';
       }
-
-      fclose($handle);
-      $message = "Imported <strong>{$importedCount}</strong> page(s) into the {$shopCfg['name']} database.";
-      if ($skippedCount > 0) {
-        $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching page row.";
-      }
-      recordUserLog('Page Import', 'Pages', "Imported {$importedCount} page SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'page', null, 'success');
     }
   }
 }

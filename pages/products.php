@@ -117,37 +117,47 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_products') {
       $productsStmt = $db->prepare('SELECT id FROM shopify_products WHERE store_key = :store ORDER BY product_name ASC');
       $productsStmt->execute([':store' => $activeStore]);
       $productIds = $productsStmt->fetchAll(PDO::FETCH_COLUMN);
+      $productCount = count($productIds);
       $updateStmt = $db->prepare("UPDATE shopify_products SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
       $rowIndex = 0;
 
-      while (($row = fgetcsv($handle)) !== false) {
-        $title = trim($row[$headerMap['Page Title']] ?? '');
-        $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
-        $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+      try {
+        $db->beginTransaction();
+        while (($row = fgetcsv($handle)) !== false) {
+          $title = trim($row[$headerMap['Page Title']] ?? '');
+          $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+          $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-        if ($title === '' || $urlHandle === '' || !isset($productIds[$rowIndex])) {
-          $skippedCount++;
+          if ($title === '' || $urlHandle === '' || $rowIndex >= $productCount) {
+            $skippedCount++;
+            $rowIndex++;
+            continue;
+          }
+
+          $updateStmt->execute([
+            ':title' => $title,
+            ':meta_description' => $metaDescription,
+            ':handle' => $urlHandle,
+            ':user' => $currentUser,
+            ':id' => $productIds[$rowIndex]
+          ]);
+          $importedCount++;
           $rowIndex++;
-          continue;
         }
-
-        $updateStmt->execute([
-          ':title' => $title,
-          ':meta_description' => $metaDescription,
-          ':handle' => $urlHandle,
-          ':user' => $currentUser,
-          ':id' => $productIds[$rowIndex]
-        ]);
-        $importedCount++;
-        $rowIndex++;
+        $db->commit();
+        fclose($handle);
+        $message = "Imported <strong>{$importedCount}</strong> product(s) into the {$shopCfg['name']} database. No new products were added.";
+        if ($skippedCount > 0) {
+          $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching product row.";
+        }
+        recordUserLog('Product Import', 'Products', "Updated {$importedCount} existing product SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'product', null, 'success');
+      } catch (Throwable $e) {
+        if ($db->inTransaction()) {
+          $db->rollBack();
+        }
+        fclose($handle);
+        $message = 'ERROR: Product import failed. No database records were changed.';
       }
-
-      fclose($handle);
-      $message = "Imported <strong>{$importedCount}</strong> product(s) into the {$shopCfg['name']} database.";
-      if ($skippedCount > 0) {
-        $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching product row.";
-      }
-      recordUserLog('Product Import', 'Products', "Imported {$importedCount} product SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'product', null, 'success');
     }
   }
 }
