@@ -62,9 +62,6 @@ function mapPageStatus(?string $publishedAt): string
 }
 
 // -----------------------------------------------------------------------------
-// EXPORT HANDLER - Removed as CSV and JSON buttons were removed
-// -----------------------------------------------------------------------------
-// -----------------------------------------------------------------------------
 // AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
 if ($db) {
@@ -103,7 +100,86 @@ if ($db) {
 // ACTION HANDLERS
 // -----------------------------------------------------------------------------
 
-// A. TEST CONNECTION
+// A. EXPORT / IMPORT PAGE SEO DATA
+if (isset($_POST['action']) && $_POST['action'] === 'export_pages') {
+  if (!$db) {
+    exit('Database connection unavailable.');
+  }
+
+  $exportStmt = $db->prepare('SELECT title, meta_description, handle FROM shopify_pages WHERE store_key = :store ORDER BY id ASC');
+  $exportStmt->execute([':store' => $activeStore]);
+
+  $filename = 'uratex_pages_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
+  header('Content-Type: text/csv; charset=utf-8');
+  header('Content-Disposition: attachment; filename="' . $filename . '"');
+  $output = fopen('php://output', 'w');
+  fputcsv($output, ['Page SEO Title', 'Meta Description', 'URL Handle']);
+
+  while ($page = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
+    fputcsv($output, $page);
+  }
+
+  fclose($output);
+  exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'import_pages') {
+  $importedCount = 0;
+  $skippedCount = 0;
+
+  if (!$db || empty($_FILES['pages_csv']['tmp_name']) || $_FILES['pages_csv']['error'] !== UPLOAD_ERR_OK) {
+    $message = 'ERROR: Please choose a valid page CSV file to import.';
+  } else {
+    $handle = fopen($_FILES['pages_csv']['tmp_name'], 'r');
+    $headers = $handle ? fgetcsv($handle) : false;
+    $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
+    $requiredColumns = ['Page SEO Title', 'Meta Description', 'URL Handle'];
+
+    if (!$handle || !is_array($headers) || count($headers) !== count($requiredColumns) || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
+      $message = 'ERROR: The CSV must include only Page SEO Title, Meta Description, and URL Handle columns.';
+      if ($handle) {
+        fclose($handle);
+      }
+    } else {
+      $pagesStmt = $db->prepare('SELECT id FROM shopify_pages WHERE store_key = :store ORDER BY id ASC');
+      $pagesStmt->execute([':store' => $activeStore]);
+      $pageIds = $pagesStmt->fetchAll(PDO::FETCH_COLUMN);
+      $updateStmt = $db->prepare("UPDATE shopify_pages SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
+      $rowIndex = 0;
+
+      while (($row = fgetcsv($handle)) !== false) {
+        $title = trim($row[$headerMap['Page SEO Title']] ?? '');
+        $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+        $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+
+        if ($title === '' || $urlHandle === '' || !isset($pageIds[$rowIndex])) {
+          $skippedCount++;
+          $rowIndex++;
+          continue;
+        }
+
+        $updateStmt->execute([
+          ':title' => $title,
+          ':meta_description' => $metaDescription,
+          ':handle' => $urlHandle,
+          ':user' => $currentUser,
+          ':id' => $pageIds[$rowIndex]
+        ]);
+        $importedCount++;
+        $rowIndex++;
+      }
+
+      fclose($handle);
+      $message = "Imported <strong>{$importedCount}</strong> page(s) into the {$shopCfg['name']} database.";
+      if ($skippedCount > 0) {
+        $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching page row.";
+      }
+      recordUserLog('Page Import', 'Pages', "Imported {$importedCount} page SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'page', null, 'success');
+    }
+  }
+}
+
+// B. TEST CONNECTION
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     try {
         $storesToTest = ['retail', 'business'];
@@ -692,8 +768,6 @@ $whereSql = implode(' AND ', $whereClauses);
 
 $totalPagesCount = 0;
 $draftCount      = 0;
-$publishedCount  = 0;
-$avgScore        = 0;
 
 if ($db) {
     try {
@@ -705,13 +779,6 @@ if ($db) {
         $dStmt->execute([':store' => $activeStore]);
         $draftCount = (int)$dStmt->fetchColumn();
 
-        $pStmt = $db->prepare("SELECT COUNT(*) FROM shopify_pages WHERE store_key = :store AND status = 'published'");
-        $pStmt->execute([':store' => $activeStore]);
-        $publishedCount = (int)$pStmt->fetchColumn();
-
-        $sStmt = $db->prepare("SELECT AVG(seo_score) FROM shopify_pages WHERE store_key = :store");
-        $sStmt->execute([':store' => $activeStore]);
-        $avgScore = (int)round((float)$sStmt->fetchColumn());
     } catch (Throwable $e) {
         // silent
     }
@@ -762,27 +829,55 @@ include __DIR__ . '/../includes/sidebar.php';
           <p class="text-muted small mb-0">Optimize page titles, meta descriptions, and handles.</p>
         </div>
 
-        <div class="col-sm-6 text-right d-flex justify-content-end align-items-center gap-2 flex-wrap">
-          <form method="POST" class="d-inline mr-2">
-            <input type="hidden" name="action" value="test_connection">
-            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #007bff;">
-              <i class="fas fa-plug mr-1"></i> Test Connection
-            </button>
-          </form>
-
-          <form method="POST" class="d-inline mr-2" id="syncForm">
-            <input type="hidden" name="action" value="sync_pages">
-            <button type="submit" id="btnSyncPages" class="btn font-weight-bold shadow-sm" style="background-color: #FFCC00; color: #1f2937; border: 1px solid #eab308;">
-              <i class="fas fa-sync-alt mr-1" id="syncIcon"></i> Sync Pages
-            </button>
-          </form>
-
-          <form method="POST" class="d-inline">
-            <input type="hidden" name="action" value="bulk_push">
-            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #16a34a;" <?php echo $draftCount === 0 ? 'disabled' : ''; ?>>
-              <i class="fas fa-check-double mr-1"></i> Bulk Approve & Push (<?php echo $draftCount; ?>)
-            </button>
-          </form>
+        <div class="col-sm-6">
+          <div class="row justify-content-end">
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #007bff !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-plug text-primary mr-1"></i>Test Connection</div>
+                  <div class="small text-muted mb-2">Verify Shopify API access.</div>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="test_connection">
+                    <button type="submit" class="btn btn-sm btn-primary btn-block font-weight-bold">Run Test</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #eab308 !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-sync-alt text-warning mr-1"></i>Sync Pages</div>
+                  <div class="small text-muted mb-2">Refresh the local catalog.</div>
+                  <form method="POST" id="syncForm">
+                    <input type="hidden" name="action" value="sync_pages">
+                    <button type="submit" id="btnSyncPages" class="btn btn-sm btn-warning btn-block font-weight-bold"><i class="fas fa-sync-alt mr-1" id="syncIcon"></i>Sync Now</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-layer-group text-success mr-1"></i>Bulk Push</div>
+                  <div class="small text-muted mb-2">Export, import, or publish.</div>
+                  <div class="d-flex flex-wrap">
+                    <form method="POST" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="export_pages">
+                      <button type="submit" class="btn btn-sm btn-outline-secondary font-weight-bold" title="Export page SEO data"><i class="fas fa-file-export mr-1"></i>Export</button>
+                    </form>
+                    <form method="POST" enctype="multipart/form-data" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="import_pages">
+                      <label class="btn btn-sm btn-outline-secondary font-weight-bold mb-0" title="Import page SEO data"><i class="fas fa-file-import mr-1"></i>Import<input type="file" name="pages_csv" accept=".csv,text/csv" class="d-none" onchange="this.form.submit()"></label>
+                    </form>
+                    <form method="POST" class="mb-1">
+                      <input type="hidden" name="action" value="bulk_push">
+                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk push imported pages to Shopify"><i class="fas fa-check-double mr-1"></i>Bulk Push (<?php echo $draftCount; ?>)</button>
+                    </form>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -790,34 +885,6 @@ include __DIR__ . '/../includes/sidebar.php';
 
   <section class="content">
     <div class="container-fluid">
-
-      <!-- KPI Cards -->
-      <div class="row mb-3">
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Total Pages</span>
-            <h3 class="font-weight-bold mb-0 text-dark mt-1"><?php echo $totalPagesCount; ?></h3>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Drafts Pending</span>
-            <h3 class="font-weight-bold mb-0 text-warning mt-1"><?php echo $draftCount; ?></h3>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Published Live</span>
-            <h3 class="font-weight-bold mb-0 text-success mt-1"><?php echo $publishedCount; ?></h3>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Average SEO Health</span>
-            <h3 class="font-weight-bold mb-0 text-info mt-1"><?php echo $avgScore; ?>%</h3>
-          </div>
-        </div>
-      </div>
 
       <!-- Search & Filter -->
       <div class="card p-3 mb-4 shadow-sm border-0" style="border-radius: 12px;">
