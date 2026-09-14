@@ -79,14 +79,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'export_products') {
     exit('Database connection unavailable.');
   }
 
-  $exportStmt = $db->prepare("SELECT shopify_product_id, product_name, title, meta_description, handle, status, seo_score, category, price FROM shopify_products WHERE store_key = :store ORDER BY product_name ASC");
+  $exportStmt = $db->prepare("SELECT title, meta_description, handle FROM shopify_products WHERE store_key = :store ORDER BY product_name ASC");
   $exportStmt->execute([':store' => $activeStore]);
 
   $filename = 'uratex_products_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
   header('Content-Type: text/csv; charset=utf-8');
   header('Content-Disposition: attachment; filename="' . $filename . '"');
   $output = fopen('php://output', 'w');
-  fputcsv($output, ['Shopify Product ID', 'Product Name', 'Page Title', 'Meta Description', 'URL Handle', 'Status', 'SEO Score', 'Category', 'Price']);
+  fputcsv($output, ['Page Title', 'Meta Description', 'URL Handle']);
 
   while ($product = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
     fputcsv($output, $product);
@@ -106,32 +106,28 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_products') {
     $handle = fopen($_FILES['products_csv']['tmp_name'], 'r');
     $headers = $handle ? fgetcsv($handle) : false;
     $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
-    $requiredColumns = ['Shopify Product ID', 'Page Title', 'Meta Description', 'URL Handle'];
+    $requiredColumns = ['Page Title', 'Meta Description', 'URL Handle'];
 
-    if (!$handle || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
-      $message = 'ERROR: The CSV must include Shopify Product ID, Page Title, Meta Description, and URL Handle columns.';
+    if (!$handle || count($headers) !== count($requiredColumns) || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
+      $message = 'ERROR: The CSV must include only Page Title, Meta Description, and URL Handle columns.';
       if ($handle) {
         fclose($handle);
       }
     } else {
-      $findStmt = $db->prepare('SELECT id FROM shopify_products WHERE store_key = :store AND shopify_product_id = :shopify_id LIMIT 1');
+      $productsStmt = $db->prepare('SELECT id FROM shopify_products WHERE store_key = :store ORDER BY product_name ASC');
+      $productsStmt->execute([':store' => $activeStore]);
+      $productIds = $productsStmt->fetchAll(PDO::FETCH_COLUMN);
       $updateStmt = $db->prepare("UPDATE shopify_products SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
+      $rowIndex = 0;
 
       while (($row = fgetcsv($handle)) !== false) {
-        $shopifyId = trim($row[$headerMap['Shopify Product ID']] ?? '');
         $title = trim($row[$headerMap['Page Title']] ?? '');
         $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
         $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-        if ($shopifyId === '' || $title === '' || $urlHandle === '') {
+        if ($title === '' || $urlHandle === '' || !isset($productIds[$rowIndex])) {
           $skippedCount++;
-          continue;
-        }
-
-        $findStmt->execute([':store' => $activeStore, ':shopify_id' => $shopifyId]);
-        $productId = $findStmt->fetchColumn();
-        if (!$productId) {
-          $skippedCount++;
+          $rowIndex++;
           continue;
         }
 
@@ -140,15 +136,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_products') {
           ':meta_description' => $metaDescription,
           ':handle' => $urlHandle,
           ':user' => $currentUser,
-          ':id' => $productId
+          ':id' => $productIds[$rowIndex]
         ]);
         $importedCount++;
+        $rowIndex++;
       }
 
       fclose($handle);
       $message = "Imported <strong>{$importedCount}</strong> product(s) into the {$shopCfg['name']} database.";
       if ($skippedCount > 0) {
-        $message .= " {$skippedCount} row(s) were skipped because no matching product was found or required values were missing.";
+        $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching product row.";
       }
       recordUserLog('Product Import', 'Products', "Imported {$importedCount} product SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'product', null, 'success');
     }
