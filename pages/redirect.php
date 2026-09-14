@@ -735,17 +735,6 @@ include __DIR__ . '/../includes/sidebar.php';
                 </div>
               </div>
             </div>
-            <div class="col-md-4">
-              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
-                <div class="card-body p-2">
-                  <div class="small font-weight-bold text-dark"><i class="fas fa-plus text-success mr-1"></i>Add Redirect</div>
-                  <div class="small text-muted mb-2">Create a new live redirect.</div>
-                  <button type="button" class="btn btn-sm btn-success btn-block font-weight-bold" data-toggle="modal" data-target="#addRedirectModal">
-                    <i class="fas fa-plus mr-1"></i>Add Now
-                  </button>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
       </div>
