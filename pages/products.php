@@ -73,7 +73,89 @@ function mapShopifyStatus(string $shopifyStatus): string
 // 1. ACTION HANDLERS
 // -----------------------------------------------------------------------------
 
-// A. TEST SHOPIFY API CONNECTION - Tests both PULL and PUSH capabilities
+// A. EXPORT / IMPORT PRODUCT SEO DATA
+if (isset($_POST['action']) && $_POST['action'] === 'export_products') {
+  if (!$db) {
+    exit('Database connection unavailable.');
+  }
+
+  $exportStmt = $db->prepare("SELECT shopify_product_id, product_name, title, meta_description, handle, status, seo_score, category, price FROM shopify_products WHERE store_key = :store ORDER BY product_name ASC");
+  $exportStmt->execute([':store' => $activeStore]);
+
+  $filename = 'uratex_products_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
+  header('Content-Type: text/csv; charset=utf-8');
+  header('Content-Disposition: attachment; filename="' . $filename . '"');
+  $output = fopen('php://output', 'w');
+  fputcsv($output, ['Shopify Product ID', 'Product Name', 'Page Title', 'Meta Description', 'URL Handle', 'Status', 'SEO Score', 'Category', 'Price']);
+
+  while ($product = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
+    fputcsv($output, $product);
+  }
+
+  fclose($output);
+  exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'import_products') {
+  $importedCount = 0;
+  $skippedCount = 0;
+
+  if (!$db || empty($_FILES['products_csv']['tmp_name']) || $_FILES['products_csv']['error'] !== UPLOAD_ERR_OK) {
+    $message = 'ERROR: Please choose a valid product CSV file to import.';
+  } else {
+    $handle = fopen($_FILES['products_csv']['tmp_name'], 'r');
+    $headers = $handle ? fgetcsv($handle) : false;
+    $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
+    $requiredColumns = ['Shopify Product ID', 'Page Title', 'Meta Description', 'URL Handle'];
+
+    if (!$handle || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
+      $message = 'ERROR: The CSV must include Shopify Product ID, Page Title, Meta Description, and URL Handle columns.';
+      if ($handle) {
+        fclose($handle);
+      }
+    } else {
+      $findStmt = $db->prepare('SELECT id FROM shopify_products WHERE store_key = :store AND shopify_product_id = :shopify_id LIMIT 1');
+      $updateStmt = $db->prepare("UPDATE shopify_products SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
+
+      while (($row = fgetcsv($handle)) !== false) {
+        $shopifyId = trim($row[$headerMap['Shopify Product ID']] ?? '');
+        $title = trim($row[$headerMap['Page Title']] ?? '');
+        $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+        $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+
+        if ($shopifyId === '' || $title === '' || $urlHandle === '') {
+          $skippedCount++;
+          continue;
+        }
+
+        $findStmt->execute([':store' => $activeStore, ':shopify_id' => $shopifyId]);
+        $productId = $findStmt->fetchColumn();
+        if (!$productId) {
+          $skippedCount++;
+          continue;
+        }
+
+        $updateStmt->execute([
+          ':title' => $title,
+          ':meta_description' => $metaDescription,
+          ':handle' => $urlHandle,
+          ':user' => $currentUser,
+          ':id' => $productId
+        ]);
+        $importedCount++;
+      }
+
+      fclose($handle);
+      $message = "Imported <strong>{$importedCount}</strong> product(s) into the {$shopCfg['name']} database.";
+      if ($skippedCount > 0) {
+        $message .= " {$skippedCount} row(s) were skipped because no matching product was found or required values were missing.";
+      }
+      recordUserLog('Product Import', 'Products', "Imported {$importedCount} product SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}.", 'product', null, 'success');
+    }
+  }
+}
+
+// B. TEST SHOPIFY API CONNECTION - Tests both PULL and PUSH capabilities
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     $storesToTest = ['retail', 'business'];
     $results = [];
@@ -702,31 +784,56 @@ include __DIR__ . '/../includes/sidebar.php';
           </a>
         </div>
 
-        <!-- Header Actions -->
-        <div class="col-sm-6 text-right d-flex justify-content-end align-items-center gap-2">
-          <!-- Test Connection -->
-          <form method="POST" class="d-inline mr-2">
-            <input type="hidden" name="action" value="test_connection">
-            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #007bff; border-color: #0069d9;" title="Test API connection before syncing">
-              <i class="fas fa-plug mr-1"></i> Test Connection
-            </button>
-          </form>
-
-          <!-- Sync Products -->
-          <form method="POST" class="d-inline mr-2">
-            <input type="hidden" name="action" value="sync_products">
-            <button type="submit" class="btn font-weight-bold shadow-sm" style="background-color: #FFCC00; color: #1f2937; border: 1px solid #eab308;">
-              <i class="fas fa-sync-alt mr-1"></i> Sync Products
-            </button>
-          </form>
-
-          <!-- Bulk Approve & Push -->
-          <form method="POST" class="d-inline">
-            <input type="hidden" name="action" value="bulk_push">
-            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #16a34a; border-color: #15803d;" <?php echo $draftCount === 0 ? 'disabled' : ''; ?>>
-              <i class="fas fa-check-double mr-1"></i> Bulk Approve & Push (<?php echo $draftCount; ?>)
-            </button>
-          </form>
+        <!-- Header Action Cards -->
+        <div class="col-sm-6">
+          <div class="row justify-content-end">
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #007bff !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-plug text-primary mr-1"></i>Test Connection</div>
+                  <div class="small text-muted mb-2">Verify Shopify API access.</div>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="test_connection">
+                    <button type="submit" class="btn btn-sm btn-primary btn-block font-weight-bold">Run Test</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #eab308 !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-sync-alt text-warning mr-1"></i>Sync Products</div>
+                  <div class="small text-muted mb-2">Refresh the local catalog.</div>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="sync_products">
+                    <button type="submit" class="btn btn-sm btn-warning btn-block font-weight-bold">Sync Now</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-layer-group text-success mr-1"></i>Bulk Updates</div>
+                  <div class="small text-muted mb-2">Move SEO data in bulk.</div>
+                  <div class="d-flex flex-wrap">
+                    <form method="POST" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="export_products">
+                      <button type="submit" class="btn btn-sm btn-outline-secondary font-weight-bold" title="Export products database"><i class="fas fa-file-export mr-1"></i>Export</button>
+                    </form>
+                    <form method="POST" enctype="multipart/form-data" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="import_products">
+                      <label class="btn btn-sm btn-outline-secondary font-weight-bold mb-0" title="Import to product database"><i class="fas fa-file-import mr-1"></i>Import<input type="file" name="products_csv" accept=".csv,text/csv" class="d-none" onchange="this.form.submit()"></label>
+                    </form>
+                    <form method="POST" class="mb-1">
+                      <input type="hidden" name="action" value="bulk_push">
+                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk push draft products to Shopify"><i class="fas fa-check-double mr-1"></i>Push (<?php echo $draftCount; ?>)</button>
+                    </form>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
