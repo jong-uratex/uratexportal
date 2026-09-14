@@ -735,36 +735,6 @@ include __DIR__ . '/../includes/sidebar.php';
   <section class="content">
     <div class="container-fluid">
 
-      <!-- KPI Cards -->
-      <div class="row mb-3">
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Total Redirects</span>
-            <h3 class="font-weight-bold mb-0 text-dark mt-1"><?php echo $totalRedirects; ?></h3>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Active Store</span>
-            <h6 class="font-weight-bold mb-0 text-primary mt-2 text-truncate" title="<?php echo htmlspecialchars($shopCfg['name'] ?? $activeStore); ?>">
-              <?php echo htmlspecialchars($shopCfg['name'] ?? $activeStore); ?>
-            </h6>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">API Version</span>
-            <h6 class="font-weight-bold mb-0 text-dark mt-2"><?php echo htmlspecialchars($apiVersion); ?></h6>
-          </div>
-        </div>
-        <div class="col-6 col-md-3">
-          <div class="card p-3 shadow-xs border-0 rounded-lg">
-            <span class="text-muted small font-weight-bold text-uppercase" style="font-size: 11px;">Last Synced</span>
-            <h6 class="font-weight-bold mb-0 text-info mt-2"><?php echo $lastSyncedAt ? htmlspecialchars($lastSyncedAt) : 'Never'; ?></h6>
-          </div>
-        </div>
-      </div>
-
       <!-- Add New Redirect (inline form — same createShopifyRedirect() backend as the modal) -->
       <div class="card p-3 mb-4 shadow-sm border-0" style="border-radius: 12px; border-top: 4px solid #16a34a !important;">
         <form method="POST" action="redirect.php" class="row align-items-end">
