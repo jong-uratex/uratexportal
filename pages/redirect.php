@@ -709,24 +709,44 @@ include __DIR__ . '/../includes/sidebar.php';
           </p>
         </div>
 
-        <div class="col-sm-6 text-right d-flex justify-content-end align-items-center gap-2 flex-wrap">
-          <form method="POST" class="d-inline mr-2">
-            <input type="hidden" name="action" value="test_connection">
-            <button type="submit" class="btn font-weight-bold text-white shadow-sm" style="background-color: #007bff;">
-              <i class="fas fa-plug mr-1"></i> Test Connection
-            </button>
-          </form>
-
-          <form method="POST" class="d-inline mr-2" id="syncForm">
-            <input type="hidden" name="action" value="sync_redirects">
-            <button type="submit" id="btnSyncRedirects" class="btn font-weight-bold shadow-sm" style="background-color: #FFCC00; color: #1f2937; border: 1px solid #eab308;">
-              <i class="fas fa-sync-alt mr-1" id="syncIcon"></i> Sync Redirects
-            </button>
-          </form>
-
-          <button type="button" class="btn font-weight-bold text-white shadow-sm" style="background-color: #16a34a;" data-toggle="modal" data-target="#addRedirectModal">
-            <i class="fas fa-plus mr-1"></i> Add Redirect
-          </button>
+        <div class="col-sm-6">
+          <div class="row justify-content-end">
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #007bff !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-plug text-primary mr-1"></i>Test Connections</div>
+                  <div class="small text-muted mb-2">Verify Shopify API access.</div>
+                  <form method="POST">
+                    <input type="hidden" name="action" value="test_connection">
+                    <button type="submit" class="btn btn-sm btn-primary btn-block font-weight-bold">Run Test</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #eab308 !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-sync-alt text-warning mr-1"></i>Sync Redirects</div>
+                  <div class="small text-muted mb-2">Refresh the local redirects.</div>
+                  <form method="POST" id="syncForm">
+                    <input type="hidden" name="action" value="sync_redirects">
+                    <button type="submit" id="btnSyncRedirects" class="btn btn-sm btn-warning btn-block font-weight-bold"><i class="fas fa-sync-alt mr-1" id="syncIcon"></i>Sync Now</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-plus text-success mr-1"></i>Add Redirect</div>
+                  <div class="small text-muted mb-2">Create a new live redirect.</div>
+                  <button type="button" class="btn btn-sm btn-success btn-block font-weight-bold" data-toggle="modal" data-target="#addRedirectModal">
+                    <i class="fas fa-plus mr-1"></i>Add Now
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
