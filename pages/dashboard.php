@@ -13,6 +13,13 @@ if (isset($_GET['switch_store'])) {
     exit;
 }
 
+$lastTokenRenewedAt = null;
+$db = getDbConnection();
+if ($db) {
+  $tokenTimestampStmt = $db->query("SELECT MAX(`updated_at`) FROM `settings` WHERE `handle` IN ('retail_access_token', 'business_access_token')");
+  $lastTokenRenewedAt = $tokenTimestampStmt->fetchColumn() ?: null;
+}
+
 $pageTitle = 'Dashboard - SEO Health & Analytics';
 include __DIR__ . '/../includes/header.php';
 include __DIR__ . '/../includes/sidebar.php';
@@ -30,7 +37,9 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
         <div class="col-sm-6 text-right">
           <button type="button" id="renewTokenBtn" class="btn btn-warning text-dark font-weight-bold mr-2">
-            <i class="fas fa-key mr-1"></i> Renew Token
+            <i class="fas fa-key mr-1"></i> Renew Token<?php if ($lastTokenRenewedAt): ?>
+              <small class="d-block font-weight-normal">Last renewed: <?= htmlspecialchars(date('M j, Y g:i A', strtotime($lastTokenRenewedAt)), ENT_QUOTES, 'UTF-8') ?></small>
+            <?php endif; ?>
           </button>
           <button type="button" class="btn btn-uratex-sync mr-2">
             <i class="fas fa-sync-alt mr-1"></i> Sync from Shopify
