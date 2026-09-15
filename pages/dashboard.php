@@ -38,7 +38,7 @@ include __DIR__ . '/../includes/sidebar.php';
         <div class="col-sm-6 text-right">
           <button type="button" id="renewTokenBtn" class="btn btn-warning text-dark font-weight-bold mr-2">
             <i class="fas fa-key mr-1"></i> Renew Token<?php if ($lastTokenRenewedAt): ?>
-              <small class="d-block font-weight-normal">Last renewed: <?= htmlspecialchars(date('M j, Y g:i A', strtotime($lastTokenRenewedAt)), ENT_QUOTES, 'UTF-8') ?></small>
+              <small class="d-block font-weight-normal">Last renewed: <?= htmlspecialchars((new DateTime($lastTokenRenewedAt, new DateTimeZone('UTC')))->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A'), ENT_QUOTES, 'UTF-8') ?></small>
             <?php endif; ?>
           </button>
           <button type="button" class="btn btn-uratex-sync mr-2">
