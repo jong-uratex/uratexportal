@@ -250,12 +250,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_blogs') {
         fclose($handle);
       }
     } else {
-      $blogsStmt = $db->prepare('SELECT id FROM shopify_blogs WHERE store_key = :store ORDER BY id ASC');
-      $blogsStmt->execute([':store' => $activeStore]);
-      $blogIds = $blogsStmt->fetchAll(PDO::FETCH_COLUMN);
-      $blogCount = count($blogIds);
-      $updateStmt = $db->prepare("UPDATE shopify_blogs SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
-      $rowIndex = 0;
+      $updateStmt = $db->prepare("UPDATE shopify_blogs SET title = :title, meta_description = :meta_description, status = 'draft', updated_by = :user WHERE store_key = :store AND handle = :handle");
 
       try {
         $db->beginTransaction();
@@ -264,27 +259,29 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_blogs') {
           $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
           $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-          if ($title === '' || $urlHandle === '' || $rowIndex >= $blogCount) {
+          if ($title === '' || $urlHandle === '') {
             $skippedCount++;
-            $rowIndex++;
             continue;
           }
 
           $updateStmt->execute([
             ':title' => $title,
             ':meta_description' => $metaDescription,
+            ':store' => $activeStore,
             ':handle' => $urlHandle,
             ':user' => $currentUser,
-            ':id' => $blogIds[$rowIndex]
           ]);
-          $importedCount++;
-          $rowIndex++;
+          if ($updateStmt->rowCount() === 1) {
+            $importedCount++;
+          } else {
+            $skippedCount++;
+          }
         }
         $db->commit();
         fclose($handle);
         $message = "Imported <strong>{$importedCount}</strong> article(s) into the {$shopCfg['name']} database. No new articles were added.";
         if ($skippedCount > 0) {
-          $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching article row.";
+          $message .= " {$skippedCount} row(s) were skipped because required values were missing or no article matched the URL handle.";
         }
         recordUserLog('Article Import', 'Blogs & Articles', "Updated {$importedCount} existing article SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'article', null, 'success');
       } catch (Throwable $e) {

@@ -243,12 +243,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_collections') {
         fclose($handle);
       }
     } else {
-      $collectionsStmt = $db->prepare('SELECT id FROM shopify_collections WHERE store_key = :store ORDER BY id ASC');
-      $collectionsStmt->execute([':store' => $activeStore]);
-      $collectionIds = $collectionsStmt->fetchAll(PDO::FETCH_COLUMN);
-      $collectionCount = count($collectionIds);
-      $updateStmt = $db->prepare("UPDATE shopify_collections SET title = :title, meta_description = :meta_description, handle = :handle, status = 'draft', updated_by = :user WHERE id = :id");
-      $rowIndex = 0;
+      $updateStmt = $db->prepare("UPDATE shopify_collections SET title = :title, meta_description = :meta_description, status = 'draft', updated_by = :user WHERE store_key = :store AND handle = :handle");
 
       try {
         $db->beginTransaction();
@@ -257,27 +252,29 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_collections') {
           $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
           $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-          if ($title === '' || $urlHandle === '' || $rowIndex >= $collectionCount) {
+          if ($title === '' || $urlHandle === '') {
             $skippedCount++;
-            $rowIndex++;
             continue;
           }
 
           $updateStmt->execute([
             ':title' => $title,
             ':meta_description' => $metaDescription,
+            ':store' => $activeStore,
             ':handle' => $urlHandle,
             ':user' => $currentUser,
-            ':id' => $collectionIds[$rowIndex]
           ]);
-          $importedCount++;
-          $rowIndex++;
+          if ($updateStmt->rowCount() === 1) {
+            $importedCount++;
+          } else {
+            $skippedCount++;
+          }
         }
         $db->commit();
         fclose($handle);
         $message = "Imported <strong>{$importedCount}</strong> collection(s) into the {$shopCfg['name']} database. No new collections were added.";
         if ($skippedCount > 0) {
-          $message .= " {$skippedCount} row(s) were skipped because required values were missing or there was no matching collection row.";
+          $message .= " {$skippedCount} row(s) were skipped because required values were missing or no collection matched the URL handle.";
         }
         recordUserLog('Collection Import', 'Collections', "Updated {$importedCount} existing collection SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'collection', null, 'success');
       } catch (Throwable $e) {
