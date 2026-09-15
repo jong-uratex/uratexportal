@@ -1251,7 +1251,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       <input type="text" name="title" id="title-<?php echo $blogId; ?>"
                              class="form-control font-weight-bold"
                              value="<?php echo htmlspecialchars($artTitle); ?>"
-                             oninput="document.getElementById('t-count-<?php echo $blogId; ?>').innerText = this.value.length;"
+                         data-char-counter="t-count-<?php echo $blogId; ?>"
                              required>
                     </div>
 
@@ -1264,7 +1264,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       </div>
                       <textarea name="meta_description" id="meta-<?php echo $blogId; ?>"
                                 class="form-control" rows="3" style="resize: vertical;"
-                                oninput="document.getElementById('m-count-<?php echo $blogId; ?>').innerText = this.value.length;"><?php echo htmlspecialchars($artMeta); ?></textarea>
+                                data-char-counter="m-count-<?php echo $blogId; ?>"><?php echo htmlspecialchars($artMeta); ?></textarea>
                     </div>
 
                     <div class="form-group mb-4">

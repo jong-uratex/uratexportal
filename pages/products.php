@@ -1071,7 +1071,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       <div class="d-flex justify-content-between align-items-center mb-1">
                         <label class="font-weight-bold small text-secondary mb-0">Page Title</label>
                         <span class="text-muted small" style="font-size: 11px;">
-                          <?php echo mb_strlen($prod['title']); ?> / 60 chars
+                          <span id="title-count-<?php echo $productId; ?>"><?php echo mb_strlen($prod['title']); ?></span> / 60 chars
                         </span>
                       </div>
                       <input
@@ -1079,6 +1079,7 @@ include __DIR__ . '/../includes/sidebar.php';
                         name="title"
                         class="form-control font-weight-bold"
                         value="<?php echo htmlspecialchars($prod['title']); ?>"
+                        data-char-counter="title-count-<?php echo $productId; ?>"
                         required
                       >
                     </div>
@@ -1088,7 +1089,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       <div class="d-flex justify-content-between align-items-center mb-1">
                         <label class="font-weight-bold small text-secondary mb-0">Meta Description</label>
                         <span class="text-muted small" style="font-size: 11px;">
-                          <?php echo mb_strlen($prod['meta_description']); ?> / 160 chars
+                          <span id="meta-count-<?php echo $productId; ?>"><?php echo mb_strlen($prod['meta_description']); ?></span> / 160 chars
                         </span>
                       </div>
                       <textarea
@@ -1096,6 +1097,7 @@ include __DIR__ . '/../includes/sidebar.php';
                         class="form-control"
                         rows="3"
                         style="resize: vertical;"
+                        data-char-counter="meta-count-<?php echo $productId; ?>"
                       ><?php echo htmlspecialchars($prod['meta_description']); ?></textarea>
                     </div>
 

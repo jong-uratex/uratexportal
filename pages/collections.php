@@ -1128,20 +1128,21 @@ include __DIR__ . '/../includes/sidebar.php';
                     <div class="form-group mb-3">
                       <div class="d-flex justify-content-between align-items-center mb-1">
                         <label class="font-weight-bold small text-secondary mb-0">Collection SEO Title</label>
-                        <span class="text-muted small"><?php echo mb_strlen($colTitle); ?> / 60 chars</span>
+                        <span class="text-muted small"><span id="title-count-<?php echo $colId; ?>"><?php echo mb_strlen($colTitle); ?></span> / 60 chars</span>
                       </div>
                       <input type="text" name="title" class="form-control font-weight-bold"
-                             value="<?php echo htmlspecialchars($colTitle); ?>" required>
+                             value="<?php echo htmlspecialchars($colTitle); ?>"
+                             data-char-counter="title-count-<?php echo $colId; ?>" required>
                     </div>
 
                     <!-- Meta -->
                     <div class="form-group mb-3">
                       <div class="d-flex justify-content-between align-items-center mb-1">
                         <label class="font-weight-bold small text-secondary mb-0">Meta Description</label>
-                        <span class="text-muted small"><?php echo mb_strlen($colMeta); ?> / 160 chars</span>
+                        <span class="text-muted small"><span id="meta-count-<?php echo $colId; ?>"><?php echo mb_strlen($colMeta); ?></span> / 160 chars</span>
                       </div>
                       <textarea name="meta_description" class="form-control" rows="3"
-                                style="resize: vertical;"><?php echo htmlspecialchars($colMeta); ?></textarea>
+                                style="resize: vertical;" data-char-counter="meta-count-<?php echo $colId; ?>"><?php echo htmlspecialchars($colMeta); ?></textarea>
                     </div>
 
                     <!-- Handle -->
