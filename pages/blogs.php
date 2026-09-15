@@ -61,6 +61,76 @@ function mapArticleStatus(?string $publishedAt): string
     return (!empty($publishedAt)) ? 'published' : 'draft';
 }
 
+/**
+ * Minimal cURL wrapper for the Shopify Admin API.
+ */
+function shopifyApiRequest(string $method, string $url, string $token, ?array $payload = null): array
+{
+    $ch   = curl_init($url);
+    $opts = [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_HTTPHEADER     => [
+            "X-Shopify-Access-Token: {$token}",
+            "Content-Type: application/json"
+        ],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT        => 15,
+    ];
+    if ($payload !== null) {
+        $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
+    }
+    curl_setopt_array($ch, $opts);
+    $res  = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return [$code, $res];
+}
+
+/**
+ * Create or update the "global" title_tag/description_tag metafield for an article.
+ *
+ * NOTE: Shopify's top-level "metafields_global_title_tag" / "metafields_global_description_tag"
+ * shorthand only WRITES a metafield the first time it is set. Once the metafield already
+ * exists, sending that shorthand again on an article PUT is silently ignored by the API
+ * (it still returns 2xx), so the live <title>/meta description never changes after the
+ * first push. We must look up the existing metafield and update it directly by ID.
+ */
+function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $token, int $ownerId, string $key, string $type, string $value): array
+{
+    $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
+             . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=article"
+             . "&namespace=global&key={$key}";
+    [$code, $res] = shopifyApiRequest('GET', $listUrl, $token);
+
+    $existingId = null;
+    if ($code >= 200 && $code < 300) {
+        $data = json_decode((string)$res, true);
+        if (!empty($data['metafields'][0]['id'])) {
+            $existingId = $data['metafields'][0]['id'];
+        }
+    }
+
+    if ($existingId) {
+        $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
+        return shopifyApiRequest('PUT', $putUrl, $token, [
+            'metafield' => ['id' => $existingId, 'value' => $value, 'type' => $type]
+        ]);
+    }
+
+    $postUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json";
+    return shopifyApiRequest('POST', $postUrl, $token, [
+        'metafield' => [
+            'namespace'      => 'global',
+            'key'            => $key,
+            'value'          => $value,
+            'type'           => $type,
+            'owner_id'       => $ownerId,
+            'owner_resource' => 'article'
+        ]
+    ]);
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
@@ -782,6 +852,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                 $shopifyBid  = $art['shopify_blog_id'] ?? 0;
                 $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
                 $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+                $token       = $shopCfg['access_token'] ?? '';
+                $finalTitle  = $title ?: $art['title'];
+                $finalMeta   = $metaDescription ?: $art['meta_description'];
 
                 if (empty($shopifyBid)) {
                     throw new Exception('Missing shopify_blog_id. Please re-sync articles.');
@@ -789,32 +862,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
 
                 $putUrl = "https://{$adminDomain}/admin/api/{$version}/blogs/{$shopifyBid}/articles/{$shopifyAid}.json";
 
-                $payload = json_encode([
+                $payload = [
                     "article" => [
-                        "id"                                => $shopifyAid,
-                        "title"                             => $title ?: $art['title'],
-                        "handle"                            => $handle ?: $art['handle'],
-                        "summary_html"                      => $metaDescription ?: $art['meta_description'],
-                        "metafields_global_title_tag"       => $title ?: $art['title'],
-                        "metafields_global_description_tag" => $metaDescription ?: $art['meta_description']
+                        "id"           => $shopifyAid,
+                        "title"        => $finalTitle,
+                        "handle"       => $handle ?: $art['handle'],
+                        "summary_html" => $finalMeta
                     ]
-                ]);
+                ];
 
-                $ch = curl_init($putUrl);
-                curl_setopt_array($ch, [
-                    CURLOPT_CUSTOMREQUEST  => "PUT",
-                    CURLOPT_POSTFIELDS     => $payload,
-                    CURLOPT_HTTPHEADER     => [
-                        "X-Shopify-Access-Token: " . ($shopCfg['access_token'] ?? ''),
-                        "Content-Type: application/json"
-                    ],
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_TIMEOUT        => 15,
-                ]);
-                $res      = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
+                [$httpCode, $res] = shopifyApiRequest('PUT', $putUrl, $token, $payload);
+
+                // Article fields alone don't update the live <title>/meta description —
+                // those live in the "global" title_tag/description_tag metafields, which must
+                // be upserted directly (see upsertGlobalSeoMetafield doc comment).
+                [$titleTagCode] = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyAid, 'title_tag', 'single_line_text_field', $finalTitle);
+                [$descTagCode]  = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyAid, 'description_tag', 'single_line_text_field', $finalMeta);
+
+                if (!($titleTagCode >= 200 && $titleTagCode < 300) || !($descTagCode >= 200 && $descTagCode < 300)) {
+                    $httpCode = max($httpCode, $titleTagCode, $descTagCode, 500);
+                }
 
                 $upStmt = $db->prepare("
                     UPDATE shopify_blogs
@@ -827,14 +894,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                     WHERE id = :id
                 ");
                 $upStmt->execute([
-                    ':title'     => $title ?: $art['title'],
-                    ':meta_desc' => $metaDescription ?: $art['meta_description'],
+                    ':title'     => $finalTitle,
+                    ':meta_desc' => $finalMeta,
                     ':handle'    => $handle ?: $art['handle'],
                     ':user'      => $currentUser,
                     ':id'        => $blogId
                 ]);
 
-                $pushedTitle = $title ?: $art['title'];
+                $pushedTitle = $finalTitle;
                 if ($httpCode >= 200 && $httpCode < 300) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
                     recordUserLog('Shopify Push', $pushedTitle, "Pushed article #{$blogId} live to {$shopCfg['name']} (Shopify article ID: {$shopifyAid}). Title, handle and meta tags updated.", 'article', $blogId, 'success');
