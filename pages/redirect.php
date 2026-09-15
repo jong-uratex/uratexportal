@@ -49,7 +49,14 @@ function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
 }
 
 /**
- * Normalise a redirect path: must start with "/".
+ * Normalise a redirect path: must be a store-relative path starting with "/".
+ *
+ * Shopify's redirect "path" only matches requests against the store's own
+ * relative URL path. If a full web address (e.g. "https://uratex-business
+ * .myshopify.com/collections/mattresses") is saved as the path, Shopify can
+ * never match it against an incoming request, so the redirect silently never
+ * fires. If a full URL is supplied here, strip the scheme/host and keep only
+ * the path (+ query/fragment) so redirects are actually matchable.
  */
 function normaliseRedirectPath(string $path): string
 {
@@ -57,10 +64,30 @@ function normaliseRedirectPath(string $path): string
     if ($path === '') {
         return '';
     }
+    if (preg_match('#^https?://#i', $path)) {
+        $parts    = parse_url($path);
+        $relative = $parts['path'] ?? '/';
+        if (!empty($parts['query'])) {
+            $relative .= '?' . $parts['query'];
+        }
+        if (!empty($parts['fragment'])) {
+            $relative .= '#' . $parts['fragment'];
+        }
+        $path = $relative;
+    }
     if ($path[0] !== '/') {
         $path = '/' . $path;
     }
     return $path;
+}
+
+/**
+ * True if a stored redirect "path" is a full web address instead of a
+ * store-relative path — meaning Shopify could never have matched it.
+ */
+function isMalformedRedirectPath(string $path): bool
+{
+    return (bool)preg_match('#^https?://#i', trim($path));
 }
 
 /**
@@ -76,6 +103,38 @@ function isValidRedirectTarget(string $target): bool
         return strlen($target) > 1;
     }
     return (bool)preg_match('#^https?://[^\s/$.?#].[^\s]*$#i', $target);
+}
+
+/**
+ * HEAD-check whether a redirect's target URL is actually reachable on the
+ * live storefront (returns a 2xx/3xx). Used only for read-only auditing —
+ * never to auto-modify a redirect.
+ */
+function checkTargetReachable(string $target, string $storeDomain): string
+{
+    $url = preg_match('#^https?://#i', $target) ? $target : ('https://' . $storeDomain . $target);
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY         => true,
+        CURLOPT_CUSTOMREQUEST  => 'HEAD',
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS      => 5,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT        => 10,
+    ]);
+    curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($httpCode >= 200 && $httpCode < 400) {
+        return 'reachable';
+    }
+    if ($httpCode === 0) {
+        return 'unknown';
+    }
+    return 'broken';
 }
 
 /**
@@ -176,6 +235,13 @@ if ($db) {
                 KEY `idx_redirects_path` (`path`(191))
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         ");
+
+        // Migrate older tables that predate the read-only target audit feature
+        $cols = $db->query("SHOW COLUMNS FROM `shopify_redirects` LIKE 'target_check_status'")->fetchAll();
+        if (empty($cols)) {
+            $db->exec("ALTER TABLE `shopify_redirects` ADD COLUMN `target_check_status` VARCHAR(20) NULL DEFAULT NULL AFTER `target`");
+            $db->exec("ALTER TABLE `shopify_redirects` ADD COLUMN `target_checked_at` DATETIME NULL DEFAULT NULL AFTER `target_check_status`");
+        }
     } catch (PDOException $e) {
         // silent – page must still render
     }
@@ -477,6 +543,55 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
     }
 }
 
+// B2. AUDIT MALFORMED REDIRECTS (read-only — never auto-fixes anything)
+//
+// These are redirects whose `path` was saved as a full web address instead of
+// a store-relative path, so Shopify has never been able to match them against
+// incoming requests. We only report on them and check whether their `target`
+// still resolves live — we deliberately do NOT rewrite `path` here, because
+// some targets (e.g. renamed/removed blog articles) no longer exist, and
+// blindly "fixing" the path would start redirecting real traffic into 404s.
+if (isset($_POST['action']) && $_POST['action'] === 'audit_redirects') {
+    try {
+        if ($db) {
+            $stmt = $db->prepare("SELECT * FROM shopify_redirects WHERE store_key = :store AND `path` NOT LIKE '/%'");
+            $stmt->execute([':store' => $activeStore]);
+            $malformed = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $storeDomainForCheck = $shopCfg['domain'] ?? getShopifyAdminDomain($shopCfg, $activeStore);
+            $upStmt = $db->prepare("
+                UPDATE shopify_redirects
+                SET target_check_status = :status, target_checked_at = NOW()
+                WHERE id = :id
+            ");
+
+            $reachable = 0;
+            $broken    = 0;
+            $unknown   = 0;
+            foreach ($malformed as $row) {
+                $status = checkTargetReachable((string)$row['target'], (string)$storeDomainForCheck);
+                $upStmt->execute([':status' => $status, ':id' => $row['id']]);
+                if ($status === 'reachable') {
+                    $reachable++;
+                } elseif ($status === 'broken') {
+                    $broken++;
+                } else {
+                    $unknown++;
+                }
+            }
+
+            $total = count($malformed);
+            $message = "🔍 Audited <strong>{$total}</strong> malformed redirect(s) for {$shopCfg['name']}: "
+                     . "<strong>{$reachable}</strong> target(s) still resolve live, "
+                     . "<strong>{$broken}</strong> target(s) return an error/404, "
+                     . "{$unknown} could not be checked. No paths were changed — review the list below before fixing anything.";
+            recordUserLog('redirect_audit', 'redirects', "Audited {$total} malformed redirects for {$activeStore}: {$reachable} reachable, {$broken} broken, {$unknown} unknown.", 'redirect', null, 'info');
+        }
+    } catch (Throwable $e) {
+        $message = "ERROR: Audit failed – " . htmlspecialchars($e->getMessage());
+    }
+}
+
 // C. CREATE REDIRECT (uses createShopifyRedirect() helper)
 if (isset($_POST['action']) && $_POST['action'] === 'create_redirect') {
     try {
@@ -676,6 +791,19 @@ if ($db) {
     }
 }
 
+// Redirects whose `path` was stored as a full URL — never matchable by Shopify.
+$malformedRedirects = [];
+if ($db) {
+    try {
+        $mStmt = $db->prepare("SELECT * FROM shopify_redirects WHERE store_key = :store AND `path` NOT LIKE '/%' ORDER BY id ASC");
+        $mStmt->execute([':store' => $activeStore]);
+        $malformedRedirects = $mStmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        $malformedRedirects = [];
+    }
+}
+$malformedCount = count($malformedRedirects);
+
 $storeDomain = $shopCfg['domain'] ?? getShopifyAdminDomain($shopCfg, $activeStore);
 $apiVersion  = $shopCfg['version'] ?? '2025-10';
 
@@ -743,6 +871,55 @@ include __DIR__ . '/../includes/sidebar.php';
 
   <section class="content">
     <div class="container-fluid">
+
+      <?php if ($malformedCount > 0): ?>
+        <div class="card p-3 mb-4 shadow-sm border-0" style="border-radius: 12px; border-top: 4px solid #dc2626 !important;">
+          <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
+            <div>
+              <h5 class="font-weight-bold mb-1 text-danger"><i class="fas fa-triangle-exclamation mr-2"></i><?php echo $malformedCount; ?> Redirect(s) Have Never Worked</h5>
+              <p class="text-muted small mb-0">
+                These were saved with a full web address in the "From URL" field instead of a relative path, so Shopify could never match them.
+                <strong>Do not bulk-fix them yet</strong> — some of their targets no longer exist (pending blog restructuring). Run the audit below to see which targets are still live before touching anything.
+              </p>
+            </div>
+            <form method="POST" class="flex-shrink-0">
+              <input type="hidden" name="action" value="audit_redirects">
+              <button type="submit" class="btn btn-sm btn-danger font-weight-bold text-nowrap"><i class="fas fa-magnifying-glass mr-1"></i>Audit Targets (Read-Only)</button>
+            </form>
+          </div>
+
+          <div class="table-responsive mt-3">
+            <table class="table table-sm table-striped mb-0">
+              <thead class="thead-light">
+                <tr>
+                  <th>Stored Path (broken)</th>
+                  <th>Target</th>
+                  <th>Target Status</th>
+                  <th>Last Audited</th>
+                </tr>
+              </thead>
+              <tbody>
+                <?php foreach ($malformedRedirects as $mr): ?>
+                  <?php
+                    $checkStatus = $mr['target_check_status'] ?? null;
+                    $badgeClass  = 'badge-secondary';
+                    $badgeLabel  = 'Not audited yet';
+                    if ($checkStatus === 'reachable') { $badgeClass = 'badge-success'; $badgeLabel = 'Target reachable'; }
+                    elseif ($checkStatus === 'broken') { $badgeClass = 'badge-danger'; $badgeLabel = 'Target missing (404/error)'; }
+                    elseif ($checkStatus === 'unknown') { $badgeClass = 'badge-warning'; $badgeLabel = 'Could not verify'; }
+                  ?>
+                  <tr>
+                    <td class="font-mono small text-danger text-break"><?php echo htmlspecialchars($mr['path']); ?></td>
+                    <td class="font-mono small text-break"><?php echo htmlspecialchars($mr['target']); ?></td>
+                    <td><span class="badge <?php echo $badgeClass; ?>"><?php echo $badgeLabel; ?></span></td>
+                    <td class="small text-muted"><?php echo $mr['target_checked_at'] ? htmlspecialchars($mr['target_checked_at']) : '—'; ?></td>
+                  </tr>
+                <?php endforeach; ?>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      <?php endif; ?>
 
       <!-- Add New Redirect (inline form — same createShopifyRedirect() backend as the modal) -->
       <div class="card p-3 mb-4 shadow-sm border-0" style="border-radius: 12px; border-top: 4px solid #16a34a !important;">
