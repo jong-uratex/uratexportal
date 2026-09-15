@@ -65,7 +65,7 @@ function mapCollectionStatus(?string $publishedAt): string
 /**
  * Minimal cURL wrapper for the Shopify Admin API.
  */
-function shopifyApiRequest(string $method, string $url, string $token, ?array $payload = null): array
+function shopifySeoApiRequest(string $method, string $url, string $token, ?array $payload = null): array
 {
     $ch   = curl_init($url);
     $opts = [
@@ -102,7 +102,7 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
     $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
              . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=collection"
              . "&namespace=global&key={$key}";
-    [$code, $res] = shopifyApiRequest('GET', $listUrl, $token);
+    [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
 
     $existingId = null;
     if ($code >= 200 && $code < 300) {
@@ -114,13 +114,13 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
 
     if ($existingId) {
         $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
-        return shopifyApiRequest('PUT', $putUrl, $token, [
+        return shopifySeoApiRequest('PUT', $putUrl, $token, [
             'metafield' => ['id' => $existingId, 'value' => $value, 'type' => $type]
         ]);
     }
 
     $postUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json";
-    return shopifyApiRequest('POST', $postUrl, $token, [
+    return shopifySeoApiRequest('POST', $postUrl, $token, [
         'metafield' => [
             'namespace'      => 'global',
             'key'            => $key,
@@ -141,7 +141,7 @@ function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $
 {
     $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
              . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=collection&namespace=global";
-    [$code, $res] = shopifyApiRequest('GET', $listUrl, $token);
+    [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
 
     $result = ['title_tag' => null, 'description_tag' => null];
     if ($code >= 200 && $code < 300) {
@@ -799,7 +799,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                     ]
                 ];
 
-                [$httpCode, $res] = shopifyApiRequest('PUT', $putUrl, $token, $payload);
+                [$httpCode, $res] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
 
                 // Collection fields alone don't update the live <title>/meta description —
                 // those live in the "global" title_tag/description_tag metafields, which must
