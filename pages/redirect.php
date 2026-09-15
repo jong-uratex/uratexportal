@@ -102,7 +102,11 @@ function isValidRedirectTarget(string $target): bool
     if (strpos($target, '/') === 0) {
         return strlen($target) > 1;
     }
-    return (bool)preg_match('#^https?://[^\s/$.?#].[^\s]*$#i', $target);
+
+    $parts = filter_var($target, FILTER_VALIDATE_URL) ? parse_url($target) : false;
+    return is_array($parts)
+      && in_array(strtolower($parts['scheme'] ?? ''), ['http', 'https'], true)
+      && !empty($parts['host']);
 }
 
 /**
