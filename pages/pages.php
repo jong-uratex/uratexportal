@@ -131,6 +131,31 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
     ]);
 }
 
+/**
+ * Fetch the live "global" title_tag/description_tag metafields for a page —
+ * these, not the plain page title/body, drive the actual live <title> and
+ * meta description. Sync must read them so the portal reflects what's really live.
+ */
+function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $token, int $ownerId): array
+{
+    $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
+             . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=page&namespace=global";
+    [$code, $res] = shopifyApiRequest('GET', $listUrl, $token);
+
+    $result = ['title_tag' => null, 'description_tag' => null];
+    if ($code >= 200 && $code < 300) {
+        $data = json_decode((string)$res, true);
+        foreach ($data['metafields'] ?? [] as $mf) {
+            if (($mf['key'] ?? '') === 'title_tag') {
+                $result['title_tag'] = $mf['value'] ?? null;
+            } elseif (($mf['key'] ?? '') === 'description_tag') {
+                $result['description_tag'] = $mf['value'] ?? null;
+            }
+        }
+    }
+    return $result;
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE TABLE
 // -----------------------------------------------------------------------------
@@ -613,12 +638,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
 
                 $pageUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/pages/" . $handle;
 
-                $title     = $p['title'] ?? $pname;
-                $bodyClean = strip_tags($p['body_html'] ?? '');
-                $metaDesc  = mb_substr($bodyClean, 0, 160);
-                if (empty($metaDesc)) {
-                    $metaDesc = "Learn more about {$pname} at Uratex Philippines.";
+                $bodyClean    = strip_tags($p['body_html'] ?? '');
+                $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                if (empty($fallbackMeta)) {
+                    $fallbackMeta = "Learn more about {$pname} at Uratex Philippines.";
                 }
+
+                // The live <title>/meta description come from the "global" SEO
+                // metafields, not the plain page title/body — pull those so
+                // the portal doesn't show stale/wrong data vs. what's live.
+                $seoFields = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$pid);
+                $title     = $seoFields['title_tag'] ?: ($p['title'] ?? $pname);
+                $metaDesc  = $seoFields['description_tag'] ?: $fallbackMeta;
 
                 $pageType = 'General Page';
                 if (!empty($p['template_suffix'])) {
