@@ -512,11 +512,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     }
 }
 
-// B. SYNC PAGES FROM SHOPIFY
+// B. SYNC PAGES FROM SHOPIFY (High-performance GraphQL with REST fallback)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     try {
         $syncedCount      = 0;
-        $shopifyPages     = [];
         $apiError         = null;
         $successfulDomain = null;
 
@@ -533,77 +536,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
 
         recordUserLog('sync_started', 'pages', "Starting pages sync for store: {$activeStore}", 'page', null, 'info');
 
-        foreach ($domainsToTry as $domain) {
-            $nextUrl          = "https://{$domain}/admin/api/{$version}/pages.json?limit=250";
-            $headers          = [
-                "X-Shopify-Access-Token: {$token}",
-                "Content-Type: application/json"
-            ];
-            $pageLimit        = 40;
-            $currentPageCount = 0;
-            $tempPages        = [];
-            $gotValidResponse = false;
-
-            while (!empty($nextUrl) && $currentPageCount < $pageLimit) {
-                $currentPageCount++;
-
-                $ch = curl_init($nextUrl);
-                if ($ch === false) {
-                    throw new Exception('Failed to initialize cURL');
-                }
-
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_HTTPHEADER     => $headers,
-                    CURLOPT_HEADER         => true,
-                    CURLOPT_SSL_VERIFYPEER => false,
-                    CURLOPT_TIMEOUT        => 25,
-                ]);
-
-                $response   = curl_exec($ch);
-                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-                $curlError  = curl_error($ch);
-                curl_close($ch);
-
-                if ($httpCode === 200 && $response !== false) {
-                    $gotValidResponse = true;
-                    $headersStr = substr($response, 0, $headerSize);
-                    $bodyStr    = substr($response, $headerSize);
-                    $json       = json_decode($bodyStr, true);
-
-                    if (!empty($json['pages']) && is_array($json['pages'])) {
-                        $tempPages = array_merge($tempPages, $json['pages']);
-                    }
-
-                    $nextUrl = '';
-                    if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
-                        $nextUrl = $match[1];
-                    }
-                } else {
-                    $bodyStr   = is_string($response) ? substr($response, $headerSize) : '';
-                    $errorData = json_decode($bodyStr, true);
-                    $apiError  = "HTTP {$httpCode} on {$domain}";
-                    if ($curlError) {
-                        $apiError .= " | cURL: {$curlError}";
-                    }
-                    if (!empty($errorData['errors'])) {
-                        $apiError .= " | " . json_encode($errorData['errors']);
-                    } elseif ($bodyStr) {
-                        $apiError .= " | " . substr($bodyStr, 0, 300);
-                    }
-                    break;
-                }
-            }
-
-            if ($gotValidResponse) {
-                $shopifyPages     = $tempPages;
-                $successfulDomain = $domain;
-                break;
-            }
-        }
-
-        if ($db && !empty($shopifyPages)) {
+        $insertStmt = null;
+        if ($db) {
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_pages (
                     store_key, shopify_page_id, page_title, page_type, page_url,
@@ -626,66 +560,311 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_pages') {
                     status            = VALUES(status),
                     last_synced_at    = NOW()
             ");
+        }
 
-            foreach ($shopifyPages as $p) {
-                $pid    = $p['id'] ?? 0;
-                $pname  = $p['title'] ?? 'Untitled Page';
-                $handle = $p['handle'] ?? '';
-                $author = $p['author'] ?? 'Uratex Team';
+        $gqlSuccess = false;
 
-                $pageUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/pages/" . $handle;
+        // 1. High-Performance GraphQL Sync
+        foreach ($domainsToTry as $domain) {
+            $gqlUrl      = "https://{$domain}/admin/api/{$version}/graphql.json";
+            $cursor      = null;
+            $hasNextPage = true;
+            $batchCount  = 0;
+            $batchLimit  = 40;
+            $tempPages   = [];
 
-                $bodyClean    = strip_tags($p['body_html'] ?? '');
-                $fallbackMeta = mb_substr($bodyClean, 0, 160);
-                if (empty($fallbackMeta)) {
-                    $fallbackMeta = "Learn more about {$pname} at Uratex Philippines.";
-                }
+            $gqlQuery = <<<'GQL'
+query getPages($cursor: String) {
+  pages(first: 250, after: $cursor) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      legacyResourceId
+      title
+      handle
+      body
+      templateSuffix
+      seo {
+        title
+        description
+      }
+      titleTag: metafield(namespace: "global", key: "title_tag") {
+        value
+      }
+      descTag: metafield(namespace: "global", key: "description_tag") {
+        value
+      }
+      publishedAt
+    }
+  }
+}
+GQL;
 
-                // The live <title>/meta description come from the "global" SEO
-                // metafields, not the plain page title/body — pull those so
-                // the portal doesn't show stale/wrong data vs. what's live.
-                $seoFields = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$pid);
-                $title     = $seoFields['title_tag'] ?: ($p['title'] ?? $pname);
-                $metaDesc  = $seoFields['description_tag'] ?: $fallbackMeta;
+            while ($hasNextPage && $batchCount < $batchLimit) {
+                $batchCount++;
 
-                $pageType = 'General Page';
-                if (!empty($p['template_suffix'])) {
-                    $pageType = ucwords(str_replace(['-', '_'], ' ', $p['template_suffix']));
-                } elseif (stripos($pname, 'about') !== false) {
-                    $pageType = 'Brand Story';
-                } elseif (stripos($pname, 'contact') !== false) {
-                    $pageType = 'Contact / Support';
-                } elseif (stripos($pname, 'policy') !== false || stripos($pname, 'privacy') !== false || stripos($pname, 'terms') !== false) {
-                    $pageType = 'Legal Policy';
-                } elseif (stripos($pname, 'faq') !== false) {
-                    $pageType = 'Help / FAQs';
-                }
-
-                if (function_exists('calculateSeoHealth')) {
-                    $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
-                    $score       = $seoAnalysis['score'];
-                } else {
-                    $score = 85;
-                }
-
-                $status = mapPageStatus($p['published_at'] ?? null);
-
-                $insertStmt->execute([
-                    ':store'     => $activeStore,
-                    ':pid'       => $pid,
-                    ':pname'     => $pname,
-                    ':ptype'     => $pageType,
-                    ':purl'      => $pageUrl,
-                    ':title'     => $title,
-                    ':meta_desc' => $metaDesc,
-                    ':handle'    => $handle,
-                    ':author'    => $author,
-                    ':status'    => $status,
-                    ':seo_score' => $score
+                $payload = json_encode([
+                    'query'     => $gqlQuery,
+                    'variables' => ['cursor' => $cursor]
                 ]);
-                $syncedCount++;
+
+                $ch = curl_init($gqlUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_POST           => true,
+                    CURLOPT_POSTFIELDS     => $payload,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json",
+                        "Accept: application/json"
+                    ],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 30,
+                ]);
+
+                $response  = curl_exec($ch);
+                $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode === 200 && $response) {
+                    $json  = json_decode($response, true);
+                    $pData = $json['data']['pages'] ?? null;
+                    if (!empty($pData['nodes']) && is_array($pData['nodes'])) {
+                        $tempPages   = array_merge($tempPages, $pData['nodes']);
+                        $hasNextPage = !empty($pData['pageInfo']['hasNextPage']);
+                        $cursor      = $pData['pageInfo']['endCursor'] ?? null;
+                    } else {
+                        if (!empty($json['errors'])) {
+                            $apiError = "GraphQL Error: " . json_encode($json['errors']);
+                        }
+                        break;
+                    }
+                } else {
+                    $apiError = "HTTP {$httpCode} on GraphQL {$domain}";
+                    if ($curlError) {
+                        $apiError .= " | cURL: {$curlError}";
+                    }
+                    break;
+                }
             }
 
+            if (!empty($tempPages) && $db && $insertStmt) {
+                try {
+                    $db->beginTransaction();
+                    foreach ($tempPages as $node) {
+                        $rawId = (string)($node['legacyResourceId'] ?? $node['id'] ?? '');
+                        $pid   = (int)preg_replace('/[^0-9]/', '', $rawId);
+                        if (!$pid) {
+                            continue;
+                        }
+
+                        $pname  = $node['title'] ?? 'Untitled Page';
+                        $handle = $node['handle'] ?? '';
+                        $author = 'Uratex Team';
+
+                        $pageUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $domain) . "/pages/" . $handle;
+
+                        $bodyClean    = strip_tags($node['body'] ?? '');
+                        $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                        if (empty($fallbackMeta)) {
+                            $fallbackMeta = "Learn more about {$pname} at Uratex Philippines.";
+                        }
+
+                        $title    = !empty($node['titleTag']['value']) ? $node['titleTag']['value'] : (!empty($node['seo']['title']) ? $node['seo']['title'] : $pname);
+                        $metaDesc = !empty($node['descTag']['value']) ? $node['descTag']['value'] : (!empty($node['seo']['description']) ? $node['seo']['description'] : $fallbackMeta);
+
+                        $pageType = 'General Page';
+                        $suffix   = $node['templateSuffix'] ?? '';
+                        if (!empty($suffix)) {
+                            $pageType = ucwords(str_replace(['-', '_'], ' ', $suffix));
+                        } elseif (stripos($pname, 'about') !== false) {
+                            $pageType = 'Brand Story';
+                        } elseif (stripos($pname, 'contact') !== false) {
+                            $pageType = 'Contact / Support';
+                        } elseif (stripos($pname, 'policy') !== false || stripos($pname, 'privacy') !== false || stripos($pname, 'terms') !== false) {
+                            $pageType = 'Legal Policy';
+                        } elseif (stripos($pname, 'faq') !== false) {
+                            $pageType = 'Help / FAQs';
+                        }
+
+                        $score = 85;
+                        if (function_exists('calculateSeoHealth')) {
+                            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                            $score       = $seoAnalysis['score'];
+                        }
+
+                        $status = mapPageStatus($node['publishedAt'] ?? null);
+
+                        $insertStmt->execute([
+                            ':store'     => $activeStore,
+                            ':pid'       => $pid,
+                            ':pname'     => $pname,
+                            ':ptype'     => $pageType,
+                            ':purl'      => $pageUrl,
+                            ':title'     => $title,
+                            ':meta_desc' => $metaDesc,
+                            ':handle'    => $handle,
+                            ':author'    => $author,
+                            ':status'    => $status,
+                            ':seo_score' => $score
+                        ]);
+                        $syncedCount++;
+                    }
+                    $db->commit();
+                    $gqlSuccess       = true;
+                    $successfulDomain = $domain;
+                    break;
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    $apiError = "Database error during GraphQL page sync: " . $e->getMessage();
+                }
+            }
+        }
+
+        // 2. Fallback to REST API if GraphQL returned no pages
+        if (!$gqlSuccess) {
+            $shopifyPages = [];
+            foreach ($domainsToTry as $domain) {
+                $nextUrl          = "https://{$domain}/admin/api/{$version}/pages.json?limit=250";
+                $headers          = [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json"
+                ];
+                $pageLimit        = 40;
+                $currentPageCount = 0;
+                $tempPages        = [];
+                $gotValidResponse = false;
+
+                while (!empty($nextUrl) && $currentPageCount < $pageLimit) {
+                    $currentPageCount++;
+
+                    $ch = curl_init($nextUrl);
+                    if ($ch === false) {
+                        throw new Exception('Failed to initialize cURL');
+                    }
+
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_HTTPHEADER     => $headers,
+                        CURLOPT_HEADER         => true,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_TIMEOUT        => 25,
+                    ]);
+
+                    $response   = curl_exec($ch);
+                    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                    $curlError  = curl_error($ch);
+                    curl_close($ch);
+
+                    if ($httpCode === 200 && $response !== false) {
+                        $gotValidResponse = true;
+                        $headersStr = substr($response, 0, $headerSize);
+                        $bodyStr    = substr($response, $headerSize);
+                        $json       = json_decode($bodyStr, true);
+
+                        if (!empty($json['pages']) && is_array($json['pages'])) {
+                            $tempPages = array_merge($tempPages, $json['pages']);
+                        }
+
+                        $nextUrl = '';
+                        if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
+                            $nextUrl = $match[1];
+                        }
+                    } else {
+                        $bodyStr   = is_string($response) ? substr($response, $headerSize) : '';
+                        $errorData = json_decode($bodyStr, true);
+                        $apiError  = "HTTP {$httpCode} on {$domain}";
+                        if ($curlError) {
+                            $apiError .= " | cURL: {$curlError}";
+                        }
+                        if (!empty($errorData['errors'])) {
+                            $apiError .= " | " . json_encode($errorData['errors']);
+                        }
+                        break;
+                    }
+                }
+
+                if ($gotValidResponse && !empty($tempPages)) {
+                    $shopifyPages     = $tempPages;
+                    $successfulDomain = $domain;
+                    break;
+                }
+            }
+
+            if ($db && !empty($shopifyPages) && $insertStmt) {
+                try {
+                    $db->beginTransaction();
+                    foreach ($shopifyPages as $p) {
+                        $pid    = $p['id'] ?? 0;
+                        $pname  = $p['title'] ?? 'Untitled Page';
+                        $handle = $p['handle'] ?? '';
+                        $author = $p['author'] ?? 'Uratex Team';
+
+                        $pageUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/pages/" . $handle;
+
+                        $bodyClean    = strip_tags($p['body_html'] ?? '');
+                        $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                        if (empty($fallbackMeta)) {
+                            $fallbackMeta = "Learn more about {$pname} at Uratex Philippines.";
+                        }
+
+                        $title    = $p['title'] ?? $pname;
+                        $metaDesc = $fallbackMeta;
+
+                        $pageType = 'General Page';
+                        if (!empty($p['template_suffix'])) {
+                            $pageType = ucwords(str_replace(['-', '_'], ' ', $p['template_suffix']));
+                        } elseif (stripos($pname, 'about') !== false) {
+                            $pageType = 'Brand Story';
+                        } elseif (stripos($pname, 'contact') !== false) {
+                            $pageType = 'Contact / Support';
+                        } elseif (stripos($pname, 'policy') !== false || stripos($pname, 'privacy') !== false || stripos($pname, 'terms') !== false) {
+                            $pageType = 'Legal Policy';
+                        } elseif (stripos($pname, 'faq') !== false) {
+                            $pageType = 'Help / FAQs';
+                        }
+
+                        $score = 85;
+                        if (function_exists('calculateSeoHealth')) {
+                            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                            $score       = $seoAnalysis['score'];
+                        }
+
+                        $status = mapPageStatus($p['published_at'] ?? null);
+
+                        $insertStmt->execute([
+                            ':store'     => $activeStore,
+                            ':pid'       => $pid,
+                            ':pname'     => $pname,
+                            ':ptype'     => $pageType,
+                            ':purl'      => $pageUrl,
+                            ':title'     => $title,
+                            ':meta_desc' => $metaDesc,
+                            ':handle'    => $handle,
+                            ':author'    => $author,
+                            ':status'    => $status,
+                            ':seo_score' => $score
+                        ]);
+                        $syncedCount++;
+                    }
+                    $db->commit();
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    $apiError = "Database error during REST page sync: " . $e->getMessage();
+                }
+            }
+        }
+
+        if ($syncedCount > 0) {
             $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> pages from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
             recordUserLog('sync_success', 'pages', "Synced {$syncedCount} pages from {$successfulDomain}", 'page', null, 'success');
         } else {

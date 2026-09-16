@@ -395,6 +395,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 
 // B. SYNC REDIRECTS FROM SHOPIFY (fetch ALL via Link pagination)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     try {
         $syncedCount      = 0;
         $shopifyRedirects = [];
@@ -496,6 +500,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
                     last_synced_at   = NOW()
             ");
 
+            $db->beginTransaction();
             $seenIds = [];
             foreach ($shopifyRedirects as $r) {
                 $rid = (int)($r['id'] ?? 0);
@@ -529,6 +534,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
                 $delStmt = $db->prepare("DELETE FROM shopify_redirects WHERE store_key = :store");
                 $delStmt->execute([':store' => $activeStore]);
             }
+            $db->commit();
 
             $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> URL redirect(s) from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
             recordUserLog('sync_success', 'redirects', "Synced {$syncedCount} redirects from {$successfulDomain}", 'redirect', null, 'success');
@@ -541,6 +547,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_redirects') {
             recordUserLog('sync_error', 'redirects', $message, 'redirect', null, 'error');
         }
     } catch (Throwable $e) {
+        if (isset($db) && $db && $db->inTransaction()) {
+            $db->rollBack();
+        }
         $message = "ERROR: Sync crashed – " . htmlspecialchars($e->getMessage()) .
                    " (file: " . basename($e->getFile()) . " line " . $e->getLine() . ")";
         recordUserLog('sync_crash', 'redirects', $message, 'redirect', null, 'error');

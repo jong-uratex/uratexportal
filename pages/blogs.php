@@ -598,11 +598,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     }
 }
 
-// B. SYNC BLOG ARTICLES FROM SHOPIFY
+// B. SYNC BLOG ARTICLES FROM SHOPIFY (High-performance GraphQL with REST fallback)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_blogs') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     try {
         $syncedCount      = 0;
-        $allArticles      = [];
         $apiError         = null;
         $successfulDomain = null;
 
@@ -616,109 +619,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_blogs') {
         }
 
         $domainsToTry = array_unique(array_filter([$primaryUrl, $fallbackUrl]));
-        $headers = [
-            "X-Shopify-Access-Token: {$token}",
-            "Content-Type: application/json"
-        ];
 
         recordUserLog('sync_started', 'blogs', "Starting blogs sync for store: {$activeStore}", 'article', null, 'info');
 
-        foreach ($domainsToTry as $domain) {
-            // 1. Fetch all blogs
-            $blogsUrl = "https://{$domain}/admin/api/{$version}/blogs.json?limit=250";
-            $ch = curl_init($blogsUrl);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER     => $headers,
-                CURLOPT_HEADER         => true,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_TIMEOUT        => 20,
-            ]);
-            $response   = curl_exec($ch);
-            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-            $curlError  = curl_error($ch);
-            curl_close($ch);
-
-            if ($httpCode !== 200 || $response === false) {
-                $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
-                $apiError = "HTTP {$httpCode} fetching blogs on {$domain}";
-                if ($curlError) $apiError .= " | cURL: {$curlError}";
-                if ($bodyStr) $apiError .= " | " . substr($bodyStr, 0, 300);
-                continue; // try next domain
-            }
-
-            $bodyStr = substr($response, $headerSize);
-            $json    = json_decode($bodyStr, true);
-            $blogs   = $json['blogs'] ?? [];
-
-            if (empty($blogs)) {
-                $apiError = "No blogs found on {$domain}";
-                continue;
-            }
-
-            $tempArticles = [];
-
-            // 2. For each blog, fetch all articles
-            foreach ($blogs as $blog) {
-                $blogId     = $blog['id'] ?? 0;
-                $blogTitle  = $blog['title'] ?? 'News & Guides';
-                $blogHandle = $blog['handle'] ?? 'news';
-
-                $nextUrl   = "https://{$domain}/admin/api/{$version}/blogs/{$blogId}/articles.json?limit=250";
-                $pageLimit = 20;
-                $pageCount = 0;
-
-                while (!empty($nextUrl) && $pageCount < $pageLimit) {
-                    $pageCount++;
-
-                    $ch = curl_init($nextUrl);
-                    curl_setopt_array($ch, [
-                        CURLOPT_RETURNTRANSFER => true,
-                        CURLOPT_HTTPHEADER     => $headers,
-                        CURLOPT_HEADER         => true,
-                        CURLOPT_SSL_VERIFYPEER => false,
-                        CURLOPT_TIMEOUT        => 25,
-                    ]);
-                    $response   = curl_exec($ch);
-                    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-                    $curlError  = curl_error($ch);
-                    curl_close($ch);
-
-                    if ($httpCode === 200 && $response !== false) {
-                        $headersStr = substr($response, 0, $headerSize);
-                        $bodyStr    = substr($response, $headerSize);
-                        $json       = json_decode($bodyStr, true);
-
-                        if (!empty($json['articles']) && is_array($json['articles'])) {
-                            foreach ($json['articles'] as $art) {
-                                $art['_blog_id']     = $blogId;
-                                $art['_blog_title']  = $blogTitle;
-                                $art['_blog_handle'] = $blogHandle;
-                                $tempArticles[] = $art;
-                            }
-                        }
-
-                        $nextUrl = '';
-                        if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
-                            $nextUrl = $match[1];
-                        }
-                    } else {
-                        $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
-                        $apiError = "HTTP {$httpCode} fetching articles for blog {$blogId}";
-                        if ($curlError) $apiError .= " | cURL: {$curlError}";
-                        break;
-                    }
-                }
-            }
-
-            $allArticles      = $tempArticles;
-            $successfulDomain = $domain;
-            break; // success
-        }
-
-        if ($db && !empty($allArticles)) {
+        $insertStmt = null;
+        if ($db) {
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_blogs (
                     store_key, shopify_article_id, shopify_blog_id, article_title,
@@ -747,69 +652,343 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_blogs') {
                     published_at      = VALUES(published_at),
                     last_synced_at    = NOW()
             ");
+        }
 
-            foreach ($allArticles as $a) {
-                $aid        = $a['id'] ?? 0;
-                $aname      = $a['title'] ?? 'Untitled Article';
-                $handle     = $a['handle'] ?? '';
-                $author     = $a['author'] ?? 'Uratex Editorial';
-                $blogId     = $a['_blog_id'] ?? 0;
-                $blogTitle  = $a['_blog_title'] ?? 'News & Guides';
-                $blogHandle = $a['_blog_handle'] ?? 'news';
+        $gqlSuccess = false;
 
-                $artUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain)
-                        . "/blogs/" . $blogHandle . "/" . $handle;
+        // 1. High-Performance GraphQL Sync
+        foreach ($domainsToTry as $domain) {
+            $gqlUrl  = "https://{$domain}/admin/api/{$version}/graphql.json";
+            $gqlQuery = <<<'GQL'
+query getBlogsAndArticles {
+  blogs(first: 50) {
+    nodes {
+      id
+      legacyResourceId
+      title
+      handle
+      articles(first: 250) {
+        nodes {
+          id
+          legacyResourceId
+          title
+          handle
+          bodyHtml
+          summary
+          tags
+          publishedAt
+          author {
+            name
+          }
+          seo {
+            title
+            description
+          }
+          titleTag: metafield(namespace: "global", key: "title_tag") {
+            value
+          }
+          descTag: metafield(namespace: "global", key: "description_tag") {
+            value
+          }
+        }
+      }
+    }
+  }
+}
+GQL;
 
-                $bodyClean    = strip_tags($a['body_html'] ?? $a['summary_html'] ?? '');
-                $fallbackMeta = mb_substr($bodyClean, 0, 160);
-                if (empty($fallbackMeta) && !empty($a['summary'])) {
-                    $fallbackMeta = mb_substr(strip_tags($a['summary']), 0, 160);
-                }
-                if (empty($fallbackMeta)) {
-                    $fallbackMeta = "Read more about {$aname} on the Uratex blog.";
-                }
+            $payload = json_encode(['query' => $gqlQuery]);
 
-                // The live <title>/meta description come from the "global" SEO
-                // metafields, not the plain article title/body — pull those so
-                // the portal doesn't show stale/wrong data vs. what's live.
-                $seoFields = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$aid);
-                $title     = $seoFields['title_tag'] ?: ($a['title'] ?? $aname);
-                $metaDesc  = $seoFields['description_tag'] ?: $fallbackMeta;
+            $ch = curl_init($gqlUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => $payload,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json",
+                    "Accept: application/json"
+                ],
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 30,
+            ]);
 
-                $tags     = $a['tags'] ?? '';
-                $category = !empty($tags) ? explode(',', $tags)[0] : 'Sleep Science';
-                $category = trim($category) ?: 'Sleep Science';
+            $response  = curl_exec($ch);
+            $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
 
-                if (function_exists('calculateSeoHealth')) {
-                    $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
-                    $score       = $seoAnalysis['score'];
+            if ($httpCode === 200 && $response) {
+                $json      = json_decode($response, true);
+                $blogNodes = $json['data']['blogs']['nodes'] ?? null;
+
+                if (!empty($blogNodes) && is_array($blogNodes) && $db && $insertStmt) {
+                    try {
+                        $db->beginTransaction();
+                        foreach ($blogNodes as $bNode) {
+                            $rawBid     = (string)($bNode['legacyResourceId'] ?? $bNode['id'] ?? '');
+                            $blogId     = (int)preg_replace('/[^0-9]/', '', $rawBid);
+                            $blogTitle  = $bNode['title'] ?? 'News & Guides';
+                            $blogHandle = $bNode['handle'] ?? 'news';
+
+                            $artNodes = $bNode['articles']['nodes'] ?? [];
+                            foreach ($artNodes as $aNode) {
+                                $rawAid = (string)($aNode['legacyResourceId'] ?? $aNode['id'] ?? '');
+                                $aid    = (int)preg_replace('/[^0-9]/', '', $rawAid);
+                                if (!$aid) {
+                                    continue;
+                                }
+
+                                $aname  = $aNode['title'] ?? 'Untitled Article';
+                                $handle = $aNode['handle'] ?? '';
+                                $author = !empty($aNode['author']['name']) ? $aNode['author']['name'] : 'Uratex Editorial';
+
+                                $artUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $domain)
+                                        . "/blogs/" . $blogHandle . "/" . $handle;
+
+                                $bodyClean    = strip_tags($aNode['bodyHtml'] ?? '');
+                                $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                                if (empty($fallbackMeta) && !empty($aNode['summary'])) {
+                                    $fallbackMeta = mb_substr(strip_tags($aNode['summary']), 0, 160);
+                                }
+                                if (empty($fallbackMeta)) {
+                                    $fallbackMeta = "Read more about {$aname} on the Uratex blog.";
+                                }
+
+                                $title    = !empty($aNode['titleTag']['value']) ? $aNode['titleTag']['value'] : (!empty($aNode['seo']['title']) ? $aNode['seo']['title'] : $aname);
+                                $metaDesc = !empty($aNode['descTag']['value']) ? $aNode['descTag']['value'] : (!empty($aNode['seo']['description']) ? $aNode['seo']['description'] : $fallbackMeta);
+
+                                $tags     = is_array($aNode['tags'] ?? null) ? implode(',', $aNode['tags']) : (string)($aNode['tags'] ?? '');
+                                $category = !empty($tags) ? explode(',', $tags)[0] : 'Sleep Science';
+                                $category = trim($category) ?: 'Sleep Science';
+
+                                $score = 85;
+                                if (function_exists('calculateSeoHealth')) {
+                                    $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                                    $score       = $seoAnalysis['score'];
+                                }
+
+                                $publishedAt = $aNode['publishedAt'] ?? null;
+                                $status      = mapArticleStatus($publishedAt);
+
+                                $insertStmt->execute([
+                                    ':store'        => $activeStore,
+                                    ':aid'          => $aid,
+                                    ':bid'          => $blogId,
+                                    ':aname'        => $aname,
+                                    ':bname'        => $blogTitle,
+                                    ':bhandle'      => $blogHandle,
+                                    ':aurl'         => $artUrl,
+                                    ':title'        => $title,
+                                    ':meta_desc'    => $metaDesc,
+                                    ':handle'       => $handle,
+                                    ':author'       => $author,
+                                    ':category'     => $category,
+                                    ':status'       => $status,
+                                    ':seo_score'    => $score,
+                                    ':published_at' => $publishedAt
+                                ]);
+                                $syncedCount++;
+                            }
+                        }
+                        $db->commit();
+                        $gqlSuccess       = true;
+                        $successfulDomain = $domain;
+                        break;
+                    } catch (Throwable $e) {
+                        if ($db->inTransaction()) {
+                            $db->rollBack();
+                        }
+                        $apiError = "Database error during GraphQL blog sync: " . $e->getMessage();
+                    }
                 } else {
-                    $score = 85;
+                    if (!empty($json['errors'])) {
+                        $apiError = "GraphQL Error: " . json_encode($json['errors']);
+                    }
+                }
+            } else {
+                $apiError = "HTTP {$httpCode} on GraphQL {$domain}";
+                if ($curlError) {
+                    $apiError .= " | cURL: {$curlError}";
+                }
+            }
+        }
+
+        // 2. Fallback to REST API if GraphQL returned no blogs
+        if (!$gqlSuccess) {
+            $allArticles = [];
+            $headers = [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ];
+
+            foreach ($domainsToTry as $domain) {
+                // 1. Fetch all blogs
+                $blogsUrl = "https://{$domain}/admin/api/{$version}/blogs.json?limit=250";
+                $ch = curl_init($blogsUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => $headers,
+                    CURLOPT_HEADER         => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 20,
+                ]);
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                $curlError  = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode !== 200 || $response === false) {
+                    $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
+                    $apiError = "HTTP {$httpCode} fetching blogs on {$domain}";
+                    if ($curlError) $apiError .= " | cURL: {$curlError}";
+                    if ($bodyStr) $apiError .= " | " . substr($bodyStr, 0, 300);
+                    continue;
                 }
 
-                $publishedAt = $a['published_at'] ?? null;
-                $status      = mapArticleStatus($publishedAt);
+                $bodyStr = substr($response, $headerSize);
+                $json    = json_decode($bodyStr, true);
+                $blogs   = $json['blogs'] ?? [];
 
-                $insertStmt->execute([
-                    ':store'        => $activeStore,
-                    ':aid'          => $aid,
-                    ':bid'          => $blogId,
-                    ':aname'        => $aname,
-                    ':bname'        => $blogTitle,
-                    ':bhandle'      => $blogHandle,
-                    ':aurl'         => $artUrl,
-                    ':title'        => $title,
-                    ':meta_desc'    => $metaDesc,
-                    ':handle'       => $handle,
-                    ':author'       => $author,
-                    ':category'     => $category,
-                    ':status'       => $status,
-                    ':seo_score'    => $score,
-                    ':published_at' => $publishedAt
-                ]);
-                $syncedCount++;
+                if (empty($blogs)) {
+                    $apiError = "No blogs found on {$domain}";
+                    continue;
+                }
+
+                $tempArticles = [];
+
+                // 2. For each blog, fetch all articles
+                foreach ($blogs as $blog) {
+                    $blogId     = $blog['id'] ?? 0;
+                    $blogTitle  = $blog['title'] ?? 'News & Guides';
+                    $blogHandle = $blog['handle'] ?? 'news';
+
+                    $nextUrl   = "https://{$domain}/admin/api/{$version}/blogs/{$blogId}/articles.json?limit=250";
+                    $pageLimit = 20;
+                    $pageCount = 0;
+
+                    while (!empty($nextUrl) && $pageCount < $pageLimit) {
+                        $pageCount++;
+
+                        $ch = curl_init($nextUrl);
+                        curl_setopt_array($ch, [
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_HTTPHEADER     => $headers,
+                            CURLOPT_HEADER         => true,
+                            CURLOPT_SSL_VERIFYPEER => false,
+                            CURLOPT_TIMEOUT        => 25,
+                        ]);
+                        $response   = curl_exec($ch);
+                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                        $curlError  = curl_error($ch);
+                        curl_close($ch);
+
+                        if ($httpCode === 200 && $response !== false) {
+                            $headersStr = substr($response, 0, $headerSize);
+                            $bodyStr    = substr($response, $headerSize);
+                            $json       = json_decode($bodyStr, true);
+
+                            if (!empty($json['articles']) && is_array($json['articles'])) {
+                                foreach ($json['articles'] as $art) {
+                                    $art['_blog_id']     = $blogId;
+                                    $art['_blog_title']  = $blogTitle;
+                                    $art['_blog_handle'] = $blogHandle;
+                                    $tempArticles[] = $art;
+                                }
+                            }
+
+                            $nextUrl = '';
+                            if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
+                                $nextUrl = $match[1];
+                            }
+                        } else {
+                            $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
+                            $apiError = "HTTP {$httpCode} fetching articles for blog {$blogId}";
+                            if ($curlError) $apiError .= " | cURL: {$curlError}";
+                            break;
+                        }
+                    }
+                }
+
+                if (!empty($tempArticles)) {
+                    $allArticles      = $tempArticles;
+                    $successfulDomain = $domain;
+                    break;
+                }
             }
 
+            if ($db && !empty($allArticles) && $insertStmt) {
+                try {
+                    $db->beginTransaction();
+                    foreach ($allArticles as $a) {
+                        $aid        = $a['id'] ?? 0;
+                        $aname      = $a['title'] ?? 'Untitled Article';
+                        $handle     = $a['handle'] ?? '';
+                        $author     = $a['author'] ?? 'Uratex Editorial';
+                        $blogId     = $a['_blog_id'] ?? 0;
+                        $blogTitle  = $a['_blog_title'] ?? 'News & Guides';
+                        $blogHandle = $a['_blog_handle'] ?? 'news';
+
+                        $artUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain)
+                                . "/blogs/" . $blogHandle . "/" . $handle;
+
+                        $bodyClean    = strip_tags($a['body_html'] ?? $a['summary_html'] ?? '');
+                        $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                        if (empty($fallbackMeta) && !empty($a['summary'])) {
+                            $fallbackMeta = mb_substr(strip_tags($a['summary']), 0, 160);
+                        }
+                        if (empty($fallbackMeta)) {
+                            $fallbackMeta = "Read more about {$aname} on the Uratex blog.";
+                        }
+
+                        $title    = $a['title'] ?? $aname;
+                        $metaDesc = $fallbackMeta;
+
+                        $tags     = $a['tags'] ?? '';
+                        $category = !empty($tags) ? explode(',', $tags)[0] : 'Sleep Science';
+                        $category = trim($category) ?: 'Sleep Science';
+
+                        $score = 85;
+                        if (function_exists('calculateSeoHealth')) {
+                            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                            $score       = $seoAnalysis['score'];
+                        }
+
+                        $publishedAt = $a['published_at'] ?? null;
+                        $status      = mapArticleStatus($publishedAt);
+
+                        $insertStmt->execute([
+                            ':store'        => $activeStore,
+                            ':aid'          => $aid,
+                            ':bid'          => $blogId,
+                            ':aname'        => $aname,
+                            ':bname'        => $blogTitle,
+                            ':bhandle'      => $blogHandle,
+                            ':aurl'         => $artUrl,
+                            ':title'        => $title,
+                            ':meta_desc'    => $metaDesc,
+                            ':handle'       => $handle,
+                            ':author'       => $author,
+                            ':category'     => $category,
+                            ':status'       => $status,
+                            ':seo_score'    => $score,
+                            ':published_at' => $publishedAt
+                        ]);
+                        $syncedCount++;
+                    }
+                    $db->commit();
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    $apiError = "Database error during REST blog sync: " . $e->getMessage();
+                }
+            }
+        }
+
+        if ($syncedCount > 0) {
             $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> articles from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
             recordUserLog('sync_success', 'blogs', "Synced {$syncedCount} articles from {$successfulDomain}", 'article', null, 'success');
         } else {

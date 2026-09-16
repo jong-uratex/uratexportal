@@ -541,11 +541,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     }
 }
 
-// B. SYNC COLLECTIONS FROM SHOPIFY
+// B. SYNC COLLECTIONS FROM SHOPIFY (High-performance GraphQL with REST fallback)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     try {
         $syncedCount      = 0;
-        $allCollections   = [];
         $apiError         = null;
         $successfulDomain = null;
 
@@ -559,88 +562,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
         }
 
         $domainsToTry = array_unique(array_filter([$primaryUrl, $fallbackUrl]));
-        $endpoints    = ['custom_collections', 'smart_collections'];
 
         recordUserLog('sync_started', 'collections', "Starting collections sync for store: {$activeStore}", 'collection', null, 'info');
 
-        foreach ($domainsToTry as $domain) {
-            $domainSuccess   = true;
-            $tempCollections = [];
-
-            foreach ($endpoints as $endpoint) {
-                $nextUrl   = "https://{$domain}/admin/api/{$version}/{$endpoint}.json?limit=250";
-                $headers   = [
-                    "X-Shopify-Access-Token: {$token}",
-                    "Content-Type: application/json"
-                ];
-                $pageLimit = 20;
-                $pageCount = 0;
-
-                while (!empty($nextUrl) && $pageCount < $pageLimit) {
-                    $pageCount++;
-
-                    $ch = curl_init($nextUrl);
-                    if ($ch === false) {
-                        throw new Exception('Failed to initialize cURL');
-                    }
-
-                    curl_setopt_array($ch, [
-                        CURLOPT_RETURNTRANSFER => true,
-                        CURLOPT_HTTPHEADER     => $headers,
-                        CURLOPT_HEADER         => true,
-                        CURLOPT_SSL_VERIFYPEER => false,
-                        CURLOPT_TIMEOUT        => 25,
-                    ]);
-
-                    $response   = curl_exec($ch);
-                    $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-                    $curlError  = curl_error($ch);
-                    curl_close($ch);
-
-                    if ($httpCode === 200 && $response !== false) {
-                        $headersStr = substr($response, 0, $headerSize);
-                        $bodyStr    = substr($response, $headerSize);
-                        $json       = json_decode($bodyStr, true);
-
-                        $key = ($endpoint === 'custom_collections') ? 'custom_collections' : 'smart_collections';
-                        if (!empty($json[$key]) && is_array($json[$key])) {
-                            foreach ($json[$key] as $col) {
-                                $col['_type'] = ($endpoint === 'custom_collections') ? 'custom' : 'smart';
-                                $tempCollections[] = $col;
-                            }
-                        }
-
-                        $nextUrl = '';
-                        if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
-                            $nextUrl = $match[1];
-                        }
-                    } else {
-                        $bodyStr   = is_string($response) ? substr($response, $headerSize) : '';
-                        $errorData = json_decode($bodyStr, true);
-                        $apiError  = "HTTP {$httpCode} on {$domain}/{$endpoint}";
-                        if ($curlError) {
-                            $apiError .= " | cURL: {$curlError}";
-                        }
-                        if (!empty($errorData['errors'])) {
-                            $apiError .= " | " . json_encode($errorData['errors']);
-                        } elseif ($bodyStr) {
-                            $apiError .= " | " . substr($bodyStr, 0, 300);
-                        }
-                        $domainSuccess = false;
-                        break 2;
-                    }
-                }
-            }
-
-            if ($domainSuccess) {
-                $allCollections   = $tempCollections;
-                $successfulDomain = $domain;
-                break;
-            }
-        }
-
-        if ($db && !empty($allCollections)) {
+        $insertStmt = null;
+        if ($db) {
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_collections (
                     store_key, shopify_collection_id, collection_type, collection_title,
@@ -663,55 +589,302 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_collections') {
                     status            = VALUES(status),
                     last_synced_at    = NOW()
             ");
+        }
 
-            foreach ($allCollections as $c) {
-                $cid    = $c['id'] ?? 0;
-                $cname  = $c['title'] ?? 'Untitled Collection';
-                $handle = $c['handle'] ?? '';
-                $ctype  = $c['_type'] ?? 'custom';
+        $gqlSuccess = false;
 
-                $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/collections/" . $handle;
+        // 1. High-Performance GraphQL Sync (single batch with metadata)
+        foreach ($domainsToTry as $domain) {
+            $gqlUrl          = "https://{$domain}/admin/api/{$version}/graphql.json";
+            $cursor          = null;
+            $hasNextPage     = true;
+            $batchCount      = 0;
+            $batchLimit      = 40;
+            $tempCollections = [];
 
-                $bodyClean    = strip_tags($c['body_html'] ?? '');
-                $fallbackMeta = mb_substr($bodyClean, 0, 160);
-                if (empty($fallbackMeta)) {
-                    $fallbackMeta = "Explore our {$cname} collection at Uratex. Quality products designed for comfort and lasting support.";
-                }
+            $gqlQuery = <<<'GQL'
+query getCollections($cursor: String) {
+  collections(first: 250, after: $cursor) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      legacyResourceId
+      title
+      handle
+      descriptionHtml
+      productsCount {
+        count
+      }
+      ruleSet {
+        appliedDisjunctively
+      }
+      seo {
+        title
+        description
+      }
+      titleTag: metafield(namespace: "global", key: "title_tag") {
+        value
+      }
+      descTag: metafield(namespace: "global", key: "description_tag") {
+        value
+      }
+      updatedAt
+    }
+  }
+}
+GQL;
 
-                // The live <title>/meta description come from the "global" SEO
-                // metafields, not the plain collection title/body — pull those
-                // so the portal doesn't show stale/wrong data vs. what's live.
-                $seoFields = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$cid);
-                $title     = $seoFields['title_tag'] ?: ($c['title'] ?? $cname);
-                $metaDesc  = $seoFields['description_tag'] ?: $fallbackMeta;
+            while ($hasNextPage && $batchCount < $batchLimit) {
+                $batchCount++;
 
-                $itemCount = (int)($c['products_count'] ?? 0);
-
-                if (function_exists('calculateSeoHealth')) {
-                    $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
-                    $score       = $seoAnalysis['score'];
-                } else {
-                    $score = 85;
-                }
-
-                $status = mapCollectionStatus($c['published_at'] ?? null);
-
-                $insertStmt->execute([
-                    ':store'      => $activeStore,
-                    ':cid'        => $cid,
-                    ':ctype'      => $ctype,
-                    ':cname'      => $cname,
-                    ':curl'       => $colUrl,
-                    ':title'      => $title,
-                    ':meta_desc'  => $metaDesc,
-                    ':handle'     => $handle,
-                    ':item_count' => $itemCount,
-                    ':status'     => $status,
-                    ':seo_score'  => $score
+                $payload = json_encode([
+                    'query'     => $gqlQuery,
+                    'variables' => ['cursor' => $cursor]
                 ]);
-                $syncedCount++;
+
+                $ch = curl_init($gqlUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_POST           => true,
+                    CURLOPT_POSTFIELDS     => $payload,
+                    CURLOPT_HTTPHEADER     => [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json",
+                        "Accept: application/json"
+                    ],
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 30,
+                ]);
+
+                $response  = curl_exec($ch);
+                $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlError = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode === 200 && $response) {
+                    $json  = json_decode($response, true);
+                    $cData = $json['data']['collections'] ?? null;
+                    if (!empty($cData['nodes']) && is_array($cData['nodes'])) {
+                        $tempCollections = array_merge($tempCollections, $cData['nodes']);
+                        $hasNextPage     = !empty($cData['pageInfo']['hasNextPage']);
+                        $cursor          = $cData['pageInfo']['endCursor'] ?? null;
+                    } else {
+                        if (!empty($json['errors'])) {
+                            $apiError = "GraphQL Error: " . json_encode($json['errors']);
+                        }
+                        break;
+                    }
+                } else {
+                    $apiError = "HTTP {$httpCode} on GraphQL {$domain}";
+                    if ($curlError) {
+                        $apiError .= " | cURL: {$curlError}";
+                    }
+                    break;
+                }
             }
 
+            if (!empty($tempCollections) && $db && $insertStmt) {
+                try {
+                    $db->beginTransaction();
+                    foreach ($tempCollections as $node) {
+                        $rawId = (string)($node['legacyResourceId'] ?? $node['id'] ?? '');
+                        $cid   = (int)preg_replace('/[^0-9]/', '', $rawId);
+                        if (!$cid) {
+                            continue;
+                        }
+
+                        $cname  = $node['title'] ?? 'Untitled Collection';
+                        $handle = $node['handle'] ?? '';
+                        $ctype  = !empty($node['ruleSet']) ? 'smart' : 'custom';
+
+                        $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $domain) . "/collections/" . $handle;
+
+                        $bodyClean    = strip_tags($node['descriptionHtml'] ?? '');
+                        $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                        if (empty($fallbackMeta)) {
+                            $fallbackMeta = "Explore our {$cname} collection at Uratex. Quality products designed for comfort and lasting support.";
+                        }
+
+                        $title    = !empty($node['titleTag']['value']) ? $node['titleTag']['value'] : (!empty($node['seo']['title']) ? $node['seo']['title'] : $cname);
+                        $metaDesc = !empty($node['descTag']['value']) ? $node['descTag']['value'] : (!empty($node['seo']['description']) ? $node['seo']['description'] : $fallbackMeta);
+
+                        $itemCount = isset($node['productsCount']['count']) ? (int)$node['productsCount']['count'] : 0;
+
+                        $score = 85;
+                        if (function_exists('calculateSeoHealth')) {
+                            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                            $score       = $seoAnalysis['score'];
+                        }
+
+                        $status = 'published';
+
+                        $insertStmt->execute([
+                            ':store'      => $activeStore,
+                            ':cid'        => $cid,
+                            ':ctype'      => $ctype,
+                            ':cname'      => $cname,
+                            ':curl'       => $colUrl,
+                            ':title'      => $title,
+                            ':meta_desc'  => $metaDesc,
+                            ':handle'     => $handle,
+                            ':item_count' => $itemCount,
+                            ':status'     => $status,
+                            ':seo_score'  => $score
+                        ]);
+                        $syncedCount++;
+                    }
+                    $db->commit();
+                    $gqlSuccess       = true;
+                    $successfulDomain = $domain;
+                    break;
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    $apiError = "Database error during GraphQL collection sync: " . $e->getMessage();
+                }
+            }
+        }
+
+        // 2. Fallback to REST API if GraphQL returned no collections
+        if (!$gqlSuccess) {
+            $allCollections = [];
+            $endpoints      = ['custom_collections', 'smart_collections'];
+
+            foreach ($domainsToTry as $domain) {
+                $domainSuccess   = true;
+                $tempCollections = [];
+
+                foreach ($endpoints as $endpoint) {
+                    $nextUrl   = "https://{$domain}/admin/api/{$version}/{$endpoint}.json?limit=250";
+                    $headers   = [
+                        "X-Shopify-Access-Token: {$token}",
+                        "Content-Type: application/json"
+                    ];
+                    $pageLimit = 20;
+                    $pageCount = 0;
+
+                    while (!empty($nextUrl) && $pageCount < $pageLimit) {
+                        $pageCount++;
+
+                        $ch = curl_init($nextUrl);
+                        if ($ch === false) {
+                            throw new Exception('Failed to initialize cURL');
+                        }
+
+                        curl_setopt_array($ch, [
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_HTTPHEADER     => $headers,
+                            CURLOPT_HEADER         => true,
+                            CURLOPT_SSL_VERIFYPEER => false,
+                            CURLOPT_TIMEOUT        => 25,
+                        ]);
+
+                        $response   = curl_exec($ch);
+                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                        $curlError  = curl_error($ch);
+                        curl_close($ch);
+
+                        if ($httpCode === 200 && $response !== false) {
+                            $headersStr = substr($response, 0, $headerSize);
+                            $bodyStr    = substr($response, $headerSize);
+                            $json       = json_decode($bodyStr, true);
+
+                            $key = ($endpoint === 'custom_collections') ? 'custom_collections' : 'smart_collections';
+                            if (!empty($json[$key]) && is_array($json[$key])) {
+                                foreach ($json[$key] as $col) {
+                                    $col['_type'] = ($endpoint === 'custom_collections') ? 'custom' : 'smart';
+                                    $tempCollections[] = $col;
+                                }
+                            }
+
+                            $nextUrl = '';
+                            if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
+                                $nextUrl = $match[1];
+                            }
+                        } else {
+                            $bodyStr   = is_string($response) ? substr($response, $headerSize) : '';
+                            $errorData = json_decode($bodyStr, true);
+                            $apiError  = "HTTP {$httpCode} on {$domain}/{$endpoint}";
+                            if ($curlError) {
+                                $apiError .= " | cURL: {$curlError}";
+                            }
+                            if (!empty($errorData['errors'])) {
+                                $apiError .= " | " . json_encode($errorData['errors']);
+                            }
+                            $domainSuccess = false;
+                            break 2;
+                        }
+                    }
+                }
+
+                if ($domainSuccess && !empty($tempCollections)) {
+                    $allCollections   = $tempCollections;
+                    $successfulDomain = $domain;
+                    break;
+                }
+            }
+
+            if ($db && !empty($allCollections) && $insertStmt) {
+                try {
+                    $db->beginTransaction();
+                    foreach ($allCollections as $c) {
+                        $cid    = $c['id'] ?? 0;
+                        $cname  = $c['title'] ?? 'Untitled Collection';
+                        $handle = $c['handle'] ?? '';
+                        $ctype  = $c['_type'] ?? 'custom';
+
+                        $colUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/collections/" . $handle;
+
+                        $bodyClean    = strip_tags($c['body_html'] ?? '');
+                        $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                        if (empty($fallbackMeta)) {
+                            $fallbackMeta = "Explore our {$cname} collection at Uratex. Quality products designed for comfort and lasting support.";
+                        }
+
+                        $title    = $c['title'] ?? $cname;
+                        $metaDesc = $fallbackMeta;
+
+                        $itemCount = (int)($c['products_count'] ?? 0);
+
+                        $score = 85;
+                        if (function_exists('calculateSeoHealth')) {
+                            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                            $score       = $seoAnalysis['score'];
+                        }
+
+                        $status = mapCollectionStatus($c['published_at'] ?? null);
+
+                        $insertStmt->execute([
+                            ':store'      => $activeStore,
+                            ':cid'        => $cid,
+                            ':ctype'      => $ctype,
+                            ':cname'      => $cname,
+                            ':curl'       => $colUrl,
+                            ':title'      => $title,
+                            ':meta_desc'  => $metaDesc,
+                            ':handle'     => $handle,
+                            ':item_count' => $itemCount,
+                            ':status'     => $status,
+                            ':seo_score'  => $score
+                        ]);
+                        $syncedCount++;
+                    }
+                    $db->commit();
+                } catch (Throwable $e) {
+                    if ($db->inTransaction()) {
+                        $db->rollBack();
+                    }
+                    $apiError = "Database error during REST collection sync: " . $e->getMessage();
+                }
+            }
+        }
+
+        if ($syncedCount > 0) {
             $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> collections from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
             recordUserLog('sync_success', 'collections', "Synced {$syncedCount} collections from {$successfulDomain}", 'collection', null, 'success');
         } else {

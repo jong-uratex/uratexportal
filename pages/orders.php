@@ -168,6 +168,10 @@ if ($db) {
 // SYNC ORDERS DATA FROM SHOPIFY API
 // -----------------------------------------------------------------------------
 if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     $targetUrl = getShopifyAdminDomain($shopCfg, $activeStore);
     $version   = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
     $token     = $shopCfg['access_token'] ?? '';
@@ -186,7 +190,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             $pageNum   = 1;
             $syncCount = 0;
 
-            $insertStmt = $db->prepare("
+            $insertStmt = $db ? $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
                     accepts_email_marketing, accepts_sms_marketing,
@@ -221,7 +225,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     shipping_city = VALUES(shipping_city),
                     shipping_zip = VALUES(shipping_zip),
                     last_synced_at = NOW()
-            ");
+            ") : null;
 
             while ($hasMore && $pageNum <= 50) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
@@ -280,7 +284,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
 
                 $data = json_decode($body, true);
 
-                if (!empty($data['orders'])) {
+                if (!empty($data['orders']) && $insertStmt) {
+                    if ($db && !$db->inTransaction()) {
+                        $db->beginTransaction();
+                    }
                     foreach ($data['orders'] as $order) {
                         $syncCount++;
 
@@ -393,6 +400,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ':shipping_city'            => $shippingCity,
                             ':shipping_zip'             => $shippingZip
                         ]);
+                    }
+                    if ($db && $db->inTransaction()) {
+                        $db->commit();
                     }
                 }
 
