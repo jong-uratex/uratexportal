@@ -485,10 +485,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     recordUserLog('Test Connection', 'Products API', "Tested Shopify API connection (products) for retail + business stores — " . ($allSuccess ? 'all checks passed.' : 'some checks failed.'), 'product', null, $allSuccess ? 'success' : 'error');
 }
 
-// B. SYNC PRODUCTS FROM SHOPIFY REST API
+// B. SYNC PRODUCTS FROM SHOPIFY (High-performance GraphQL with REST fallback)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    @ini_set('memory_limit', '512M');
+
     $syncedCount      = 0;
-    $shopifyProducts  = [];
     $apiError         = null;
     $successfulDomain = null;
 
@@ -502,75 +505,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
 
     recordUserLog('sync_started', 'products', "Starting sync for store: {$activeStore}", 'product', null, 'info');
 
-    foreach ($domainsToTry as $domain) {
-        $nextUrl          = "https://{$domain}/admin/api/{$version}/products.json?limit=250";
-        $headers          = [
-            "X-Shopify-Access-Token: {$token}",
-            "Content-Type: application/json"
-        ];
-        $pageLimit        = 40; // safety ceiling (~10 000 products)
-        $currentPageCount = 0;
-        $tempProducts     = [];
-        $gotValidResponse = false;
-
-        while (!empty($nextUrl) && $currentPageCount < $pageLimit) {
-            $currentPageCount++;
-
-            $ch = curl_init($nextUrl);
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER     => $headers,
-                CURLOPT_HEADER         => true,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_TIMEOUT        => 20,
-            ]);
-
-            $response   = curl_exec($ch);
-            $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-            $curlError  = curl_error($ch);
-            curl_close($ch);
-
-            if ($httpCode === 200 && $response) {
-                $gotValidResponse = true;
-                $headersStr = substr($response, 0, $headerSize);
-                $bodyStr    = substr($response, $headerSize);
-                $json       = json_decode($bodyStr, true);
-
-                if (!empty($json['products']) && is_array($json['products'])) {
-                    $tempProducts = array_merge($tempProducts, $json['products']);
-                }
-
-                // Shopify cursor pagination via Link header
-                $nextUrl = '';
-                if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
-                    $nextUrl = $match[1];
-                }
-            } else {
-                $bodyStr   = substr($response, $headerSize);
-                $errorData = json_decode($bodyStr, true);
-                $apiError  = "HTTP {$httpCode} on {$domain}";
-                if ($curlError) {
-                    $apiError .= " | cURL: {$curlError}";
-                }
-                if (!empty($errorData['errors'])) {
-                    $apiError .= " | " . json_encode($errorData['errors']);
-                } elseif ($bodyStr) {
-                    $apiError .= " | " . substr($bodyStr, 0, 300);
-                }
-                break; // try next domain
-            }
-        }
-
-        if ($gotValidResponse) {
-            $shopifyProducts  = $tempProducts;
-            $successfulDomain = $domain;
-            break; // success – stop trying other domains
-        }
-    }
-
-    // Persist products if we got any
-    if ($db && !empty($shopifyProducts)) {
+    $insertStmt = null;
+    if ($db) {
         $insertStmt = $db->prepare("
             INSERT INTO shopify_products (
                 store_key, shopify_product_id, product_name, image_url, image_name, product_url,
@@ -593,69 +529,321 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_products') {
                 status            = VALUES(status),
                 last_synced_at    = NOW()
         ");
+    }
 
-        foreach ($shopifyProducts as $p) {
-            $pid    = $p['id'];
-            $pname  = $p['title'];
-            $handle = $p['handle'];
+    $gqlSuccess = false;
 
-            $rawImg = !empty($p['image']['src'])
-                ? $p['image']['src']
-                : (!empty($p['images'][0]['src']) ? $p['images'][0]['src'] : '');
+    // 1. High-Performance GraphQL Sync: fetches up to 250 products + SEO metafields per single request
+    foreach ($domainsToTry as $domain) {
+        $gqlUrl       = "https://{$domain}/admin/api/{$version}/graphql.json";
+        $cursor       = null;
+        $hasNextPage  = true;
+        $batchCount   = 0;
+        $batchLimit   = 40; // safety ceiling (~10,000 products)
+        $tempProducts = [];
 
-            if (empty($rawImg)) {
-                $imgUrl  = 'https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?w=500&auto=format&fit=crop&q=80';
-                $imgName = $handle . '.jpg';
-            } else {
-                $imgUrl  = $rawImg;
-                $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: ($handle . '.jpg'));
-            }
+        $gqlQuery = <<<'GQL'
+query getProducts($cursor: String) {
+  products(first: 250, after: $cursor) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      legacyResourceId
+      title
+      handle
+      status
+      productType
+      descriptionHtml
+      featuredImage {
+        url
+      }
+      variants(first: 1) {
+        nodes {
+          price
+        }
+      }
+      seo {
+        title
+        description
+      }
+      titleTag: metafield(namespace: "global", key: "title_tag") {
+        value
+      }
+      descTag: metafield(namespace: "global", key: "description_tag") {
+        value
+      }
+    }
+  }
+}
+GQL;
 
-            // Public storefront URL uses the custom domain when available
-            $prodUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/products/" . $handle;
+        while ($hasNextPage && $batchCount < $batchLimit) {
+            $batchCount++;
 
-            $bodyClean    = strip_tags($p['body_html'] ?? '');
-            $fallbackMeta = mb_substr($bodyClean, 0, 160);
-            if (empty($fallbackMeta)) {
-                $fallbackMeta = "Shop authentic {$pname} with high-density sanitized foam, orthopedic support, and official Uratex Philippines warranty.";
-            }
-
-            // The live <title>/meta description come from the "global" SEO
-            // metafields, not the plain product title/body — pull those so
-            // the portal doesn't show stale/wrong data vs. what's live.
-            $seoFields = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$pid);
-            $title     = $seoFields['title_tag'] ?: $p['title'];
-            $metaDesc  = $seoFields['description_tag'] ?: $fallbackMeta;
-
-            $category = $p['product_type'] ?: 'Product';
-            $price    = !empty($p['variants'][0]['price'])
-                ? '₱' . number_format((float)$p['variants'][0]['price'], 2)
-                : '₱0.00';
-
-            $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
-            $score       = $seoAnalysis['score'];
-
-            // ★ FIX: Use the REAL status from Shopify instead of inventing it from SEO score
-            $status = mapShopifyStatus($p['status'] ?? 'active');
-
-            $insertStmt->execute([
-                ':store'     => $activeStore,
-                ':pid'       => $pid,
-                ':pname'     => $pname,
-                ':img_url'   => $imgUrl,
-                ':img_name'  => $imgName,
-                ':purl'      => $prodUrl,
-                ':title'     => $title,
-                ':meta_desc' => $metaDesc,
-                ':handle'    => $handle,
-                ':status'    => $status,
-                ':seo_score' => $score,
-                ':category'  => $category,
-                ':price'     => $price
+            $payload = json_encode([
+                'query'     => $gqlQuery,
+                'variables' => ['cursor' => $cursor]
             ]);
-            $syncedCount++;
+
+            $ch = curl_init($gqlUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_POST           => true,
+                CURLOPT_POSTFIELDS     => $payload,
+                CURLOPT_HTTPHEADER     => [
+                    "X-Shopify-Access-Token: {$token}",
+                    "Content-Type: application/json",
+                    "Accept: application/json"
+                ],
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_TIMEOUT        => 30,
+            ]);
+
+            $response  = curl_exec($ch);
+            $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
+
+            if ($httpCode === 200 && $response) {
+                $json  = json_decode($response, true);
+                $pData = $json['data']['products'] ?? null;
+                if (!empty($pData['nodes']) && is_array($pData['nodes'])) {
+                    $tempProducts = array_merge($tempProducts, $pData['nodes']);
+                    $hasNextPage  = !empty($pData['pageInfo']['hasNextPage']);
+                    $cursor       = $pData['pageInfo']['endCursor'] ?? null;
+                } else {
+                    if (!empty($json['errors'])) {
+                        $apiError = "GraphQL Error: " . json_encode($json['errors']);
+                    }
+                    break;
+                }
+            } else {
+                $apiError = "HTTP {$httpCode} on GraphQL {$domain}";
+                if ($curlError) {
+                    $apiError .= " | cURL: {$curlError}";
+                }
+                break;
+            }
         }
 
+        if (!empty($tempProducts) && $db && $insertStmt) {
+            try {
+                $db->beginTransaction();
+                foreach ($tempProducts as $node) {
+                    $rawId = (string)($node['legacyResourceId'] ?? $node['id'] ?? '');
+                    $pid   = (int)preg_replace('/[^0-9]/', '', $rawId);
+                    if (!$pid) {
+                        continue;
+                    }
+
+                    $pname  = $node['title'] ?? 'Untitled Product';
+                    $handle = $node['handle'] ?? '';
+
+                    $rawImg = $node['featuredImage']['url'] ?? '';
+                    if (empty($rawImg)) {
+                        $imgUrl  = 'https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?w=500&auto=format&fit=crop&q=80';
+                        $imgName = $handle . '.jpg';
+                    } else {
+                        $imgUrl  = $rawImg;
+                        $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: ($handle . '.jpg'));
+                    }
+
+                    $prodUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $domain) . "/products/" . $handle;
+
+                    $bodyClean    = strip_tags($node['descriptionHtml'] ?? '');
+                    $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                    if (empty($fallbackMeta)) {
+                        $fallbackMeta = "Shop authentic {$pname} with high-density sanitized foam, orthopedic support, and official Uratex Philippines warranty.";
+                    }
+
+                    $title    = !empty($node['titleTag']['value']) ? $node['titleTag']['value'] : (!empty($node['seo']['title']) ? $node['seo']['title'] : $pname);
+                    $metaDesc = !empty($node['descTag']['value']) ? $node['descTag']['value'] : (!empty($node['seo']['description']) ? $node['seo']['description'] : $fallbackMeta);
+
+                    $category = !empty($node['productType']) ? $node['productType'] : 'Product';
+                    $price    = !empty($node['variants']['nodes'][0]['price'])
+                        ? '₱' . number_format((float)$node['variants']['nodes'][0]['price'], 2)
+                        : '₱0.00';
+
+                    $score = 85;
+                    if (function_exists('calculateSeoHealth')) {
+                        $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                        $score       = $seoAnalysis['score'];
+                    }
+
+                    $status = mapShopifyStatus($node['status'] ?? 'active');
+
+                    $insertStmt->execute([
+                        ':store'     => $activeStore,
+                        ':pid'       => $pid,
+                        ':pname'     => $pname,
+                        ':img_url'   => $imgUrl,
+                        ':img_name'  => $imgName,
+                        ':purl'      => $prodUrl,
+                        ':title'     => $title,
+                        ':meta_desc' => $metaDesc,
+                        ':handle'    => $handle,
+                        ':status'    => $status,
+                        ':seo_score' => $score,
+                        ':category'  => $category,
+                        ':price'     => $price
+                    ]);
+                    $syncedCount++;
+                }
+                $db->commit();
+                $gqlSuccess       = true;
+                $successfulDomain = $domain;
+                break;
+            } catch (Throwable $e) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                $apiError = "Database error during GraphQL sync: " . $e->getMessage();
+            }
+        }
+    }
+
+    // 2. Fallback to REST API if GraphQL returned no products
+    if (!$gqlSuccess) {
+        $shopifyProducts = [];
+        foreach ($domainsToTry as $domain) {
+            $nextUrl          = "https://{$domain}/admin/api/{$version}/products.json?limit=250";
+            $headers          = [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ];
+            $pageLimit        = 40;
+            $currentPageCount = 0;
+            $tempProducts     = [];
+            $gotValidResponse = false;
+
+            while (!empty($nextUrl) && $currentPageCount < $pageLimit) {
+                $currentPageCount++;
+
+                $ch = curl_init($nextUrl);
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER     => $headers,
+                    CURLOPT_HEADER         => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_TIMEOUT        => 20,
+                ]);
+
+                $response   = curl_exec($ch);
+                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+                $curlError  = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode === 200 && $response) {
+                    $gotValidResponse = true;
+                    $headersStr = substr($response, 0, $headerSize);
+                    $bodyStr    = substr($response, $headerSize);
+                    $json       = json_decode($bodyStr, true);
+
+                    if (!empty($json['products']) && is_array($json['products'])) {
+                        $tempProducts = array_merge($tempProducts, $json['products']);
+                    }
+
+                    $nextUrl = '';
+                    if (preg_match('/<([^>]+)>;\s*rel=["\']next["\']/i', $headersStr, $match)) {
+                        $nextUrl = $match[1];
+                    }
+                } else {
+                    $bodyStr   = substr($response, $headerSize);
+                    $errorData = json_decode($bodyStr, true);
+                    $apiError  = "HTTP {$httpCode} on {$domain}";
+                    if ($curlError) {
+                        $apiError .= " | cURL: {$curlError}";
+                    }
+                    if (!empty($errorData['errors'])) {
+                        $apiError .= " | " . json_encode($errorData['errors']);
+                    }
+                    break;
+                }
+            }
+
+            if ($gotValidResponse && !empty($tempProducts)) {
+                $shopifyProducts  = $tempProducts;
+                $successfulDomain = $domain;
+                break;
+            }
+        }
+
+        if ($db && !empty($shopifyProducts) && $insertStmt) {
+            try {
+                $db->beginTransaction();
+                foreach ($shopifyProducts as $p) {
+                    $pid    = $p['id'];
+                    $pname  = $p['title'] ?? 'Untitled Product';
+                    $handle = $p['handle'] ?? '';
+
+                    $rawImg = !empty($p['image']['src'])
+                        ? $p['image']['src']
+                        : (!empty($p['images'][0]['src']) ? $p['images'][0]['src'] : '');
+
+                    if (empty($rawImg)) {
+                        $imgUrl  = 'https://images.unsplash.com/photo-1505693416388-ac5ce068fe85?w=500&auto=format&fit=crop&q=80';
+                        $imgName = $handle . '.jpg';
+                    } else {
+                        $imgUrl  = $rawImg;
+                        $imgName = basename(parse_url($rawImg, PHP_URL_PATH) ?: ($handle . '.jpg'));
+                    }
+
+                    $prodUrl = "https://" . (!empty($shopCfg['domain']) ? $shopCfg['domain'] : $successfulDomain) . "/products/" . $handle;
+
+                    $bodyClean    = strip_tags($p['body_html'] ?? '');
+                    $fallbackMeta = mb_substr($bodyClean, 0, 160);
+                    if (empty($fallbackMeta)) {
+                        $fallbackMeta = "Shop authentic {$pname} with high-density sanitized foam, orthopedic support, and official Uratex Philippines warranty.";
+                    }
+
+                    $title    = $p['title'];
+                    $metaDesc = $fallbackMeta;
+
+                    $category = $p['product_type'] ?: 'Product';
+                    $price    = !empty($p['variants'][0]['price'])
+                        ? '₱' . number_format((float)$p['variants'][0]['price'], 2)
+                        : '₱0.00';
+
+                    $score = 85;
+                    if (function_exists('calculateSeoHealth')) {
+                        $seoAnalysis = calculateSeoHealth($title, $metaDesc, $handle);
+                        $score       = $seoAnalysis['score'];
+                    }
+
+                    $status = mapShopifyStatus($p['status'] ?? 'active');
+
+                    $insertStmt->execute([
+                        ':store'     => $activeStore,
+                        ':pid'       => $pid,
+                        ':pname'     => $pname,
+                        ':img_url'   => $imgUrl,
+                        ':img_name'  => $imgName,
+                        ':purl'      => $prodUrl,
+                        ':title'     => $title,
+                        ':meta_desc' => $metaDesc,
+                        ':handle'    => $handle,
+                        ':status'    => $status,
+                        ':seo_score' => $score,
+                        ':category'  => $category,
+                        ':price'     => $price
+                    ]);
+                    $syncedCount++;
+                }
+                $db->commit();
+            } catch (Throwable $e) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                $apiError = "Database error during REST sync: " . $e->getMessage();
+            }
+        }
+    }
+
+    if ($syncedCount > 0) {
         $message = "✅ Successfully synchronized <strong>{$syncedCount}</strong> products from <strong>{$successfulDomain}</strong> ({$shopCfg['name']}).";
         recordUserLog('sync_success', 'products', "Synced {$syncedCount} products from {$successfulDomain}", 'product', null, 'success');
     } else {
