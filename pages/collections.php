@@ -133,31 +133,6 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
 }
 
 /**
- * Fetch the live "global" title_tag/description_tag metafields for a collection —
- * these, not the plain collection title/body, drive the actual live <title> and
- * meta description. Sync must read them so the portal reflects what's really live.
- */
-function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $token, int $ownerId): array
-{
-    $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
-             . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=collection&namespace=global";
-    [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
-
-    $result = ['title_tag' => null, 'description_tag' => null];
-    if ($code >= 200 && $code < 300) {
-        $data = json_decode((string)$res, true);
-        foreach ($data['metafields'] ?? [] as $mf) {
-            if (($mf['key'] ?? '') === 'title_tag') {
-                $result['title_tag'] = $mf['value'] ?? null;
-            } elseif (($mf['key'] ?? '') === 'description_tag') {
-                $result['description_tag'] = $mf['value'] ?? null;
-            }
-        }
-    }
-    return $result;
-}
-
-/**
  * Push a single collection's SEO fields (title, handle, global title_tag/description_tag
  * metafields) to Shopify and persist the result locally. Used by both the individual
  * "Push to Shopify" action and the bulk push loop so both paths perform the same write.
@@ -227,47 +202,6 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
         'title'     => $finalTitle,
         'id'        => $collectionId,
     ];
-}
-
-// -----------------------------------------------------------------------------
-// AUTO-CREATE / MIGRATE TABLE
-// -----------------------------------------------------------------------------
-if ($db) {
-    try {
-        $db->exec("
-            CREATE TABLE IF NOT EXISTS `shopify_collections` (
-                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                `store_key` VARCHAR(50) NOT NULL DEFAULT 'business',
-                `shopify_collection_id` BIGINT UNSIGNED NOT NULL,
-                `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom',
-                `collection_title` VARCHAR(255) NOT NULL,
-                `collection_url` VARCHAR(1000) NULL DEFAULT NULL,
-                `title` VARCHAR(255) NOT NULL,
-                `meta_description` TEXT NULL,
-                `handle` VARCHAR(255) NOT NULL,
-                `item_count` INT UNSIGNED DEFAULT 0,
-                `status` ENUM('draft', 'published', 'needs_optimization', 'archived') NOT NULL DEFAULT 'draft',
-                `seo_score` TINYINT UNSIGNED NOT NULL DEFAULT 85,
-                `last_synced_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                `last_pushed_at` DATETIME NULL DEFAULT NULL,
-                `updated_by` VARCHAR(100) NULL DEFAULT NULL,
-                `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (`id`),
-                UNIQUE KEY `uq_store_collection` (`store_key`, `shopify_collection_id`),
-                KEY `idx_collections_store_status` (`store_key`, `status`),
-                KEY `idx_collections_handle` (`handle`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        ");
-
-        // Migrate older tables that are missing collection_type
-        $cols = $db->query("SHOW COLUMNS FROM `shopify_collections` LIKE 'collection_type'")->fetchAll();
-        if (empty($cols)) {
-            $db->exec("ALTER TABLE `shopify_collections` ADD COLUMN `collection_type` VARCHAR(20) NOT NULL DEFAULT 'custom' AFTER `shopify_collection_id`");
-        }
-    } catch (PDOException $e) {
-        // keep going
-    }
 }
 
 // -----------------------------------------------------------------------------
