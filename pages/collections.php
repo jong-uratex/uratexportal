@@ -157,6 +157,78 @@ function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $
     return $result;
 }
 
+/**
+ * Push a single collection's SEO fields (title, handle, global title_tag/description_tag
+ * metafields) to Shopify and persist the result locally. Used by both the individual
+ * "Push to Shopify" action and the bulk push loop so both paths perform the same write.
+ */
+function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore, array $col, string $currentUser, ?string $title = null, ?string $metaDescription = null, ?string $handle = null): array
+{
+    $collectionId = (int)$col['id'];
+    $shopifyCid   = $col['shopify_collection_id'];
+    $colType      = $col['collection_type'] ?? 'custom';
+    $adminDomain  = getShopifyAdminDomain($shopCfg, $activeStore);
+    $version      = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+
+    $endpoint   = ($colType === 'smart') ? 'smart_collections' : 'custom_collections';
+    $putUrl     = "https://{$adminDomain}/admin/api/{$version}/{$endpoint}/{$shopifyCid}.json";
+    $payloadKey = ($colType === 'smart') ? 'smart_collection' : 'custom_collection';
+    $token      = $shopCfg['access_token'] ?? '';
+    $finalTitle = $title ?: $col['title'];
+    $finalMeta  = $metaDescription ?: $col['meta_description'];
+    $finalHandle = $handle ?: $col['handle'];
+
+    $payload = [
+        $payloadKey => [
+            "id"        => $shopifyCid,
+            "title"     => $finalTitle,
+            "handle"    => $finalHandle,
+            "body_html" => $finalMeta
+        ]
+    ];
+
+    [$httpCode] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
+
+    // Collection fields alone don't update the live <title>/meta description —
+    // those live in the "global" title_tag/description_tag metafields, which must
+    // be upserted directly (see upsertGlobalSeoMetafield doc comment).
+    [$titleTagCode] = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'title_tag', 'single_line_text_field', $finalTitle);
+    [$descTagCode]  = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'description_tag', 'single_line_text_field', $finalMeta);
+
+    if (!($titleTagCode >= 200 && $titleTagCode < 300) || !($descTagCode >= 200 && $descTagCode < 300)) {
+        $httpCode = max($httpCode, $titleTagCode, $descTagCode, 500);
+    }
+
+    $success = ($httpCode >= 200 && $httpCode < 300);
+
+    // Only mark the record as published locally if Shopify actually accepted the write.
+    $upStmt = $db->prepare("
+        UPDATE shopify_collections
+        SET title = :title,
+            meta_description = :meta_desc,
+            handle = :handle,
+            status = :status,
+            last_pushed_at = NOW(),
+            updated_by = :user
+        WHERE id = :id
+    ");
+    $upStmt->execute([
+        ':title'     => $finalTitle,
+        ':meta_desc' => $finalMeta,
+        ':handle'    => $finalHandle,
+        ':status'    => $success ? 'published' : 'needs_optimization',
+        ':user'      => $currentUser,
+        ':id'        => $collectionId
+    ]);
+
+    return [
+        'success'   => $success,
+        'http_code' => $httpCode,
+        'title'     => $finalTitle,
+        'id'        => $collectionId,
+    ];
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE / MIGRATE TABLE
 // -----------------------------------------------------------------------------
@@ -951,64 +1023,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
             $col = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($col) {
-                $shopifyCid  = $col['shopify_collection_id'];
-                $colType     = $col['collection_type'] ?? 'custom';
-                $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
-                $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+                $result = pushCollectionSeoToShopify($db, $shopCfg, $activeStore, $col, $currentUser, $title, $metaDescription, $handle);
 
-                $endpoint   = ($colType === 'smart') ? 'smart_collections' : 'custom_collections';
-                $putUrl     = "https://{$adminDomain}/admin/api/{$version}/{$endpoint}/{$shopifyCid}.json";
-                $payloadKey = ($colType === 'smart') ? 'smart_collection' : 'custom_collection';
-                $token      = $shopCfg['access_token'] ?? '';
-                $finalTitle = $title ?: $col['title'];
-                $finalMeta  = $metaDescription ?: $col['meta_description'];
-
-                $payload = [
-                    $payloadKey => [
-                        "id"        => $shopifyCid,
-                        "title"     => $finalTitle,
-                        "handle"    => $handle ?: $col['handle'],
-                        "body_html" => $finalMeta
-                    ]
-                ];
-
-                [$httpCode, $res] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
-
-                // Collection fields alone don't update the live <title>/meta description —
-                // those live in the "global" title_tag/description_tag metafields, which must
-                // be upserted directly (see upsertGlobalSeoMetafield doc comment).
-                [$titleTagCode]  = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'title_tag', 'single_line_text_field', $finalTitle);
-                [$descTagCode]   = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'description_tag', 'single_line_text_field', $finalMeta);
-
-                if (!($titleTagCode >= 200 && $titleTagCode < 300) || !($descTagCode >= 200 && $descTagCode < 300)) {
-                    $httpCode = max($httpCode, $titleTagCode, $descTagCode, 500);
-                }
-
-                $upStmt = $db->prepare("
-                    UPDATE shopify_collections
-                    SET title = :title,
-                        meta_description = :meta_desc,
-                        handle = :handle,
-                        status = 'published',
-                        last_pushed_at = NOW(),
-                        updated_by = :user
-                    WHERE id = :id
-                ");
-                $upStmt->execute([
-                    ':title'     => $finalTitle,
-                    ':meta_desc' => $finalMeta,
-                    ':handle'    => $handle ?: $col['handle'],
-                    ':user'      => $currentUser,
-                    ':id'        => $collectionId
-                ]);
-
-                $pushedTitle = $finalTitle;
-                if ($httpCode >= 200 && $httpCode < 300) {
+                if ($result['success']) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
-                    recordUserLog('Shopify Push', $pushedTitle, "Pushed collection #{$collectionId} live to {$shopCfg['name']} (Shopify ID: {$shopifyCid}). Title, handle and meta tags updated.", 'collection', $collectionId, 'success');
+                    recordUserLog('Shopify Push', $result['title'], "Pushed collection #{$collectionId} live to {$shopCfg['name']} (Shopify ID: {$col['shopify_collection_id']}). Title, handle and meta tags updated.", 'collection', $collectionId, 'success');
                 } else {
-                    $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
-                    recordUserLog('Shopify Push Failed', $pushedTitle, "Push of collection #{$collectionId} to {$shopCfg['name']} returned HTTP {$httpCode}. Local draft kept — verify on Shopify.", 'collection', $collectionId, 'error');
+                    $message = "⚠️ Shopify API returned HTTP {$result['http_code']}. The push failed and the record was NOT marked as published.";
+                    recordUserLog('Shopify Push Failed', $result['title'], "Push of collection #{$collectionId} to {$shopCfg['name']} returned HTTP {$result['http_code']}. Record kept out of 'published' status.", 'collection', $collectionId, 'error');
                 }
             }
         }
@@ -1019,22 +1041,46 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
 
 // E. BULK APPROVE & PUSH
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+
     try {
         if ($db) {
-            $bStmt = $db->prepare("
-                UPDATE shopify_collections
-                SET status = 'published',
-                    last_pushed_at = NOW(),
-                    updated_by = :user
-                WHERE store_key = :store AND status = 'draft'
-            ");
-            $bStmt->execute([
-                ':user'  => $currentUser,
-                ':store' => $activeStore
-            ]);
-            $affected = $bStmt->rowCount();
-            $message  = "Bulk approved & published {$affected} draft collections for {$shopCfg['name']}.";
-            recordUserLog('Bulk Approve & Push', 'Collections', "Bulk approved & published {$affected} draft collection(s) for {$shopCfg['name']} (store: {$activeStore}).", 'collection', null, 'success');
+            $draftStmt = $db->prepare("SELECT * FROM shopify_collections WHERE store_key = :store AND status = 'draft'");
+            $draftStmt->execute([':store' => $activeStore]);
+            $drafts = $draftStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $successCount = 0;
+            $failures     = [];
+
+            foreach ($drafts as $draftCol) {
+                $result = pushCollectionSeoToShopify($db, $shopCfg, $activeStore, $draftCol, $currentUser);
+                if ($result['success']) {
+                    $successCount++;
+                } else {
+                    $failures[] = ($draftCol['handle'] ?: $draftCol['title']) . " (HTTP {$result['http_code']})";
+                }
+            }
+
+            $failCount = count($failures);
+            $total     = count($drafts);
+
+            if ($failCount === 0) {
+                $message = "✅ Bulk push complete: <strong>{$successCount}</strong> of <strong>{$total}</strong> draft collections pushed to Shopify ({$shopCfg['name']}) successfully.";
+            } else {
+                $failList = htmlspecialchars(implode(', ', array_slice($failures, 0, 10)));
+                $more     = $failCount > 10 ? ' and ' . ($failCount - 10) . ' more' : '';
+                $message  = "⚠️ Bulk push finished with errors: <strong>{$successCount}</strong> succeeded, <strong>{$failCount}</strong> failed out of {$total}. Failed: {$failList}{$more}.";
+            }
+
+            recordUserLog(
+                'Bulk Approve & Push',
+                'Collections',
+                "Bulk pushed {$total} draft collection(s) for {$shopCfg['name']} (store: {$activeStore}): {$successCount} succeeded, {$failCount} failed.",
+                'collection',
+                null,
+                $failCount === 0 ? 'success' : 'error'
+            );
         }
     } catch (Throwable $e) {
         $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());
