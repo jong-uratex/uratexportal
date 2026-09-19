@@ -1,111 +1,401 @@
 # Uratex Shopify SEO Partner Portal
 
-The Uratex Shopify SEO Partner Portal is an internal workspace for managing search optimization across Uratex's consumer and business storefronts:
+The Uratex Shopify SEO Partner Portal is an internal SEO operations platform built to help the Uratex marketing and growth teams manage Shopify storefront optimization across both retail and business channels. It centralizes SEO review, bulk metadata editing, API sync, content publishing, redirect management, user administration, and operational monitoring in one system.
 
-- **Uratex Retail**: `uratex.com.ph`
-- **Uratex Business**: `business.uratex.com.ph`
+This repository contains two complementary app layers:
 
-The portal brings catalog review, SEO editing, Shopify synchronization, publishing workflows, and operational administration into one interface. It includes a React/Vite development application, an Express API used by that application, and PHP/MySQL pages for the server deployment.
+- A modern React + Vite frontend served by an Express API for day-to-day SEO and catalog workflows
+- A PHP/MySQL portal used for server-side administration, Shopify sync, access-token renewal, and legacy portal pages
 
-## What It Does
+The platform is designed for the following storefronts:
 
-- Switch between the Retail and Business stores.
-- Review and optimize product, collection, page, and blog metadata.
-- Calculate SEO health scores and surface title, description, and URL issues.
-- Generate SEO suggestions with the Gemini API.
-- Preview search-engine results before saving changes.
-- Save drafts and push approved metadata to Shopify.
-- Synchronize pages and blog content from Shopify through the Admin GraphQL API.
-- Manage URL redirects and inspect audit logs.
-- Manage portal users, roles, statuses, and store access.
-- Renew both Shopify access tokens manually or on a schedule.
+- Uratex Retail: `uratex.com.ph`
+- Uratex Business: `business.uratex.com.ph`
 
-## Technology
+---
 
-- React 19, TypeScript, Vite, and Tailwind CSS
-- Express and `tsx` for the development/API server
-- Shopify Admin REST and GraphQL APIs
-- Google Gemini API for SEO optimization suggestions
-- PHP, PDO, and MySQL for the deployed portal pages
-- AdminLTE, Bootstrap, and Font Awesome in the PHP interface
+## What This Web App Does
 
-## Requirements
+The portal supports the full SEO lifecycle for a Shopify catalog and storefront content:
 
-- Node.js and npm
-- PHP with cURL, PDO, and the MySQL PDO driver for the PHP deployment
+- Manage product, collection, page, and blog SEO metadata
+- Review live SEO scores and identify issues before publishing
+- Search, filter, and edit title, meta description, and URL handle fields
+- Save draft updates locally and push approved changes to Shopify
+- Synchronize product, collection, page, and blog records from live Shopify stores
+- Preview how pages appear in search engine results before publishing
+- Use AI-powered suggestions through Google Gemini for SEO improvements
+- Audit logs, redirect rules, and user actions in one dashboard
+- Manage users, roles, access permissions, and store-level visibility
+- Renew Shopify access tokens automatically or manually from the admin interface
+
+The app is not just a page editor; it is a structured SEO workflow system built around live source-of-truth data from Shopify.
+
+---
+
+## Core Modules
+
+### 1. Dashboard
+
+The dashboard gives a high-level operational overview of the active storefront, including:
+
+- average SEO health score across all resources
+- total synced items across products, collections, pages, and blogs
+- critical metadata issues and optimization counts
+- recent optimization activity
+- live sync status and API version information
+
+It acts as the command center for SEO monitoring and quick navigation into each module.
+
+### 2. Product SEO Module
+
+The product module allows users to:
+
+- browse products by search term and status
+- review SEO score, handle, title, and meta description
+- identify missing or weak metadata fields
+- save draft updates
+- push individual or bulk approved items to Shopify
+- preview search results for a product page
+- generate AI-assisted optimization suggestions
+
+Products are managed with a grid/table interface and paging for large catalog sizes.
+
+### 3. Collection SEO Module
+
+The collection module is built for category-level optimization, including:
+
+- collection sync from Shopify custom and smart collections
+- status tracking such as draft, published, and needs optimization
+- editing of collection title, meta description, and URL handle
+- bulk export and import via CSV
+- live push to Shopify with metafield updates for global SEO title and description
+- pagination and search/filter controls for large stores
+
+This module supports the SEO workflow for merchandising categories and landing pages.
+
+### 4. Pages SEO Module
+
+The pages module handles storefront content pages such as informational and landing pages. Users can:
+
+- review SEO metadata for static pages
+- adjust title, meta description, and URL slugs
+- preview SERP result cards
+- save drafts and push them back to Shopify
+- analyze the quality of page-level SEO metadata
+
+### 5. Blogs SEO Module
+
+The blog module allows optimization of article-level SEO settings, including:
+
+- article metadata review and updates
+- search and filtering
+- AI optimization assistance
+- save-draft and publish workflows
+
+This keeps blog content aligned with the broader storefront SEO strategy.
+
+### 6. Redirect Manager
+
+The redirect module is used to manage 301 redirect rules between old and new URLs. It helps preserve SEO value during:
+
+- product migrations
+- catalog reorganizations
+- URL changes from new merchandising structures
+- historical content cleanup
+
+Users can track redirect count, mappings, and store-specific rules.
+
+### 7. Script Manager
+
+The script manager is used to configure and review storefront scripts and integrations. It provides a central place for managing site-level scripts and observability related to Shopify storefront behavior.
+
+### 8. User Management
+
+The app includes role-based access management for the internal team. Administrators can:
+
+- create and edit users
+- assign roles and store access
+- activate or suspend accounts
+- review login metadata and user audit history
+
+This is especially useful for agencies, marketing teams, and internal SEO partners working across multiple storefronts.
+
+### 9. User Logs and Audit Trail
+
+The application records operational activity such as:
+
+- login events
+- drafts saved
+- sync attempts
+- Shopify pushes
+- token renewals
+- user account changes
+
+These records are surfaced in the logs module for traceability and accountability.
+
+---
+
+## AI SEO Workflow
+
+The app integrates with Google Gemini via the `@google/genai` SDK to provide AI-powered SEO recommendations. This is used inside the optimization UI to:
+
+- suggest stronger title text
+- improve meta descriptions
+- refine handle/URL formatting
+- improve keyword alignment
+- catch duplication and weak SEO patterns
+
+The AI module is designed to assist human editors rather than replace them; final publishing remains under team control.
+
+---
+
+## Shopify Integration
+
+The application is built around Shopify admin APIs and supports both customized storefronts.
+
+### Store Configurations
+
+The backend stores store config values including:
+
+- store name and domain
+- Shopify admin URL
+- fallback domain
+- API version
+- access token
+- currency and product counts
+
+The app contains configuration for:
+
+- retail store
+- business store
+
+### API Usage
+
+The system communicates with Shopify using:
+
+- REST API for product, collection, page, blog, and redirect data
+- GraphQL queries for higher-performance collection sync and metadata retrieval
+- metafield updates for SEO title and description values
+
+The app includes logic to map published and draft states and to store local state for SEO optimization workflows.
+
+---
+
+## Data Model & SEO Logic
+
+Each resource item includes fields such as:
+
+- title
+- meta description
+- handle
+- Shopify item ID
+- SEO score
+- status
+- store key
+- last sync and updated timestamps
+
+SEO scoring is evaluated using best-practice checks for:
+
+- title length
+- meta description length
+- missing/weak metadata
+- bad URL handles
+- test tags and internal markers
+
+The score is used to highlight items that are healthy, partially optimized, or in need of attention.
+
+---
+
+## Frontend & Backend Architecture
+
+### Frontend
+
+The main UI is built with:
+
+- React 19
+- TypeScript
+- Vite
+- Tailwind CSS
+- Lucide icons
+- custom dashboard cards and charts
+
+The app renders different modules depending on the active tab and store.
+
+### API Layer
+
+The Express server exposes endpoints for:
+
+- authentication
+- store data fetches
+- sync operations
+- draft saving
+- Shopify push actions
+- user management
+- AI optimization requests
+
+### PHP Portal Layer
+
+The PHP side contains pages for the server-deployed portal, including:
+
+- products
+- collections
+- blogs
+- pages
+- redirects
+- user logs
+- user management
+- token renewal and Shopify connection testing
+
+This layer is tuned for a deployed PHP environment and uses PDO/MySQL for persistent data access.
+
+---
+
+## Project Structure
+
+```text
+/
+├── src/                     React app and all feature views
+│   ├── components/         UI modules and reusable widgets
+│   ├── data/              data generation and catalog fixtures
+│   ├── utils/             SEO helpers and calculation utilities
+│   ├── App.tsx            application shell and tab orchestration
+│   ├── types.ts           shared TypeScript models
+│   └── main.tsx           app mount point
+├── pages/                  PHP portal pages and admin modules
+├── config/                 PHP config template and environment settings
+├── includes/               shared PHP header/sidebar/footer layout
+├── cron/                   scheduled token-renewal jobs
+├── schema.sql              database schema
+├── server.ts               Express server and development runtime
+├── package.json            Node scripts and dependencies
+├── vite.config.ts          Vite config
+├── index.html              frontend entry page
+├── index.php               PHP entry point / app shell
+├── README.md               project documentation
+├── login.php               login page
+├── logout.php              logout flow
+├── metadata.json           metadata description
+├── composer.json           PHP package definitions
+└── .env.local              local environment variables (not checked in)
+```
+
+---
+
+## Local Development Setup
+
+### Requirements
+
+- Node.js 18+ and npm
+- PHP 8+
 - MySQL or MariaDB
-- Shopify Admin API credentials for both stores
-- A Gemini API key for AI SEO suggestions
+- Shopify Admin API access for the retail and business stores
+- Google Gemini API key
 
-## React/Express Development
-
-Install the Node dependencies:
+### Install Dependencies
 
 ```bash
 npm install
 ```
 
-Create `.env.local` and add the Gemini key:
+### Environment Variables
+
+Create a `.env.local` file in the project root:
 
 ```env
-GEMINI_API_KEY=your_gemini_api_key
+GEMINI_API_KEY=your_google_gemini_api_key
 ```
 
-Start the development server:
+### Start the App
 
 ```bash
 npm run dev
 ```
 
-The application is served on `http://localhost:3000`.
+The app is usually served at:
 
-Available scripts:
-
-```bash
-npm run dev    # Start the Vite/Express development server
-npm run lint   # Type-check the TypeScript application
-npm run build  # Build the frontend and bundled server
-npm start      # Run the production server bundle
+```text
+http://localhost:3000
 ```
 
-## PHP/MySQL Setup
+### Useful Scripts
 
-1. Copy `config/config.php.dist` to `config/config.php`.
-2. Set the MySQL connection values and reCAPTCHA values in `config/config.php`.
-3. Create the database using [schema.sql](schema.sql), or use the existing production database schema.
-4. Store Shopify store settings and OAuth client credentials in the `settings` table. The PHP application loads store settings from database records such as `retail_url`, `retail_access_token`, `business_url`, and `business_access_token`.
-5. Point the web server document root at the project directory and ensure PHP can write its session data.
+```bash
+npm run dev     # start the Vite + Express app
+npm run build   # build the frontend and server
+npm run lint    # TypeScript type-check
+npm start       # run the production build
+```
 
-Do not commit `config/config.php`, API keys, access tokens, database passwords, or `.env.local`. Use [config/config.php.dist](config/config.php.dist) as the safe configuration template.
+---
 
-## Automatic Shopify Token Renewal
+## PHP/MySQL Configuration
 
-The scheduled PHP job renews access tokens for both stores and writes the new values to the `settings` table. Configure the production server's cron scheduler for 11:30 PM Manila time:
+For the PHP deployment, configure the environment using the sample template:
+
+```bash
+cp config/config.php.dist config/config.php
+```
+
+Then update the values in `config/config.php` with the appropriate:
+
+- database host
+- database name
+- database username
+- database password
+- Shopify configuration values
+- OAuth keys and access tokens
+- reCAPTCHA keys if used
+
+Because the project contains internal credentials and private tokens, do not commit production secrets to source control.
+
+---
+
+## Token Renewal Workflow
+
+The repository includes a token renewal task under the `cron/` directory. This is used to refresh Shopify access tokens and write the updated credentials back to the store settings store.
+
+Example cron setup:
 
 ```cron
 CRON_TZ=Asia/Manila
 30 23 * * * /usr/bin/php /path/to/uratexportal/cron/renew_access_tokens.php >> /path/to/uratexportal/cron/token-renewal.log 2>&1
 ```
 
-Replace `/path/to/uratexportal` with the deployed project path. If the hosting provider does not support `CRON_TZ`, set the cron job timezone to `Asia/Manila` in its control panel before using `30 23 * * *`. The job uses a lock file to prevent overlapping renewals and returns a non-zero exit code when either store fails.
+This automated renewal job is intended to prevent access-token expiry issues and keep the platform connected to Shopify without manual intervention.
 
-The same renewal flow is available to authenticated administrators through the dashboard's **Renew Token** action.
+---
 
-## Project Layout
+## Security and Operational Notes
 
-```text
-src/                  React application and feature views
-server.ts             Express API and development server
-pages/                PHP portal pages and API endpoints
-config/               PHP configuration templates and database bootstrap
-includes/             Shared PHP layout and portal helpers
-cron/                 Scheduled maintenance scripts
-schema.sql            MySQL schema
-```
+- Keep production configuration values outside of version control.
+- Protect admin routes and cron scripts using server-side access controls.
+- Use HTTPS in production.
+- Review audit logs after SEO changes, store syncs, and token renewals.
+- Validate Shopify API credentials before broad publishing operations.
+- Treat AI-generated suggestions as assistive content, not final authoring decisions.
 
-## Security Notes
+---
 
-- Keep production secrets outside source control.
-- Restrict access to administrative pages and scheduled scripts at the web-server level.
-- Use HTTPS for the portal and Shopify API requests.
-- Review audit logs after token renewals, synchronization, and publishing actions.
+## Typical User Flow
+
+A normal SEO workflow in this system looks like this:
+
+1. Select the active store: retail or business
+2. Synchronize the store catalog from Shopify
+3. Review issue counts and SEO score cards
+4. Edit titles, descriptions, and URL handles
+5. Save a draft or generate AI suggestions
+6. Preview the SERP result
+7. Push approved changes to Shopify
+8. Review logs and confirm the published metadata is live
+
+This gives users a consistent, auditable process from research to publishing.
+
+---
+
+## Summary
+
+The Uratex Shopify SEO Partner Portal is a complete SEO operations platform for managing storefront optimization across multiple Shopify stores. It combines live Shopify data, AI optimization support, bulk SEO editing, publishing flows, redirect management, and operational governance in a unified, internal-facing workflow.
+
+It is built for teams that need to keep product and collection metadata optimized, maintain standards across multiple storefronts, and track every SEO action with a clear audit trail.
