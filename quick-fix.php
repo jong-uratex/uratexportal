@@ -197,14 +197,33 @@ if ($confirmed) {
       <ul><?php foreach ($rows as $row): ?><li><?php echo $escape($row); ?></li><?php endforeach; ?></ul>
     <?php endif; ?>
         <?php if ($hasMore): ?>
-            <form method="post">
+            <p id="batch-status">Next batch starts automatically in <strong>10</strong> seconds.</p>
+            <form method="post" id="continue-batch-form">
                 <input type="hidden" name="confirm" value="<?php echo $escape($confirmationToken); ?>">
                 <input type="hidden" name="last_id" value="<?php echo $nextLastId; ?>">
-                <button type="submit">Continue with next batch</button>
+                <button type="submit">Run next batch now</button>
             </form>
         <?php else: ?>
             <p>Quick fix complete. You can remove <code>quick-fix.php</code> from the server now.</p>
         <?php endif; ?>
   <?php endif; ?>
+    <?php if ($confirmed && $hasMore): ?>
+        <script>
+            (function () {
+                var seconds = 10;
+                var status = document.getElementById('batch-status');
+                var form = document.getElementById('continue-batch-form');
+                var timer = setInterval(function () {
+                    seconds -= 1;
+                    if (seconds <= 0) {
+                        clearInterval(timer);
+                        form.submit();
+                        return;
+                    }
+                    status.innerHTML = 'Next batch starts automatically in <strong>' + seconds + '</strong> seconds.';
+                }, 1000);
+            }());
+        </script>
+    <?php endif; ?>
 </body>
 </html>
