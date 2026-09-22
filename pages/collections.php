@@ -6,7 +6,7 @@
  *  1. Syncs ALL collections (custom + smart) from Shopify REST API with cursor pagination
  *  2. Saves & persists collections in MySQL table `shopify_collections`
  *  3. Categorized strictly according to active store (retail / business)
- *  4. Editable fields: ONLY Collection SEO Title, Meta Description, and URL Handle
+ *  4. Editable fields: ONLY Search engine listing title, Meta Description, and URL Handle
  *  5. 20 Collections Per Page Pagination
  *  6. Single & Bulk Save Drafts / Push to Shopify API
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
@@ -133,11 +133,11 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
 }
 
 /**
- * Push a single collection's SEO fields (title, handle, global title_tag/description_tag
+ * Push a single collection's SEO fields (SEO title, handle, global title_tag/description_tag
  * metafields) to Shopify and persist the result locally. Used by both the individual
  * "Push to Shopify" action and the bulk push loop so both paths perform the same write.
  */
-function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore, array $col, string $currentUser, ?string $title = null, ?string $metaDescription = null, ?string $handle = null): array
+function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore, array $col, string $currentUser, ?string $seoTitle = null, ?string $metaDescription = null, ?string $handle = null): array
 {
     $collectionId = (int)$col['id'];
     $shopifyCid   = $col['shopify_collection_id'];
@@ -149,14 +149,13 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
     $putUrl     = "https://{$adminDomain}/admin/api/{$version}/{$endpoint}/{$shopifyCid}.json";
     $payloadKey = ($colType === 'smart') ? 'smart_collection' : 'custom_collection';
     $token      = $shopCfg['access_token'] ?? '';
-    $finalTitle = $title ?: $col['title'];
+    $finalSeoTitle = $seoTitle ?: $col['title'];
     $finalMeta  = $metaDescription ?: $col['meta_description'];
     $finalHandle = $handle ?: $col['handle'];
 
     $payload = [
         $payloadKey => [
             "id"        => $shopifyCid,
-            "title"     => $finalTitle,
             "handle"    => $finalHandle,
             "body_html" => $finalMeta
         ]
@@ -167,7 +166,7 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
     // Collection fields alone don't update the live <title>/meta description —
     // those live in the "global" title_tag/description_tag metafields, which must
     // be upserted directly (see upsertGlobalSeoMetafield doc comment).
-    [$titleTagCode] = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'title_tag', 'single_line_text_field', $finalTitle);
+    [$titleTagCode] = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'title_tag', 'single_line_text_field', $finalSeoTitle);
     [$descTagCode]  = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyCid, 'description_tag', 'single_line_text_field', $finalMeta);
 
     if (!($titleTagCode >= 200 && $titleTagCode < 300) || !($descTagCode >= 200 && $descTagCode < 300)) {
@@ -179,7 +178,7 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
     // Only mark the record as published locally if Shopify actually accepted the write.
     $upStmt = $db->prepare("
         UPDATE shopify_collections
-        SET title = :title,
+        SET title = :seo_title,
             meta_description = :meta_desc,
             handle = :handle,
             status = :status,
@@ -188,7 +187,7 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
         WHERE id = :id
     ");
     $upStmt->execute([
-        ':title'     => $finalTitle,
+        ':seo_title' => $finalSeoTitle,
         ':meta_desc' => $finalMeta,
         ':handle'    => $finalHandle,
         ':status'    => $success ? 'published' : 'needs_optimization',
@@ -199,7 +198,7 @@ function pushCollectionSeoToShopify(PDO $db, array $shopCfg, string $activeStore
     return [
         'success'   => $success,
         'http_code' => $httpCode,
-        'title'     => $finalTitle,
+        'title'     => $finalSeoTitle,
         'id'        => $collectionId,
     ];
 }
@@ -254,17 +253,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'import_collections') {
       try {
         $db->beginTransaction();
         while (($row = fgetcsv($handle)) !== false) {
-          $title = trim($row[$headerMap['Collection SEO Title']] ?? '');
+          $seoTitle = trim($row[$headerMap['Collection SEO Title']] ?? '');
           $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
           $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
 
-          if ($title === '' || $urlHandle === '') {
+          if ($seoTitle === '' || $urlHandle === '') {
             $skippedCount++;
             continue;
           }
 
           $updateStmt->execute([
-            ':title' => $title,
+            ':title' => $seoTitle,
             ':meta_description' => $metaDescription,
             ':store' => $activeStore,
             ':handle' => $urlHandle,
@@ -450,7 +449,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                             $pushPayload = json_encode([
                                 $payloadKey => [
                                     "id" => $collectionId,
-                                    "title" => $testCollection['title'] ?? '',
                                     "handle" => $testCollection['handle'] ?? ''
                                 ]
                             ]);
@@ -912,11 +910,11 @@ GQL;
 if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
     try {
         $collectionId    = (int)($_POST['collection_id'] ?? 0);
-        $title           = trim($_POST['title'] ?? '');
+        $seoTitle        = trim($_POST['seo_title'] ?? '');
         $metaDescription = trim($_POST['meta_description'] ?? '');
         $handle          = trim($_POST['handle'] ?? '');
 
-        if ($collectionId && !empty($title) && $db) {
+        if ($collectionId && !empty($seoTitle) && $db) {
             $stmt = $db->prepare("
                 UPDATE shopify_collections
                 SET title = :title,
@@ -928,7 +926,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
                 WHERE id = :id AND store_key = :store
             ");
             $stmt->execute([
-                ':title'     => $title,
+                ':title'     => $seoTitle,
                 ':meta_desc' => $metaDescription,
                 ':handle'    => $handle,
                 ':user'      => $currentUser,
@@ -936,7 +934,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
                 ':store'     => $activeStore
             ]);
             $message = "SEO Draft saved successfully for collection #{$collectionId}.";
-            recordUserLog('Draft Saved', $title, "Saved SEO draft for collection #{$collectionId} (store: {$activeStore}). Title, meta description and handle updated locally.", 'collection', $collectionId, 'success');
+            recordUserLog('Draft Saved', $seoTitle, "Saved SEO draft for collection #{$collectionId} (store: {$activeStore}). Search engine listing title, meta description and handle updated locally.", 'collection', $collectionId, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Save draft failed – " . htmlspecialchars($e->getMessage());
@@ -947,7 +945,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
 if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
     try {
         $collectionId    = (int)($_POST['collection_id'] ?? 0);
-        $title           = trim($_POST['title'] ?? '');
+        $seoTitle        = trim($_POST['seo_title'] ?? '');
         $metaDescription = trim($_POST['meta_description'] ?? '');
         $handle          = trim($_POST['handle'] ?? '');
 
@@ -957,11 +955,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
             $col = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($col) {
-                $result = pushCollectionSeoToShopify($db, $shopCfg, $activeStore, $col, $currentUser, $title, $metaDescription, $handle);
+                $result = pushCollectionSeoToShopify($db, $shopCfg, $activeStore, $col, $currentUser, $seoTitle, $metaDescription, $handle);
 
                 if ($result['success']) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
-                    recordUserLog('Shopify Push', $result['title'], "Pushed collection #{$collectionId} live to {$shopCfg['name']} (Shopify ID: {$col['shopify_collection_id']}). Title, handle and meta tags updated.", 'collection', $collectionId, 'success');
+                    recordUserLog('Shopify Push', $result['title'], "Pushed collection #{$collectionId} live to {$shopCfg['name']} (Shopify ID: {$col['shopify_collection_id']}). Search engine listing title, handle and meta tags updated; collection title was not changed.", 'collection', $collectionId, 'success');
                 } else {
                     $message = "⚠️ Shopify API returned HTTP {$result['http_code']}. The push failed and the record was NOT marked as published.";
                     recordUserLog('Shopify Push Failed', $result['title'], "Push of collection #{$collectionId} to {$shopCfg['name']} returned HTTP {$result['http_code']}. Record kept out of 'published' status.", 'collection', $collectionId, 'error');
@@ -1237,8 +1235,8 @@ include __DIR__ . '/../includes/sidebar.php';
               $statusBadge = $status === 'published' ? 'badge-primary'
                            : ($status === 'archived' ? 'badge-secondary' : 'badge-success');
               $colId       = (int)$col['id'];
-              $colTitle    = $col['title'] ?? '';
-              $colName     = $col['collection_title'] ?? $colTitle;
+              $seoTitle    = $col['title'] ?? '';
+              $colName     = $col['collection_title'] ?? 'Untitled Collection';
               $colMeta     = $col['meta_description'] ?? '';
               $colHandle   = $col['handle'] ?? '';
               $colUrl      = $col['collection_url']
@@ -1277,14 +1275,14 @@ include __DIR__ . '/../includes/sidebar.php';
                   <form method="POST" action="collections.php?page=<?php echo $currentPage; ?>">
                     <input type="hidden" name="collection_id" value="<?php echo $colId; ?>">
 
-                    <!-- Title -->
+                    <!-- Search engine listing title; the collection title above is read-only. -->
                     <div class="form-group mb-3">
                       <div class="d-flex justify-content-between align-items-center mb-1">
-                        <label class="font-weight-bold small text-secondary mb-0">Collection SEO Title</label>
-                        <span class="text-muted small"><span id="title-count-<?php echo $colId; ?>"><?php echo mb_strlen($colTitle); ?></span> / 60 chars</span>
+                        <label class="font-weight-bold small text-secondary mb-0">Search engine listing title</label>
+                        <span class="text-muted small"><span id="title-count-<?php echo $colId; ?>"><?php echo mb_strlen($seoTitle); ?></span> / 60 chars</span>
                       </div>
-                      <input type="text" name="title" class="form-control font-weight-bold"
-                             value="<?php echo htmlspecialchars($colTitle); ?>"
+                      <input type="text" name="seo_title" class="form-control font-weight-bold"
+                             value="<?php echo htmlspecialchars($seoTitle); ?>"
                              data-char-counter="title-count-<?php echo $colId; ?>" required>
                     </div>
 
