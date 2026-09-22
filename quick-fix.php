@@ -7,6 +7,9 @@
  */
 require_once __DIR__ . '/config/config.php';
 
+@set_time_limit(60);
+@ini_set('max_execution_time', '60');
+
 if (!isset($_SESSION['user_logged_in'])) {
     http_response_code(403);
     exit('Authentication required.');
@@ -34,7 +37,8 @@ $request = static function (string $method, string $url, string $token, ?array $
         ],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT        => 8,
     ]);
     if ($payload !== null) {
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
@@ -60,16 +64,28 @@ $escape = static function (string $value): string {
     return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
 };
 
-$confirmed = isset($_POST['confirm']) && hash_equals('REMOVE_COLLECTION_URATEX_SUFFIX', (string)$_POST['confirm']);
+$confirmationToken = 'REMOVE_COLLECTION_URATEX_SUFFIX';
+$confirmed = isset($_POST['confirm']) && hash_equals($confirmationToken, (string)$_POST['confirm']);
+$lastId = max(0, (int)($_POST['last_id'] ?? 0));
+$batchSize = 2;
 $rows = [];
 $errors = [];
 $updated = 0;
+$processed = 0;
+$total = (int)$db->query('SELECT COUNT(*) FROM shopify_collections')->fetchColumn();
+$nextLastId = $lastId;
+$hasMore = false;
 
 if ($confirmed) {
-    $select = $db->query('SELECT * FROM shopify_collections ORDER BY store_key, id');
+    $select = $db->prepare('SELECT * FROM shopify_collections WHERE id > :last_id ORDER BY id LIMIT :batch_size');
+    $select->bindValue(':last_id', $lastId, PDO::PARAM_INT);
+    $select->bindValue(':batch_size', $batchSize, PDO::PARAM_INT);
+    $select->execute();
     $collections = $select->fetchAll(PDO::FETCH_ASSOC);
 
     foreach ($collections as $collection) {
+        $processed++;
+        $nextLastId = (int)$collection['id'];
         $storeKey = $collection['store_key'];
         $config = $shopConfig[$storeKey] ?? [];
         $token = $config['access_token'] ?? '';
@@ -143,8 +159,7 @@ if ($confirmed) {
         $updated++;
         $rows[] = "{$storeKey} #{$collection['id']}: {$visibleTitle} / {$seoTitle}";
     }
-} else {
-    $count = (int)$db->query('SELECT COUNT(*) FROM shopify_collections')->fetchColumn();
+    $hasMore = count($collections) === $batchSize;
 }
 ?>
 <!doctype html>
@@ -165,15 +180,15 @@ if ($confirmed) {
   <h1>Collection title quick fix</h1>
   <?php if (!$confirmed): ?>
     <div class="warning">
-      <p>This will update <?php echo $count; ?> local collection records and their Shopify records.</p>
+    <p>This will update <?php echo $total; ?> local collection records and their Shopify records in batches of <?php echo $batchSize; ?>.</p>
       <p>Visible collection names will lose a trailing <strong>| Uratex</strong>. Search engine listing titles will end with exactly one <strong>| Uratex</strong>.</p>
       <form method="post">
-        <input type="hidden" name="confirm" value="REMOVE_COLLECTION_URATEX_SUFFIX">
+        <input type="hidden" name="confirm" value="<?php echo $escape($confirmationToken); ?>">
         <button type="submit">Run quick fix</button>
       </form>
     </div>
   <?php else: ?>
-    <div class="success"><strong><?php echo $updated; ?></strong> collection records updated.</div>
+    <div class="success"><strong><?php echo $updated; ?></strong> collection records updated in this batch (<?php echo $processed; ?> processed).</div>
     <?php if ($errors): ?>
       <div class="error"><strong>Errors</strong><ul><?php foreach ($errors as $error): ?><li><?php echo $escape($error); ?></li><?php endforeach; ?></ul></div>
     <?php endif; ?>
@@ -181,6 +196,15 @@ if ($confirmed) {
       <h2>Updated records</h2>
       <ul><?php foreach ($rows as $row): ?><li><?php echo $escape($row); ?></li><?php endforeach; ?></ul>
     <?php endif; ?>
+        <?php if ($hasMore): ?>
+            <form method="post">
+                <input type="hidden" name="confirm" value="<?php echo $escape($confirmationToken); ?>">
+                <input type="hidden" name="last_id" value="<?php echo $nextLastId; ?>">
+                <button type="submit">Continue with next batch</button>
+            </form>
+        <?php else: ?>
+            <p>Quick fix complete. You can remove <code>quick-fix.php</code> from the server now.</p>
+        <?php endif; ?>
   <?php endif; ?>
 </body>
 </html>
