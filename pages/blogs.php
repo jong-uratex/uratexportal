@@ -4,6 +4,7 @@
  *
  * Features:
  *  1. Syncs ALL blog articles from Shopify REST API (blogs → articles with cursor pagination)
+ *     + high-performance GraphQL path with REST fallback
  *  2. Saves & persists articles in MySQL table `shopify_blogs`
  *  3. Categorized strictly according to active store (retail / business)
  *  4. Editable fields: ONLY Article SEO Title, Meta Description, and URL Handle
@@ -12,6 +13,13 @@
  *  7. Uses REAL Shopify publish status (published_at → published / draft)
  *  8. Live View button next to the article title
  *  9. Defensive error handling – never dies with HTTP 500
+ *
+ * FIXES (2026-09):
+ *  - Push no longer overwrites the real article title (only handle + global SEO metafields).
+ *  - Metafield failures are reported with the real Shopify response body instead of forced HTTP 500.
+ *  - Empty shopify_blog_id is handled with a clear message.
+ *  - REST sync path now also reads global title_tag / description_tag metafields.
+ *  - All API errors surface the response body for diagnosis.
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -63,6 +71,7 @@ function mapArticleStatus(?string $publishedAt): string
 
 /**
  * Minimal cURL wrapper for the Shopify Admin API.
+ * Always returns [httpCode, responseBody].
  */
 function shopifySeoApiRequest(string $method, string $url, string $token, ?array $payload = null): array
 {
@@ -75,29 +84,38 @@ function shopifySeoApiRequest(string $method, string $url, string $token, ?array
         ],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_TIMEOUT        => 20,
     ];
     if ($payload !== null) {
         $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
     }
     curl_setopt_array($ch, $opts);
     $res  = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
     curl_close($ch);
-    return [$code, $res];
+
+    if ($res === false && $err) {
+        return [$code ?: 0, json_encode(['error' => $err])];
+    }
+    return [$code, (string)$res];
 }
 
 /**
- * Create or update the "global" title_tag/description_tag metafield for an article.
+ * Create or update the "global" title_tag / description_tag metafield for an article.
  *
- * NOTE: Shopify's top-level "metafields_global_title_tag" / "metafields_global_description_tag"
- * shorthand only WRITES a metafield the first time it is set. Once the metafield already
- * exists, sending that shorthand again on an article PUT is silently ignored by the API
- * (it still returns 2xx), so the live <title>/meta description never changes after the
- * first push. We must look up the existing metafield and update it directly by ID.
+ * Shopify's top-level shorthand only writes the metafield the first time.
+ * Once it exists, we must look it up by ID and PUT the update.
  */
-function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $token, int $ownerId, string $key, string $type, string $value): array
-{
+function upsertGlobalSeoMetafield(
+    string $adminDomain,
+    string $version,
+    string $token,
+    int $ownerId,
+    string $key,
+    string $type,
+    string $value
+): array {
     $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
              . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=article"
              . "&namespace=global&key={$key}";
@@ -105,16 +123,20 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
 
     $existingId = null;
     if ($code >= 200 && $code < 300) {
-        $data = json_decode((string)$res, true);
+        $data = json_decode($res, true);
         if (!empty($data['metafields'][0]['id'])) {
-            $existingId = $data['metafields'][0]['id'];
+            $existingId = (int)$data['metafields'][0]['id'];
         }
     }
 
     if ($existingId) {
         $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
         return shopifySeoApiRequest('PUT', $putUrl, $token, [
-            'metafield' => ['id' => $existingId, 'value' => $value, 'type' => $type]
+            'metafield' => [
+                'id'    => $existingId,
+                'value' => $value,
+                'type'  => $type
+            ]
         ]);
     }
 
@@ -132,9 +154,7 @@ function upsertGlobalSeoMetafield(string $adminDomain, string $version, string $
 }
 
 /**
- * Fetch the live "global" title_tag/description_tag metafields for an article —
- * these, not the plain article title/body, drive the actual live <title> and
- * meta description. Sync must read them so the portal reflects what's really live.
+ * Fetch the live global title_tag / description_tag metafields for an article.
  */
 function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $token, int $ownerId): array
 {
@@ -144,7 +164,7 @@ function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $
 
     $result = ['title_tag' => null, 'description_tag' => null];
     if ($code >= 200 && $code < 300) {
-        $data = json_decode((string)$res, true);
+        $data = json_decode($res, true);
         foreach ($data['metafields'] ?? [] as $mf) {
             if (($mf['key'] ?? '') === 'title_tag') {
                 $result['title_tag'] = $mf['value'] ?? null;
@@ -154,6 +174,18 @@ function fetchGlobalSeoMetafields(string $adminDomain, string $version, string $
         }
     }
     return $result;
+}
+
+/**
+ * Truncate a string safely for display in error messages.
+ */
+function truncateForMessage(?string $text, int $max = 400): string
+{
+    $text = (string)$text;
+    if (mb_strlen($text) <= $max) {
+        return $text;
+    }
+    return mb_substr($text, 0, $max) . '…';
 }
 
 // -----------------------------------------------------------------------------
@@ -201,7 +233,7 @@ if ($db) {
             $db->exec("ALTER TABLE `shopify_blogs` ADD COLUMN `blog_handle` VARCHAR(255) NULL DEFAULT 'news' AFTER `blog_title`");
         }
     } catch (PDOException $e) {
-        // silent
+        // silent – table already exists or permissions issue
     }
 }
 
@@ -211,107 +243,115 @@ if ($db) {
 
 // A. EXPORT / IMPORT ARTICLE SEO DATA
 if (isset($_POST['action']) && $_POST['action'] === 'export_blogs') {
-  if (!$db) {
-    exit('Database connection unavailable.');
-  }
+    if (!$db) {
+        exit('Database connection unavailable.');
+    }
 
-  $exportStmt = $db->prepare('SELECT title, meta_description, handle FROM shopify_blogs WHERE store_key = :store ORDER BY id ASC');
-  $exportStmt->execute([':store' => $activeStore]);
+    $exportStmt = $db->prepare('SELECT title, meta_description, handle FROM shopify_blogs WHERE store_key = :store ORDER BY id ASC');
+    $exportStmt->execute([':store' => $activeStore]);
 
-  $filename = 'uratex_blogs_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
-  header('Content-Type: text/csv; charset=utf-8');
-  header('Content-Disposition: attachment; filename="' . $filename . '"');
-  $output = fopen('php://output', 'w');
-  fputcsv($output, ['Article SEO Title', 'Meta Description', 'URL Handle']);
+    $filename = 'uratex_blogs_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    $output = fopen('php://output', 'w');
+    fputcsv($output, ['Article SEO Title', 'Meta Description', 'URL Handle']);
 
-  while ($article = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
-    fputcsv($output, $article);
-  }
+    while ($article = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
+        fputcsv($output, $article);
+    }
 
-  fclose($output);
-  exit;
+    fclose($output);
+    exit;
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'import_blogs') {
-  $importedCount = 0;
-  $skippedCount = 0;
+    $importedCount = 0;
+    $skippedCount  = 0;
 
-  if (!$db || empty($_FILES['blogs_csv']['tmp_name']) || $_FILES['blogs_csv']['error'] !== UPLOAD_ERR_OK) {
-    $message = 'ERROR: Please choose a valid article CSV file to import.';
-  } else {
-    $handle = fopen($_FILES['blogs_csv']['tmp_name'], 'r');
-    $headers = $handle ? fgetcsv($handle) : false;
-    $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
-    $requiredColumns = ['Article SEO Title', 'Meta Description', 'URL Handle'];
-
-    if (!$handle || !is_array($headers) || count($headers) !== count($requiredColumns) || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
-      $message = 'ERROR: The CSV must include only Article SEO Title, Meta Description, and URL Handle columns.';
-      if ($handle) {
-        fclose($handle);
-      }
+    if (!$db || empty($_FILES['blogs_csv']['tmp_name']) || $_FILES['blogs_csv']['error'] !== UPLOAD_ERR_OK) {
+        $message = 'ERROR: Please choose a valid article CSV file to import.';
     } else {
-      $updateStmt = $db->prepare("UPDATE shopify_blogs SET title = :title, meta_description = :meta_description, status = 'draft', updated_by = :user WHERE store_key = :store AND handle = :handle");
+        $handle  = fopen($_FILES['blogs_csv']['tmp_name'], 'r');
+        $headers = $handle ? fgetcsv($handle) : false;
+        $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
+        $requiredColumns = ['Article SEO Title', 'Meta Description', 'URL Handle'];
 
-      try {
-        $db->beginTransaction();
-        while (($row = fgetcsv($handle)) !== false) {
-          $title = trim($row[$headerMap['Article SEO Title']] ?? '');
-          $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
-          $urlHandle = trim($row[$headerMap['URL Handle']] ?? '');
+        if (!$handle || !is_array($headers) || count(array_intersect($requiredColumns, array_keys($headerMap))) !== count($requiredColumns)) {
+            $message = 'ERROR: The CSV must include only Article SEO Title, Meta Description, and URL Handle columns.';
+            if ($handle) {
+                fclose($handle);
+            }
+        } else {
+            $updateStmt = $db->prepare("
+                UPDATE shopify_blogs
+                SET title = :title,
+                    meta_description = :meta_description,
+                    status = 'draft',
+                    updated_by = :user
+                WHERE store_key = :store AND handle = :handle
+            ");
 
-          if ($title === '' || $urlHandle === '') {
-            $skippedCount++;
-            continue;
-          }
+            try {
+                $db->beginTransaction();
+                while (($row = fgetcsv($handle)) !== false) {
+                    $title           = trim($row[$headerMap['Article SEO Title']] ?? '');
+                    $metaDescription = trim($row[$headerMap['Meta Description']] ?? '');
+                    $urlHandle       = trim($row[$headerMap['URL Handle']] ?? '');
 
-          $updateStmt->execute([
-            ':title' => $title,
-            ':meta_description' => $metaDescription,
-            ':store' => $activeStore,
-            ':handle' => $urlHandle,
-            ':user' => $currentUser,
-          ]);
-          if ($updateStmt->rowCount() === 1) {
-            $importedCount++;
-          } else {
-            $skippedCount++;
-          }
+                    if ($title === '' || $urlHandle === '') {
+                        $skippedCount++;
+                        continue;
+                    }
+
+                    $updateStmt->execute([
+                        ':title'            => $title,
+                        ':meta_description' => $metaDescription,
+                        ':store'            => $activeStore,
+                        ':handle'           => $urlHandle,
+                        ':user'             => $currentUser,
+                    ]);
+                    if ($updateStmt->rowCount() === 1) {
+                        $importedCount++;
+                    } else {
+                        $skippedCount++;
+                    }
+                }
+                $db->commit();
+                fclose($handle);
+                $message = "Imported <strong>{$importedCount}</strong> article(s) into the {$shopCfg['name']} database. No new articles were added.";
+                if ($skippedCount > 0) {
+                    $message .= " {$skippedCount} row(s) were skipped because required values were missing or no article matched the URL handle.";
+                }
+                recordUserLog('Article Import', 'Blogs & Articles', "Updated {$importedCount} existing article SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'article', null, 'success');
+            } catch (Throwable $e) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                if ($handle) {
+                    fclose($handle);
+                }
+                $message = 'ERROR: Article import failed. No database records were changed.';
+            }
         }
-        $db->commit();
-        fclose($handle);
-        $message = "Imported <strong>{$importedCount}</strong> article(s) into the {$shopCfg['name']} database. No new articles were added.";
-        if ($skippedCount > 0) {
-          $message .= " {$skippedCount} row(s) were skipped because required values were missing or no article matched the URL handle.";
-        }
-        recordUserLog('Article Import', 'Blogs & Articles', "Updated {$importedCount} existing article SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'article', null, 'success');
-      } catch (Throwable $e) {
-        if ($db->inTransaction()) {
-          $db->rollBack();
-        }
-        fclose($handle);
-        $message = 'ERROR: Article import failed. No database records were changed.';
-      }
     }
-  }
 }
 
 // B. TEST CONNECTION
 if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     try {
         $storesToTest = ['retail', 'business'];
-        $results = [];
-        $allSuccess = true;
-        
+        $results      = [];
+        $allSuccess   = true;
+
         foreach ($storesToTest as $storeKey) {
             $storeCfg = $shopConfig[$storeKey] ?? [];
             $targetUrl = getShopifyAdminDomain($storeCfg, $storeKey);
             $version   = !empty($storeCfg['version']) ? $storeCfg['version'] : '2025-10';
             $token     = $storeCfg['access_token'] ?? '';
-            
+
             $storeResults = [];
             $storeSuccess = true;
 
-            // Check if access token is available
             if (empty($token)) {
                 $storeResults[] = "❌ Access Token: MISSING - No access token found for {$storeKey} store";
                 $storeSuccess = false;
@@ -322,7 +362,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 continue;
             }
 
-            // Check if target URL is available
             if (empty($targetUrl)) {
                 $storeResults[] = "❌ Store Configuration: MISSING - No URL configured for {$storeKey} store";
                 $storeSuccess = false;
@@ -333,9 +372,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 continue;
             }
 
-            // Test 1: Basic connection test
+            // Test 1: Basic connection
             $testUrl = "https://{$targetUrl}/admin/api/{$version}/shop.json";
-            
             $ch = curl_init($testUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -347,14 +385,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 CURLOPT_TIMEOUT        => 15,
                 CURLOPT_HEADER         => true,
             ]);
-
             $response   = curl_exec($ch);
             $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
             $curlError  = curl_error($ch);
             curl_close($ch);
 
-            $bodyStr = substr($response, $headerSize);
+            $bodyStr = substr((string)$response, $headerSize);
             $json    = json_decode($bodyStr, true);
 
             if ($httpCode === 200 && !empty($json['shop'])) {
@@ -372,12 +409,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 $storeSuccess = false;
             }
 
-            // Test 2: Test PULL capability - GET blogs (containers) and articles
+            // Test 2: Pull blogs + articles
             $pullTestMessage = "❌ Pull Blogs: NOT TESTED";
-            
-            // First, try to get blogs
             $blogsTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs.json?limit=1";
-            
             $ch = curl_init($blogsTestUrl);
             curl_setopt_array($ch, [
                 CURLOPT_RETURNTRANSFER => true,
@@ -389,27 +423,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 CURLOPT_TIMEOUT        => 15,
                 CURLOPT_HEADER         => true,
             ]);
-
             $response   = curl_exec($ch);
             $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
             $curlError  = curl_error($ch);
             curl_close($ch);
 
-            $bodyStr = substr($response, $headerSize);
+            $bodyStr   = substr((string)$response, $headerSize);
             $blogsJson = json_decode($bodyStr, true);
+            $articlesJson = null;
 
             if ($httpCode === 200 && !empty($blogsJson['blogs']) && is_array($blogsJson['blogs'])) {
                 $blogCount = count($blogsJson['blogs']);
-                
-                // Try to get articles from the first blog if available
                 if ($blogCount > 0) {
                     $firstBlog = $blogsJson['blogs'][0];
-                    $blogId = $firstBlog['id'] ?? '';
-                    
+                    $blogId    = $firstBlog['id'] ?? '';
                     if ($blogId) {
                         $articlesTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles.json?limit=1";
-                        
                         $ch = curl_init($articlesTestUrl);
                         curl_setopt_array($ch, [
                             CURLOPT_RETURNTRANSFER => true,
@@ -421,14 +451,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                             CURLOPT_TIMEOUT        => 15,
                             CURLOPT_HEADER         => true,
                         ]);
-
                         $response   = curl_exec($ch);
                         $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                         $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
                         $curlError  = curl_error($ch);
                         curl_close($ch);
 
-                        $bodyStr = substr($response, $headerSize);
+                        $bodyStr      = substr((string)$response, $headerSize);
                         $articlesJson = json_decode($bodyStr, true);
 
                         if ($httpCode === 200 && !empty($articlesJson['articles']) && is_array($articlesJson['articles'])) {
@@ -461,33 +490,24 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                 }
                 $storeSuccess = false;
             }
-            
             $storeResults[] = $pullTestMessage;
 
-            // Test 3: Test PUSH capability - Try to find an article and update it
+            // Test 3: Push capability (no-op PUT)
             $pushTestMessage = "❌ Push Blogs: NOT TESTED - No articles available";
-            
-            // Try to use the data we already have from pull test
             if (isset($blogsJson['blogs']) && is_array($blogsJson['blogs']) && count($blogsJson['blogs']) > 0) {
                 $firstBlog = $blogsJson['blogs'][0];
-                $blogId = $firstBlog['id'] ?? '';
-                
+                $blogId    = $firstBlog['id'] ?? '';
                 if ($blogId && isset($articlesJson['articles']) && is_array($articlesJson['articles']) && count($articlesJson['articles']) > 0) {
                     $testArticle = $articlesJson['articles'][0];
-                    $articleId = $testArticle['id'] ?? '';
-                    
+                    $articleId   = $testArticle['id'] ?? '';
                     if ($articleId) {
                         $pushTestUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles/{$articleId}.json";
-                        
-                        // Use the exact same data to avoid actual changes
                         $pushPayload = json_encode([
                             "article" => [
-                                "id" => $articleId,
-                                "title" => $testArticle['title'] ?? '',
+                                "id"     => $articleId,
                                 "handle" => $testArticle['handle'] ?? ''
                             ]
                         ]);
-
                         $ch = curl_init($pushTestUrl);
                         curl_setopt_array($ch, [
                             CURLOPT_CUSTOMREQUEST  => "PUT",
@@ -500,19 +520,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                             CURLOPT_SSL_VERIFYPEER => false,
                             CURLOPT_TIMEOUT        => 15,
                         ]);
-
-                        $response   = curl_exec($ch);
-                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                        $curlError  = curl_error($ch);
+                        $response  = curl_exec($ch);
+                        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $curlError = curl_error($ch);
                         curl_close($ch);
 
-                        $bodyStr = $response;
-                        $pushJson = json_decode($bodyStr, true);
-
+                        $pushJson = json_decode((string)$response, true);
                         if ($httpCode >= 200 && $httpCode < 300) {
                             $pushTestMessage = "✅ Push Blogs: SUCCESS - Can update articles (tested on article ID: {$articleId})";
                         } else {
-                            $errorDetails = $pushJson['errors'] ?? $bodyStr;
+                            $errorDetails = $pushJson['errors'] ?? $response;
                             $pushTestMessage = "❌ Push Blogs: FAILED! HTTP {$httpCode}";
                             if ($curlError) {
                                 $pushTestMessage .= " | cURL: " . htmlspecialchars($curlError);
@@ -524,10 +541,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                         }
                     }
                 } else {
-                    // If we have blogs but no articles, try count endpoint as fallback
                     if ($blogId) {
                         $countUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/{$blogId}/articles/count.json";
-                        
                         $ch = curl_init($countUrl);
                         curl_setopt_array($ch, [
                             CURLOPT_RETURNTRANSFER => true,
@@ -538,11 +553,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                             CURLOPT_SSL_VERIFYPEER => false,
                             CURLOPT_TIMEOUT        => 15,
                         ]);
-
-                        $response   = curl_exec($ch);
-                        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        $response = curl_exec($ch);
+                        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                         curl_close($ch);
-
                         if ($httpCode === 200) {
                             $pushTestMessage = "✅ Push Blogs: SUCCESS - Can access articles endpoint";
                         } else {
@@ -551,9 +564,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                     }
                 }
             } else {
-                // No blogs found, try blogs/count.json as fallback
                 $countUrl = "https://{$targetUrl}/admin/api/{$version}/blogs/count.json";
-                
                 $ch = curl_init($countUrl);
                 curl_setopt_array($ch, [
                     CURLOPT_RETURNTRANSFER => true,
@@ -564,28 +575,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
                     CURLOPT_SSL_VERIFYPEER => false,
                     CURLOPT_TIMEOUT        => 15,
                 ]);
-
-                $response   = curl_exec($ch);
-                $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $response = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
                 curl_close($ch);
-
                 if ($httpCode === 200) {
                     $pushTestMessage = "✅ Push Blogs: SUCCESS - Can access blogs endpoint";
                 } else {
                     $pushTestMessage = "❌ Push Blogs: Unable to verify - No blogs found to test with";
                 }
             }
-            
             $storeResults[] = $pushTestMessage;
-            
-            // Combine all results for this store
+
             $results[$storeKey] = implode('<br>', $storeResults);
-            
             if (!$storeSuccess) {
                 $allSuccess = false;
             }
         }
-        
+
         $message = implode('<br><br>', $results);
         if ($allSuccess) {
             $message = "✅ All connections and API capabilities verified successfully!<br><br>" . $message;
@@ -598,7 +604,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
     }
 }
 
-// B. SYNC BLOG ARTICLES FROM SHOPIFY (High-performance GraphQL with REST fallback)
+// C. SYNC BLOG ARTICLES FROM SHOPIFY (GraphQL + REST fallback)
 if (isset($_POST['action']) && $_POST['action'] === 'sync_blogs') {
     @set_time_limit(300);
     @ini_set('max_execution_time', '300');
@@ -658,7 +664,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_blogs') {
 
         // 1. High-Performance GraphQL Sync
         foreach ($domainsToTry as $domain) {
-            $gqlUrl  = "https://{$domain}/admin/api/{$version}/graphql.json";
+            $gqlUrl   = "https://{$domain}/admin/api/{$version}/graphql.json";
             $gqlQuery = <<<'GQL'
 query getBlogsAndArticles {
   blogs(first: 50) {
@@ -698,7 +704,6 @@ query getBlogsAndArticles {
 GQL;
 
             $payload = json_encode(['query' => $gqlQuery]);
-
             $ch = curl_init($gqlUrl);
             curl_setopt_array($ch, [
                 CURLOPT_POST           => true,
@@ -710,9 +715,8 @@ GQL;
                 ],
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_TIMEOUT        => 30,
+                CURLOPT_TIMEOUT        => 45,
             ]);
-
             $response  = curl_exec($ch);
             $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $curlError = curl_error($ch);
@@ -755,8 +759,13 @@ GQL;
                                     $fallbackMeta = "Read more about {$aname} on the Uratex blog.";
                                 }
 
-                                $title    = !empty($aNode['titleTag']['value']) ? $aNode['titleTag']['value'] : (!empty($aNode['seo']['title']) ? $aNode['seo']['title'] : $aname);
-                                $metaDesc = !empty($aNode['descTag']['value']) ? $aNode['descTag']['value'] : (!empty($aNode['seo']['description']) ? $aNode['seo']['description'] : $fallbackMeta);
+                                // Prefer live global metafields → SEO object → fallback
+                                $title    = !empty($aNode['titleTag']['value'])
+                                    ? $aNode['titleTag']['value']
+                                    : (!empty($aNode['seo']['title']) ? $aNode['seo']['title'] : $aname);
+                                $metaDesc = !empty($aNode['descTag']['value'])
+                                    ? $aNode['descTag']['value']
+                                    : (!empty($aNode['seo']['description']) ? $aNode['seo']['description'] : $fallbackMeta);
 
                                 $tags     = is_array($aNode['tags'] ?? null) ? implode(',', $aNode['tags']) : (string)($aNode['tags'] ?? '');
                                 $category = !empty($tags) ? explode(',', $tags)[0] : 'Sleep Science';
@@ -823,7 +832,6 @@ GQL;
             ];
 
             foreach ($domainsToTry as $domain) {
-                // 1. Fetch all blogs
                 $blogsUrl = "https://{$domain}/admin/api/{$version}/blogs.json?limit=250";
                 $ch = curl_init($blogsUrl);
                 curl_setopt_array($ch, [
@@ -842,8 +850,12 @@ GQL;
                 if ($httpCode !== 200 || $response === false) {
                     $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
                     $apiError = "HTTP {$httpCode} fetching blogs on {$domain}";
-                    if ($curlError) $apiError .= " | cURL: {$curlError}";
-                    if ($bodyStr) $apiError .= " | " . substr($bodyStr, 0, 300);
+                    if ($curlError) {
+                        $apiError .= " | cURL: {$curlError}";
+                    }
+                    if ($bodyStr) {
+                        $apiError .= " | " . substr($bodyStr, 0, 300);
+                    }
                     continue;
                 }
 
@@ -858,7 +870,6 @@ GQL;
 
                 $tempArticles = [];
 
-                // 2. For each blog, fetch all articles
                 foreach ($blogs as $blog) {
                     $blogId     = $blog['id'] ?? 0;
                     $blogTitle  = $blog['title'] ?? 'News & Guides';
@@ -906,7 +917,9 @@ GQL;
                         } else {
                             $bodyStr  = is_string($response) ? substr($response, $headerSize) : '';
                             $apiError = "HTTP {$httpCode} fetching articles for blog {$blogId}";
-                            if ($curlError) $apiError .= " | cURL: {$curlError}";
+                            if ($curlError) {
+                                $apiError .= " | cURL: {$curlError}";
+                            }
                             break;
                         }
                     }
@@ -943,8 +956,14 @@ GQL;
                             $fallbackMeta = "Read more about {$aname} on the Uratex blog.";
                         }
 
-                        $title    = $a['title'] ?? $aname;
-                        $metaDesc = $fallbackMeta;
+                        // REST path: also fetch live global SEO metafields so portal matches reality
+                        $liveSeo  = fetchGlobalSeoMetafields($successfulDomain, $version, $token, (int)$aid);
+                        $title    = !empty($liveSeo['title_tag'])
+                            ? $liveSeo['title_tag']
+                            : ($a['title'] ?? $aname);
+                        $metaDesc = !empty($liveSeo['description_tag'])
+                            ? $liveSeo['description_tag']
+                            : $fallbackMeta;
 
                         $tags     = $a['tags'] ?? '';
                         $category = !empty($tags) ? explode(',', $tags)[0] : 'Sleep Science';
@@ -1006,7 +1025,7 @@ GQL;
     }
 }
 
-// C. SAVE DRAFT
+// D. SAVE DRAFT
 if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
     try {
         $blogId          = (int)($_POST['blog_id'] ?? 0);
@@ -1041,7 +1060,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
     }
 }
 
-// D. PUSH TO SHOPIFY
+// E. PUSH TO SHOPIFY  (FIXED – does NOT overwrite real article title)
 if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
     try {
         $blogId          = (int)($_POST['blog_id'] ?? 0);
@@ -1049,47 +1068,67 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
         $metaDescription = trim($_POST['meta_description'] ?? '');
         $handle          = trim($_POST['handle'] ?? '');
 
-        if ($blogId && $db) {
+        if (!$blogId || !$db) {
+            $message = 'ERROR: Invalid article or database unavailable.';
+        } else {
             $stmt = $db->prepare("SELECT * FROM shopify_blogs WHERE id = :id AND store_key = :store LIMIT 1");
             $stmt->execute([':id' => $blogId, ':store' => $activeStore]);
             $art = $stmt->fetch(PDO::FETCH_ASSOC);
 
-            if ($art) {
-                $shopifyAid  = $art['shopify_article_id'];
-                $shopifyBid  = $art['shopify_blog_id'] ?? 0;
+            if (!$art) {
+                $message = "ERROR: Article #{$blogId} not found for the active store.";
+            } else {
+                $shopifyAid  = (int)$art['shopify_article_id'];
+                $shopifyBid  = (int)($art['shopify_blog_id'] ?? 0);
                 $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
                 $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
                 $token       = $shopCfg['access_token'] ?? '';
-                $finalTitle  = $title ?: $art['title'];
-                $finalMeta   = $metaDescription ?: $art['meta_description'];
+                $finalTitle  = $title !== '' ? $title : ($art['title'] ?? '');
+                $finalMeta   = $metaDescription !== '' ? $metaDescription : ($art['meta_description'] ?? '');
+                $finalHandle = $handle !== '' ? $handle : ($art['handle'] ?? '');
 
-                if (empty($shopifyBid)) {
-                    throw new Exception('Missing shopify_blog_id. Please re-sync articles.');
+                if (empty($token)) {
+                    throw new Exception('Access token is empty for the active store.');
+                }
+                if ($shopifyBid <= 0) {
+                    throw new Exception('Missing shopify_blog_id for this article. Please re-sync articles so the blog ID is populated.');
+                }
+                if ($shopifyAid <= 0) {
+                    throw new Exception('Missing shopify_article_id for this article. Please re-sync.');
                 }
 
+                // ---------------------------------------------------------------
+                // 1. Update only the handle on the article resource.
+                //    NEVER write the SEO title into the real article title field.
+                //    The visible blog-post title stays exactly as it is in Shopify.
+                // ---------------------------------------------------------------
                 $putUrl = "https://{$adminDomain}/admin/api/{$version}/blogs/{$shopifyBid}/articles/{$shopifyAid}.json";
-
                 $payload = [
-                    "article" => [
-                        "id"           => $shopifyAid,
-                        "title"        => $finalTitle,
-                        "handle"       => $handle ?: $art['handle'],
-                        "summary_html" => $finalMeta
+                    'article' => [
+                        'id'     => $shopifyAid,
+                        'handle' => $finalHandle,
                     ]
                 ];
 
-                [$httpCode, $res] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
+                [$articleCode, $articleRes] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
 
-                // Article fields alone don't update the live <title>/meta description —
-                // those live in the "global" title_tag/description_tag metafields, which must
-                // be upserted directly (see upsertGlobalSeoMetafield doc comment).
-                [$titleTagCode] = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyAid, 'title_tag', 'single_line_text_field', $finalTitle);
-                [$descTagCode]  = upsertGlobalSeoMetafield($adminDomain, $version, $token, (int)$shopifyAid, 'description_tag', 'single_line_text_field', $finalMeta);
+                // ---------------------------------------------------------------
+                // 2. Upsert the real SEO metafields (these drive <title> and meta description)
+                // ---------------------------------------------------------------
+                [$titleTagCode, $titleTagRes] = upsertGlobalSeoMetafield(
+                    $adminDomain, $version, $token, $shopifyAid,
+                    'title_tag', 'single_line_text_field', $finalTitle
+                );
+                [$descTagCode, $descTagRes] = upsertGlobalSeoMetafield(
+                    $adminDomain, $version, $token, $shopifyAid,
+                    'description_tag', 'single_line_text_field', $finalMeta
+                );
 
-                if (!($titleTagCode >= 200 && $titleTagCode < 300) || !($descTagCode >= 200 && $descTagCode < 300)) {
-                    $httpCode = max($httpCode, $titleTagCode, $descTagCode, 500);
-                }
+                $articleOk  = ($articleCode >= 200 && $articleCode < 300);
+                $titleTagOk = ($titleTagCode >= 200 && $titleTagCode < 300);
+                $descTagOk  = ($descTagCode >= 200 && $descTagCode < 300);
 
+                // Always persist local changes so the portal stays in sync with what the user just edited
                 $upStmt = $db->prepare("
                     UPDATE shopify_blogs
                     SET title = :title,
@@ -1103,27 +1142,56 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
                 $upStmt->execute([
                     ':title'     => $finalTitle,
                     ':meta_desc' => $finalMeta,
-                    ':handle'    => $handle ?: $art['handle'],
+                    ':handle'    => $finalHandle,
                     ':user'      => $currentUser,
                     ':id'        => $blogId
                 ]);
 
-                $pushedTitle = $finalTitle;
-                if ($httpCode >= 200 && $httpCode < 300) {
-                    $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!";
-                    recordUserLog('Shopify Push', $pushedTitle, "Pushed article #{$blogId} live to {$shopCfg['name']} (Shopify article ID: {$shopifyAid}). Title, handle and meta tags updated.", 'article', $blogId, 'success');
+                // Build a clear, actionable message
+                if ($articleOk && $titleTagOk && $descTagOk) {
+                    $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!<br>"
+                             . "Handle + global title_tag + description_tag updated for article #{$blogId}.";
+                    recordUserLog(
+                        'Shopify Push',
+                        $finalTitle,
+                        "Pushed article #{$blogId} live to {$shopCfg['name']} (Shopify article ID: {$shopifyAid}). Handle and SEO metafields updated. Real article title left unchanged.",
+                        'article',
+                        $blogId,
+                        'success'
+                    );
                 } else {
-                    $message = "⚠️ Local draft updated, but Shopify API returned HTTP {$httpCode}. Please verify the push.";
-                    recordUserLog('Shopify Push Failed', $pushedTitle, "Push of article #{$blogId} to {$shopCfg['name']} returned HTTP {$httpCode}. Local draft kept — verify on Shopify.", 'article', $blogId, 'error');
+                    $parts = [];
+                    if (!$articleOk) {
+                        $parts[] = "Article handle update HTTP {$articleCode}: " . htmlspecialchars(truncateForMessage($articleRes));
+                    }
+                    if (!$titleTagOk) {
+                        $parts[] = "title_tag metafield HTTP {$titleTagCode}: " . htmlspecialchars(truncateForMessage($titleTagRes));
+                    }
+                    if (!$descTagOk) {
+                        $parts[] = "description_tag metafield HTTP {$descTagCode}: " . htmlspecialchars(truncateForMessage($descTagRes));
+                    }
+                    $message = "⚠️ Local draft updated, but one or more Shopify calls failed:<br><ul><li>"
+                             . implode('</li><li>', $parts)
+                             . "</li></ul>"
+                             . "Please verify the values on Shopify or re-sync and try again.";
+                    recordUserLog(
+                        'Shopify Push Partial/Failed',
+                        $finalTitle,
+                        "Partial or failed push of article #{$blogId} to {$shopCfg['name']}. Details: " . implode(' | ', $parts),
+                        'article',
+                        $blogId,
+                        'error'
+                    );
                 }
             }
         }
     } catch (Throwable $e) {
         $message = "ERROR: Push failed – " . htmlspecialchars($e->getMessage());
+        recordUserLog('Shopify Push Exception', 'Blogs', $message, 'article', $blogId ?? null, 'error');
     }
 }
 
-// E. BULK APPROVE & PUSH
+// F. BULK APPROVE & PUSH (still local-only – real multi-article push can be added later)
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
     try {
         if ($db) {
@@ -1139,8 +1207,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
                 ':store' => $activeStore
             ]);
             $affected = $bStmt->rowCount();
-            $message  = "Bulk approved & published {$affected} draft articles for {$shopCfg['name']}.";
-            recordUserLog('Bulk Approve & Push', 'Blogs & Articles', "Bulk approved & published {$affected} draft article(s) for {$shopCfg['name']} (store: {$activeStore}).", 'article', null, 'success');
+            $message  = "Bulk approved & marked published {$affected} draft article(s) for {$shopCfg['name']} (local status only). "
+                      . "Use individual Push to Shopify to write handle + SEO metafields live.";
+            recordUserLog('Bulk Approve & Push', 'Blogs & Articles', "Bulk approved & published {$affected} draft article(s) for {$shopCfg['name']} (store: {$activeStore}). Local only.", 'article', null, 'success');
         }
     } catch (Throwable $e) {
         $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());
@@ -1191,7 +1260,6 @@ if ($db) {
         $dStmt = $db->prepare("SELECT COUNT(*) FROM shopify_blogs WHERE store_key = :store AND status = 'draft'");
         $dStmt->execute([':store' => $activeStore]);
         $draftCount = (int)$dStmt->fetchColumn();
-
     } catch (Throwable $e) {
         // silent
     }
@@ -1284,7 +1352,7 @@ include __DIR__ . '/../includes/sidebar.php';
                     </form>
                     <form method="POST" class="mb-1">
                       <input type="hidden" name="action" value="bulk_push">
-                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk push imported articles to Shopify"><i class="fas fa-check-double mr-1"></i>Bulk Push (<?php echo $draftCount; ?>)</button>
+                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk mark drafts as published (local only)"><i class="fas fa-check-double mr-1"></i>Bulk Push (<?php echo $draftCount; ?>)</button>
                     </form>
                   </div>
                 </div>
@@ -1430,7 +1498,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       <input type="text" name="title" id="title-<?php echo $blogId; ?>"
                              class="form-control font-weight-bold"
                              value="<?php echo htmlspecialchars($artTitle); ?>"
-                         data-char-counter="t-count-<?php echo $blogId; ?>"
+                             data-char-counter="t-count-<?php echo $blogId; ?>"
                              required>
                     </div>
 
@@ -1465,7 +1533,7 @@ include __DIR__ . '/../includes/sidebar.php';
                       </button>
                       <button type="submit" name="action" value="push_shopify"
                               class="btn font-weight-bold text-white" style="background-color: #003087;"
-                              onclick="return confirm('Push this article live to Shopify?');">
+                              onclick="return confirm('Push this article\'s SEO (handle + title_tag + description_tag) live to Shopify?\n\nThe real article title will NOT be changed.');">
                         <i class="fas fa-upload mr-1"></i> Push to Shopify
                       </button>
                     </div>
