@@ -710,6 +710,7 @@ $formImageUrl    = $editingArticle['image_url'] ?? '';
 
 $pageTitle = 'Write & Publish Article';
 include __DIR__ . '/../includes/header.php';
+include __DIR__ . '/../includes/sidebar.php';
 ?>
 
 <!-- Summernote Bootstrap 4 Stylesheet -->
