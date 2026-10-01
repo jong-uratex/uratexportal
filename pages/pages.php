@@ -125,6 +125,203 @@ if (isset($_GET['export']) && in_array($_GET['export'], ['csv', 'json'])) {
 }
 
 // -----------------------------------------------------------------------------
+// SHOPIFY API & SEO METAFIELD HELPERS
+// -----------------------------------------------------------------------------
+if (!function_exists('getShopifyAdminDomain')) {
+    function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
+    {
+        if (!empty($shopCfg['url'])) {
+            return $shopCfg['url'];
+        }
+        if (!empty($shopCfg['fallback_url'])) {
+            return $shopCfg['fallback_url'];
+        }
+        return ($activeStore === 'business')
+            ? 'uratex-business.myshopify.com'
+            : 'uratex-philippines.myshopify.com';
+    }
+}
+
+if (!function_exists('shopifySeoApiRequest')) {
+    function shopifySeoApiRequest(string $method, string $url, string $token, ?array $payload = null): array
+    {
+        $ch   = curl_init($url);
+        $opts = [
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TIMEOUT        => 20,
+        ];
+        if ($payload !== null) {
+            $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
+        }
+        curl_setopt_array($ch, $opts);
+        $res  = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+
+        if ($res === false && $err) {
+            return [$code ?: 0, json_encode(['error' => $err])];
+        }
+        return [$code, (string)$res];
+    }
+}
+
+if (!function_exists('upsertGlobalPageSeoMetafield')) {
+    function upsertGlobalPageSeoMetafield(string $adminDomain, string $version, string $token, int $ownerId, string $key, string $type, string $value): array
+    {
+        $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
+                 . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=page"
+                 . "&namespace=global&key={$key}";
+        [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
+
+        $existingId = null;
+        if ($code >= 200 && $code < 300) {
+            $data = json_decode((string)$res, true);
+            if (!empty($data['metafields'][0]['id'])) {
+                $existingId = $data['metafields'][0]['id'];
+            }
+        }
+
+        if ($existingId) {
+            $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
+            return shopifySeoApiRequest('PUT', $putUrl, $token, [
+                'metafield' => ['id' => $existingId, 'value' => $value, 'type' => $type]
+            ]);
+        }
+
+        $postUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json";
+        return shopifySeoApiRequest('POST', $postUrl, $token, [
+            'metafield' => [
+                'namespace'      => 'global',
+                'key'            => $key,
+                'value'          => $value,
+                'type'           => $type,
+                'owner_id'       => $ownerId,
+                'owner_resource' => 'page'
+            ]
+        ]);
+    }
+}
+
+/**
+ * Push a single page's SEO fields (handle, global title_tag/description_tag metafields)
+ * to Shopify and persist the result locally. Used by both individual and bulk push.
+ */
+function pushPageSeoToShopify(
+    PDO $db,
+    array $shopCfg,
+    string $activeStore,
+    array $pg,
+    string $currentUser,
+    ?string $title = null,
+    ?string $metaDescription = null,
+    ?string $handle = null
+): array {
+    $pageId      = (int)$pg['id'];
+    $shopifyPid  = (int)($pg['shopify_page_id'] ?? 0);
+    $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
+    $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+    $token       = $shopCfg['access_token'] ?? '';
+    $finalTitle  = ($title !== null && $title !== '') ? $title : ($pg['title'] ?? '');
+    $finalMeta   = ($metaDescription !== null && $metaDescription !== '') ? $metaDescription : ($pg['meta_description'] ?? '');
+    $finalHandle = ($handle !== null && $handle !== '') ? $handle : ($pg['handle'] ?? '');
+
+    if (empty($token)) {
+        return ['success' => false, 'http_code' => 0, 'error' => 'Missing access token for active store', 'title' => $finalTitle, 'id' => $pageId];
+    }
+    if ($shopifyPid <= 0) {
+        return ['success' => false, 'http_code' => 0, 'error' => 'Missing shopify_page_id', 'title' => $finalTitle, 'id' => $pageId];
+    }
+
+    // 1. Update handle on page resource (NEVER touches body_html or main page title)
+    $putUrl = "https://{$adminDomain}/admin/api/{$version}/pages/{$shopifyPid}.json";
+    $payload = [
+        "page" => [
+            "id"     => $shopifyPid,
+            "handle" => $finalHandle
+        ]
+    ];
+    [$pageCode, $pageRes] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
+
+    // 2. Upsert SEO metafields (title_tag and description_tag)
+    [$titleTagCode, $titleTagRes] = upsertGlobalPageSeoMetafield($adminDomain, $version, $token, $shopifyPid, 'title_tag', 'single_line_text_field', $finalTitle);
+    [$descTagCode, $descTagRes]   = upsertGlobalPageSeoMetafield($adminDomain, $version, $token, $shopifyPid, 'description_tag', 'single_line_text_field', $finalMeta);
+
+    $pageOk     = ($pageCode >= 200 && $pageCode < 300);
+    $titleTagOk = ($titleTagCode >= 200 && $titleTagCode < 300);
+    $descTagOk  = ($descTagCode >= 200 && $descTagCode < 300);
+    $success    = ($pageOk && $titleTagOk && $descTagOk);
+
+    // Calculate SEO health score
+    $score = (int)($pg['seo_score'] ?? 85);
+    if (function_exists('calculateSeoHealth')) {
+        $health = calculateSeoHealth($finalTitle, $finalMeta, $finalHandle);
+        $score = $health['score'] ?? $score;
+    }
+
+    // ONLY mark status as 'published' and set last_pushed_at if Shopify succeeded!
+    if ($success) {
+        $upStmt = $db->prepare("
+            UPDATE shopify_pages 
+            SET title = :title, 
+                meta_description = :meta_desc, 
+                handle = :handle, 
+                status = 'published',
+                seo_score = :score,
+                last_pushed_at = NOW(),
+                updated_by = :user
+            WHERE id = :id
+        ");
+        $upStmt->execute([
+            ':title'     => $finalTitle,
+            ':meta_desc' => $finalMeta,
+            ':handle'    => $finalHandle,
+            ':score'     => $score,
+            ':user'      => $currentUser,
+            ':id'        => $pageId
+        ]);
+    } else {
+        $upStmt = $db->prepare("
+            UPDATE shopify_pages 
+            SET title = :title, 
+                meta_description = :meta_desc, 
+                handle = :handle, 
+                seo_score = :score,
+                updated_by = :user
+            WHERE id = :id
+        ");
+        $upStmt->execute([
+            ':title'     => $finalTitle,
+            ':meta_desc' => $finalMeta,
+            ':handle'    => $finalHandle,
+            ':score'     => $score,
+            ':user'      => $currentUser,
+            ':id'        => $pageId
+        ]);
+    }
+
+    $errors = [];
+    if (!$pageOk)     $errors[] = "Handle HTTP {$pageCode}: " . (is_string($pageRes) ? substr($pageRes, 0, 200) : '');
+    if (!$titleTagOk) $errors[] = "title_tag HTTP {$titleTagCode}: " . (is_string($titleTagRes) ? substr($titleTagRes, 0, 200) : '');
+    if (!$descTagOk)  $errors[] = "description_tag HTTP {$descTagCode}: " . (is_string($descTagRes) ? substr($descTagRes, 0, 200) : '');
+
+    return [
+        'success'    => $success,
+        'http_code'  => $pageCode,
+        'title'      => $finalTitle,
+        'id'         => $pageId,
+        'shopify_id' => $shopifyPid,
+        'errors'     => $errors
+    ];
+}
+
+// -----------------------------------------------------------------------------
 // 0. AUTO-INITIALIZE SQL TABLE `shopify_pages`
 // -----------------------------------------------------------------------------
 if ($db) {
@@ -863,9 +1060,114 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
     }
 }
 
-// C. PUSH TO SHOPIFY API (SINGLE PAGE)
+// C. EXPORT / IMPORT PAGE SEO DATA (CSV like blogs.php)
+if (isset($_POST['action']) && $_POST['action'] === 'export_pages') {
+    if (!$db) {
+        exit('Database connection unavailable.');
+    }
+    $exportStmt = $db->prepare("SELECT title, meta_description, handle FROM shopify_pages WHERE store_key = :store ORDER BY id ASC");
+    $exportStmt->execute([':store' => $activeStore]);
+
+    $filename = 'uratex_pages_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    $output = fopen('php://output', 'w');
+    fputcsv($output, ['Page SEO Title', 'Meta Description', 'URL Handle']);
+
+    while ($pageRow = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
+        fputcsv($output, $pageRow);
+    }
+    fclose($output);
+    exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'import_pages') {
+    $importedCount = 0;
+    $skippedCount  = 0;
+
+    if (!$db || empty($_FILES['pages_csv']['tmp_name']) || $_FILES['pages_csv']['error'] !== UPLOAD_ERR_OK) {
+        $message = 'ERROR: Please choose a valid page CSV file to import.';
+        $messageType = 'danger';
+    } else {
+        $handle  = fopen($_FILES['pages_csv']['tmp_name'], 'r');
+        $headers = $handle ? fgetcsv($handle) : false;
+        $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
+
+        $titleCol = null;
+        if (isset($headerMap['Page SEO Title'])) $titleCol = 'Page SEO Title';
+        elseif (isset($headerMap['Page Title'])) $titleCol = 'Page Title';
+        elseif (isset($headerMap['SEO Title'])) $titleCol = 'SEO Title';
+        elseif (isset($headerMap['Article SEO Title'])) $titleCol = 'Article SEO Title';
+
+        $metaCol = null;
+        if (isset($headerMap['Meta Description'])) $metaCol = 'Meta Description';
+
+        $handleCol = null;
+        if (isset($headerMap['URL Handle'])) $handleCol = 'URL Handle';
+        elseif (isset($headerMap['Handle'])) $handleCol = 'Handle';
+
+        if (!$handle || !$titleCol || !$metaCol || !$handleCol) {
+            $message = 'ERROR: The CSV must include Page SEO Title, Meta Description, and URL Handle columns.';
+            $messageType = 'danger';
+            if ($handle) fclose($handle);
+        } else {
+            $updateStmt = $db->prepare("
+                UPDATE shopify_pages
+                SET title = :title,
+                    meta_description = :meta_description,
+                    status = 'draft',
+                    updated_by = :user
+                WHERE store_key = :store AND handle = :handle
+            ");
+
+            try {
+                $db->beginTransaction();
+                while (($row = fgetcsv($handle)) !== false) {
+                    $title           = trim($row[$headerMap[$titleCol]] ?? '');
+                    $metaDescription = trim($row[$headerMap[$metaCol]] ?? '');
+                    $urlHandle       = trim($row[$headerMap[$handleCol]] ?? '');
+
+                    if ($title === '' || $urlHandle === '') {
+                        $skippedCount++;
+                        continue;
+                    }
+
+                    $updateStmt->execute([
+                        ':title'            => $title,
+                        ':meta_description' => $metaDescription,
+                        ':store'            => $activeStore,
+                        ':handle'           => $urlHandle,
+                        ':user'             => $currentUser,
+                    ]);
+                    if ($updateStmt->rowCount() === 1) {
+                        $importedCount++;
+                    } else {
+                        $skippedCount++;
+                    }
+                }
+                $db->commit();
+                fclose($handle);
+                $message = "Imported <strong>{$importedCount}</strong> page(s) into the {$shopCfg['name']} database. No new pages were created.";
+                if ($skippedCount > 0) {
+                    $message .= " {$skippedCount} row(s) were skipped because required values were missing or no page matched the URL handle.";
+                }
+                $messageType = 'success';
+                recordUserLog('Page Import', 'Pages Manager', "Updated {$importedCount} existing page SEO row(s) for {$shopCfg['name']}; skipped {$skippedCount}; no records added.", 'page', null, 'success');
+            } catch (Throwable $e) {
+                if ($db->inTransaction()) {
+                    $db->rollBack();
+                }
+                if ($handle) fclose($handle);
+                $message = 'ERROR: Page import failed. No database records were changed.';
+                $messageType = 'danger';
+            }
+        }
+    }
+}
+
+// D. PUSH TO SHOPIFY API (SINGLE PAGE)
 // FIXED: Updates ONLY Search engine listing (title_tag + description_tag) + handle.
-// Never touches body_html / page content.
+// Never touches body_html / page content. Ties published status ONLY to actual success.
 if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
     $pageId = (int)($_POST['page_id'] ?? 0);
     $title = trim($_POST['title'] ?? '');
@@ -878,92 +1180,75 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
         $pg = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if ($pg) {
-            $shopifyPid = $pg['shopify_page_id'];
-            $shopifyPutUrl = "https://" . $shopCfg['domain'] . "/admin/api/" . $shopCfg['version'] . "/pages/{$shopifyPid}.json";
-            
-            // ONLY update handle + SEO metafields. NEVER touch body_html or the main page title.
-            $payload = [
-                "page" => [
-                    "id" => $shopifyPid,
-                    "handle" => $handle ?: $pg['handle'],
-                    "metafields" => [
-                        [
-                            "namespace" => "global",
-                            "key" => "title_tag",
-                            "value" => $title ?: $pg['title'],
-                            "type" => "single_line_text_field"
-                        ],
-                        [
-                            "namespace" => "global",
-                            "key" => "description_tag",
-                            "value" => $metaDescription ?: $pg['meta_description'],
-                            "type" => "single_line_text_field"
-                        ]
-                    ]
-                ]
-            ];
-            
-            $ch = curl_init();
-            curl_setopt($ch, CURLOPT_URL, $shopifyPutUrl);
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                "X-Shopify-Access-Token: " . $shopCfg['access_token'],
-                "Content-Type: application/json"
-            ]);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-            $res = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            
-            $seoAnalysis = calculateSeoHealth($title ?: $pg['title'], $metaDescription ?: $pg['meta_description'], $handle ?: $pg['handle']);
-            $score = $seoAnalysis['score'];
-            
-            $upStmt = $db->prepare("
-                UPDATE shopify_pages 
-                SET title = :title, 
-                    meta_description = :meta_desc, 
-                    handle = :handle, 
-                    status = 'published',
-                    seo_score = :score,
-                    last_pushed_at = NOW(),
-                    updated_by = :user
-                WHERE id = :id
-            ");
-            $upStmt->execute([
-                ':title' => $title ?: $pg['title'],
-                ':meta_desc' => $metaDescription ?: $pg['meta_description'],
-                ':handle' => $handle ?: $pg['handle'],
-                ':score' => $score,
-                ':user' => $currentUser,
-                ':id' => $pageId
-            ]);
-            
-            if ($httpCode >= 200 && $httpCode < 300) {
+            $result = pushPageSeoToShopify($db, $shopCfg, $activeStore, $pg, $currentUser, $title, $metaDescription, $handle);
+
+            if ($result['success']) {
                 $message = "Search engine listing updated successfully on {$shopCfg['name']} for '{$pg['page_title']}' (page content left completely untouched).";
+                $messageType = 'success';
+                recordUserLog('Shopify Push', $result['title'], "Pushed page #{$pageId} live to {$shopCfg['name']} (Shopify ID: {$pg['shopify_page_id']}). Handle and SEO metafields updated.", 'page', $pageId, 'success');
             } else {
-                $message = "Database updated, but Shopify API returned HTTP {$httpCode}. Please verify access token and scopes (write_content / write_online_store_pages).";
+                $errDetails = !empty($result['errors']) ? implode('<br>', $result['errors']) : ($result['error'] ?? "HTTP {$result['http_code']}");
+                $message = "⚠️ Shopify API push failed for page #{$pageId}: {$errDetails}<br>Local record remains in Draft status.";
                 $messageType = 'warning';
+                recordUserLog('Shopify Push Failed', $result['title'], "Push of page #{$pageId} to {$shopCfg['name']} failed. Details: {$errDetails}", 'page', $pageId, 'error');
             }
         }
     }
 }
 
-// D. BULK APPROVE & PUSH TO SHOPIFY
+// E. BULK APPROVE & PUSH TO SHOPIFY API (Calls live Shopify API, writes handle + SEO metafields, updates status ONLY on success)
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
-    if ($db) {
-        $stmt = $db->prepare("
-            UPDATE shopify_pages 
-            SET status = 'published', 
-                last_pushed_at = NOW(), 
-                updated_by = :user 
-            WHERE store_key = :store AND status = 'draft'
-        ");
-        $stmt->execute([':user' => $currentUser, ':store' => $activeStore]);
-        $count = $stmt->rowCount();
-        $message = "Bulk approved & marked {$count} page draft(s) as published for {$shopCfg['name']}. (Note: actual SEO metafield push still requires individual Push or a future bulk API loop.)";
+    @set_time_limit(600);
+    @ini_set('max_execution_time', '600');
+
+    try {
+        if ($db) {
+            $draftStmt = $db->prepare("SELECT * FROM shopify_pages WHERE store_key = :store AND status = 'draft'");
+            $draftStmt->execute([':store' => $activeStore]);
+            $drafts = $draftStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $successCount = 0;
+            $failures     = [];
+
+            foreach ($drafts as $draftPg) {
+                $result = pushPageSeoToShopify($db, $shopCfg, $activeStore, $draftPg, $currentUser);
+                if ($result['success']) {
+                    $successCount++;
+                } else {
+                    $errStr = !empty($result['errors']) ? implode(', ', $result['errors']) : ($result['error'] ?? "HTTP {$result['http_code']}");
+                    $failures[] = ($draftPg['handle'] ?: ($draftPg['title'] ?: "Page #{$draftPg['id']}")) . " ({$errStr})";
+                }
+                usleep(50000); // 50ms throttle
+            }
+
+            $failCount = count($failures);
+            $total     = count($drafts);
+
+            if ($total === 0) {
+                $message = "No draft pages to push for {$shopCfg['name']}.";
+                $messageType = 'info';
+            } elseif ($failCount === 0) {
+                $message = "✅ Bulk push complete: <strong>{$successCount}</strong> of <strong>{$total}</strong> draft pages pushed live to Shopify ({$shopCfg['name']}) successfully. Handle + global title_tag + description_tag updated.";
+                $messageType = 'success';
+            } else {
+                $failList = htmlspecialchars(implode('; ', array_slice($failures, 0, 5)));
+                $more     = $failCount > 5 ? ' and ' . ($failCount - 5) . ' more' : '';
+                $message  = "⚠️ Bulk push finished with errors: <strong>{$successCount}</strong> succeeded, <strong>{$failCount}</strong> failed out of {$total}. Failed pages remain as drafts for review: {$failList}{$more}.";
+                $messageType = 'warning';
+            }
+
+            recordUserLog(
+                'Bulk Push to Shopify',
+                'Pages Manager',
+                "Bulk pushed {$successCount}/{$total} draft pages to {$shopCfg['name']} live API. Failures: {$failCount}.",
+                'page',
+                null,
+                $failCount === 0 ? 'success' : 'warning'
+            );
+        }
+    } catch (Throwable $e) {
+        $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());
+        $messageType = 'danger';
     }
 }
 
@@ -1151,23 +1436,40 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
         
         <div class="col-sm-6 text-right mt-2 mt-sm-0 d-flex align-items-center justify-content-sm-end gap-2 flex-wrap">
-          <!-- 1. EXPORT DROPDOWN (EXPORTS ALL PAGES FROM DATABASE) -->
+          <!-- 1. EXPORT DROPDOWN (SEO CSV & FULL DATABASE EXPORT) -->
           <div class="dropdown d-inline mr-1">
             <button class="btn btn-outline-secondary dropdown-toggle font-weight-bold px-3 shadow-sm bg-white" type="button" id="exportDropdown" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false" style="color: #003087; border-color: #d1d5db;">
-              <i class="fas fa-file-export mr-1 text-primary"></i> Export All
+              <i class="fas fa-file-export mr-1 text-primary"></i> Export
             </button>
             <div class="dropdown-menu dropdown-menu-right shadow border-0" aria-labelledby="exportDropdown" style="border-radius: 8px;">
-              <h6 class="dropdown-header font-weight-bold text-uppercase" style="font-size: 10px;">Database Pages Export</h6>
+              <h6 class="dropdown-header font-weight-bold text-uppercase" style="font-size: 10px;">Pages SEO Export</h6>
+              <form method="POST" class="d-block m-0 p-0">
+                <input type="hidden" name="action" value="export_pages">
+                <button type="submit" class="dropdown-item py-2" style="background: none; border: none; width: 100%; text-align: left;">
+                  <i class="fas fa-file-csv text-success mr-2"></i> Export SEO CSV (.csv)
+                </button>
+              </form>
+              <div class="dropdown-divider"></div>
+              <h6 class="dropdown-header font-weight-bold text-uppercase" style="font-size: 10px;">Full Database Export</h6>
               <a class="dropdown-item py-2" href="?store=<?php echo htmlspecialchars($storeKey); ?>&export=csv">
-                <i class="fas fa-file-csv text-success mr-2"></i> Export All to CSV (.csv)
+                <i class="fas fa-table text-primary mr-2"></i> Full Catalog CSV (.csv)
               </a>
               <a class="dropdown-item py-2" href="?store=<?php echo htmlspecialchars($storeKey); ?>&export=json">
-                <i class="fas fa-file-code text-info mr-2"></i> Export All to JSON (.json)
+                <i class="fas fa-file-code text-info mr-2"></i> Full Catalog JSON (.json)
               </a>
             </div>
           </div>
 
-          <!-- 2. FUNCTIONAL GRAPHQL CURSOR SYNC BUTTON -->
+          <!-- 2. IMPORT CSV BUTTON (MATCHES BLOGS & PRODUCTS) -->
+          <form method="POST" enctype="multipart/form-data" class="d-inline mr-1">
+            <input type="hidden" name="action" value="import_pages">
+            <label class="btn btn-outline-secondary font-weight-bold px-3 shadow-sm bg-white mb-0" style="color: #003087; border-color: #d1d5db; cursor: pointer;" title="Import page SEO titles and meta descriptions from CSV">
+              <i class="fas fa-file-import mr-1 text-primary"></i> Import
+              <input type="file" name="pages_csv" accept=".csv,text/csv" class="d-none" onchange="this.form.submit()">
+            </label>
+          </form>
+
+          <!-- 3. FUNCTIONAL GRAPHQL CURSOR SYNC BUTTON -->
           <form method="POST" class="d-inline mr-1" id="syncForm">
             <input type="hidden" name="action" value="sync">
             <button type="submit" id="btnSyncPages" class="btn btn-warning font-weight-bold px-3 shadow-sm" style="background-color: #FFCC00; border-color: #E6B800; color: #002277;" title="Synchronously fetch all pages via GraphQL cursor pagination (first: 250, after: $cursor)">
@@ -1175,11 +1477,11 @@ include __DIR__ . '/../includes/sidebar.php';
             </button>
           </form>
 
-          <!-- 3. BULK APPROVE & PUSH BUTTON -->
+          <!-- 4. BULK PUSH BUTTON (PUSHES LIVE TO SHOPIFY API) -->
           <form method="POST" class="d-inline">
             <input type="hidden" name="action" value="bulk_push">
-            <button type="submit" class="btn btn-success font-weight-bold px-3 shadow-sm" onclick="return confirm('Mark all <?php echo $draftCount; ?> pending page drafts as published?');">
-              <i class="fas fa-check-double mr-1"></i> Bulk Approve & Push
+            <button type="submit" class="btn btn-success font-weight-bold px-3 shadow-sm" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk push draft pages live to Shopify API (writes handle & SEO metafields)">
+              <i class="fas fa-check-double mr-1"></i> Bulk Push (<?php echo $draftCount; ?>)
             </button>
           </form>
         </div>

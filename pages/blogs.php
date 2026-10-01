@@ -48,109 +48,118 @@ $messageType = 'success';
 /**
  * Returns the best .myshopify.com domain for Admin API calls.
  */
-function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
-{
-    if (!empty($shopCfg['url'])) {
-        return $shopCfg['url'];
+if (!function_exists('getShopifyAdminDomain')) {
+    function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
+    {
+        if (!empty($shopCfg['url'])) {
+            return $shopCfg['url'];
+        }
+        if (!empty($shopCfg['fallback_url'])) {
+            return $shopCfg['fallback_url'];
+        }
+        return ($activeStore === 'business')
+            ? 'uratex-business.myshopify.com'
+            : 'uratex-philippines.myshopify.com';
     }
-    if (!empty($shopCfg['fallback_url'])) {
-        return $shopCfg['fallback_url'];
-    }
-    return ($activeStore === 'business')
-        ? 'uratex-business.myshopify.com'
-        : 'uratex-philippines.myshopify.com';
 }
 
 /**
  * Map Shopify article publish state to portal status.
  */
-function mapArticleStatus(?string $publishedAt): string
-{
-    return (!empty($publishedAt)) ? 'published' : 'draft';
+if (!function_exists('mapArticleStatus')) {
+    function mapArticleStatus(?string $publishedAt): string
+    {
+        return (!empty($publishedAt)) ? 'published' : 'draft';
+    }
 }
 
 /**
  * Minimal cURL wrapper for the Shopify Admin API.
  * Always returns [httpCode, responseBody].
  */
-function shopifySeoApiRequest(string $method, string $url, string $token, ?array $payload = null): array
-{
-    $ch   = curl_init($url);
-    $opts = [
-        CURLOPT_CUSTOMREQUEST  => $method,
-        CURLOPT_HTTPHEADER     => [
-            "X-Shopify-Access-Token: {$token}",
-            "Content-Type: application/json"
-        ],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 20,
-    ];
-    if ($payload !== null) {
-        $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
-    }
-    curl_setopt_array($ch, $opts);
-    $res  = curl_exec($ch);
-    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err  = curl_error($ch);
-    curl_close($ch);
+if (!function_exists('shopifySeoApiRequest')) {
+    function shopifySeoApiRequest(string $method, string $url, string $token, ?array $payload = null): array
+    {
+        $ch   = curl_init($url);
+        $opts = [
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => [
+                "X-Shopify-Access-Token: {$token}",
+                "Content-Type: application/json"
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TIMEOUT        => 20,
+        ];
+        if ($payload !== null) {
+            $opts[CURLOPT_POSTFIELDS] = json_encode($payload);
+        }
+        curl_setopt_array($ch, $opts);
+        $res  = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
 
-    if ($res === false && $err) {
-        return [$code ?: 0, json_encode(['error' => $err])];
+        if ($res === false && $err) {
+            return [$code ?: 0, json_encode(['error' => $err])];
+        }
+        return [$code, (string)$res];
     }
-    return [$code, (string)$res];
 }
 
 /**
- * Create or update the "global" title_tag / description_tag metafield for an article.
+ * Create or update the "global" title_tag / description_tag metafield.
  *
  * Shopify's top-level shorthand only writes the metafield the first time.
  * Once it exists, we must look it up by ID and PUT the update.
  */
-function upsertGlobalSeoMetafield(
-    string $adminDomain,
-    string $version,
-    string $token,
-    int $ownerId,
-    string $key,
-    string $type,
-    string $value
-): array {
-    $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
-             . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]=article"
-             . "&namespace=global&key={$key}";
-    [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
+if (!function_exists('upsertGlobalSeoMetafield')) {
+    function upsertGlobalSeoMetafield(
+        string $adminDomain,
+        string $version,
+        string $token,
+        int $ownerId,
+        string $key,
+        string $type,
+        string $value,
+        string $ownerResource = 'article'
+    ): array {
+        $listUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json"
+                 . "?metafield[owner_id]={$ownerId}&metafield[owner_resource]={$ownerResource}"
+                 . "&namespace=global&key={$key}";
+        [$code, $res] = shopifySeoApiRequest('GET', $listUrl, $token);
 
-    $existingId = null;
-    if ($code >= 200 && $code < 300) {
-        $data = json_decode($res, true);
-        if (!empty($data['metafields'][0]['id'])) {
-            $existingId = (int)$data['metafields'][0]['id'];
+        $existingId = null;
+        if ($code >= 200 && $code < 300) {
+            $data = json_decode((string)$res, true);
+            if (!empty($data['metafields'][0]['id'])) {
+                $existingId = (int)$data['metafields'][0]['id'];
+            }
         }
-    }
 
-    if ($existingId) {
-        $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
-        return shopifySeoApiRequest('PUT', $putUrl, $token, [
+        if ($existingId) {
+            $putUrl = "https://{$adminDomain}/admin/api/{$version}/metafields/{$existingId}.json";
+            return shopifySeoApiRequest('PUT', $putUrl, $token, [
+                'metafield' => [
+                    'id'    => $existingId,
+                    'value' => $value,
+                    'type'  => $type
+                ]
+            ]);
+        }
+
+        $postUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json";
+        return shopifySeoApiRequest('POST', $postUrl, $token, [
             'metafield' => [
-                'id'    => $existingId,
-                'value' => $value,
-                'type'  => $type
+                'namespace'      => 'global',
+                'key'            => $key,
+                'value'          => $value,
+                'type'           => $type,
+                'owner_id'       => $ownerId,
+                'owner_resource' => $ownerResource
             ]
         ]);
     }
-
-    $postUrl = "https://{$adminDomain}/admin/api/{$version}/metafields.json";
-    return shopifySeoApiRequest('POST', $postUrl, $token, [
-        'metafield' => [
-            'namespace'      => 'global',
-            'key'            => $key,
-            'value'          => $value,
-            'type'           => $type,
-            'owner_id'       => $ownerId,
-            'owner_resource' => 'article'
-        ]
-    ]);
 }
 
 /**
@@ -186,6 +195,129 @@ function truncateForMessage(?string $text, int $max = 400): string
         return $text;
     }
     return mb_substr($text, 0, $max) . '…';
+}
+
+/**
+ * Push a single article's SEO fields (handle, global title_tag/description_tag metafields)
+ * to Shopify and persist the result locally. Used by both individual and bulk push.
+ */
+function pushArticleSeoToShopify(
+    PDO $db,
+    array $shopCfg,
+    string $activeStore,
+    array $art,
+    string $currentUser,
+    ?string $title = null,
+    ?string $metaDescription = null,
+    ?string $handle = null
+): array {
+    $blogId      = (int)$art['id'];
+    $shopifyAid  = (int)($art['shopify_article_id'] ?? 0);
+    $shopifyBid  = (int)($art['shopify_blog_id'] ?? 0);
+    $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
+    $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+    $token       = $shopCfg['access_token'] ?? '';
+    $finalTitle  = ($title !== null && $title !== '') ? $title : ($art['title'] ?? '');
+    $finalMeta   = ($metaDescription !== null && $metaDescription !== '') ? $metaDescription : ($art['meta_description'] ?? '');
+    $finalHandle = ($handle !== null && $handle !== '') ? $handle : ($art['handle'] ?? '');
+
+    if (empty($token)) {
+        return ['success' => false, 'http_code' => 0, 'error' => 'Missing access token for active store', 'title' => $finalTitle, 'id' => $blogId];
+    }
+    if ($shopifyBid <= 0) {
+        return ['success' => false, 'http_code' => 0, 'error' => 'Missing shopify_blog_id (re-sync articles)', 'title' => $finalTitle, 'id' => $blogId];
+    }
+    if ($shopifyAid <= 0) {
+        return ['success' => false, 'http_code' => 0, 'error' => 'Missing shopify_article_id (re-sync articles)', 'title' => $finalTitle, 'id' => $blogId];
+    }
+
+    // 1. Update only the handle on the article resource. Real article title stays intact.
+    $putUrl = "https://{$adminDomain}/admin/api/{$version}/blogs/{$shopifyBid}/articles/{$shopifyAid}.json";
+    $payload = [
+        'article' => [
+            'id'     => $shopifyAid,
+            'handle' => $finalHandle,
+        ]
+    ];
+    [$articleCode, $articleRes] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
+
+    // 2. Upsert the real SEO metafields (title_tag and description_tag)
+    [$titleTagCode, $titleTagRes] = upsertGlobalSeoMetafield(
+        $adminDomain, $version, $token, $shopifyAid,
+        'title_tag', 'single_line_text_field', $finalTitle, 'article'
+    );
+    [$descTagCode, $descTagRes] = upsertGlobalSeoMetafield(
+        $adminDomain, $version, $token, $shopifyAid,
+        'description_tag', 'single_line_text_field', $finalMeta, 'article'
+    );
+
+    $articleOk  = ($articleCode >= 200 && $articleCode < 300);
+    $titleTagOk = ($titleTagCode >= 200 && $titleTagCode < 300);
+    $descTagOk  = ($descTagCode >= 200 && $descTagCode < 300);
+    $success    = ($articleOk && $titleTagOk && $descTagOk);
+
+    // Calculate SEO health score
+    $score = (int)($art['seo_score'] ?? 85);
+    if (function_exists('calculateSeoHealth')) {
+        $health = calculateSeoHealth($finalTitle, $finalMeta, $finalHandle);
+        $score = $health['score'] ?? $score;
+    }
+
+    // ONLY mark status as 'published' and set last_pushed_at if Shopify actually accepted the writes!
+    // If it failed, keep the record as draft so users can still filter for outstanding drafts.
+    if ($success) {
+        $upStmt = $db->prepare("
+            UPDATE shopify_blogs
+            SET title = :title,
+                meta_description = :meta_desc,
+                handle = :handle,
+                status = 'published',
+                seo_score = :score,
+                last_pushed_at = NOW(),
+                updated_by = :user
+            WHERE id = :id
+        ");
+        $upStmt->execute([
+            ':title'     => $finalTitle,
+            ':meta_desc' => $finalMeta,
+            ':handle'    => $finalHandle,
+            ':score'     => $score,
+            ':user'      => $currentUser,
+            ':id'        => $blogId
+        ]);
+    } else {
+        $upStmt = $db->prepare("
+            UPDATE shopify_blogs
+            SET title = :title,
+                meta_description = :meta_desc,
+                handle = :handle,
+                seo_score = :score,
+                updated_by = :user
+            WHERE id = :id
+        ");
+        $upStmt->execute([
+            ':title'     => $finalTitle,
+            ':meta_desc' => $finalMeta,
+            ':handle'    => $finalHandle,
+            ':score'     => $score,
+            ':user'      => $currentUser,
+            ':id'        => $blogId
+        ]);
+    }
+
+    $errors = [];
+    if (!$articleOk)  $errors[] = "Handle HTTP {$articleCode}: " . truncateForMessage($articleRes);
+    if (!$titleTagOk) $errors[] = "title_tag HTTP {$titleTagCode}: " . truncateForMessage($titleTagRes);
+    if (!$descTagOk)  $errors[] = "description_tag HTTP {$descTagCode}: " . truncateForMessage($descTagRes);
+
+    return [
+        'success'    => $success,
+        'http_code'  => $articleCode,
+        'title'      => $finalTitle,
+        'id'         => $blogId,
+        'shopify_id' => $shopifyAid,
+        'errors'     => $errors
+    ];
 }
 
 // -----------------------------------------------------------------------------
@@ -1060,7 +1192,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'save_draft') {
     }
 }
 
-// E. PUSH TO SHOPIFY  (FIXED – does NOT overwrite real article title)
+// E. PUSH TO SHOPIFY (Writes handle + SEO metafields; ties published status ONLY to actual success)
 if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
     try {
         $blogId          = (int)($_POST['blog_id'] ?? 0);
@@ -1078,106 +1210,27 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
             if (!$art) {
                 $message = "ERROR: Article #{$blogId} not found for the active store.";
             } else {
-                $shopifyAid  = (int)$art['shopify_article_id'];
-                $shopifyBid  = (int)($art['shopify_blog_id'] ?? 0);
-                $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
-                $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
-                $token       = $shopCfg['access_token'] ?? '';
-                $finalTitle  = $title !== '' ? $title : ($art['title'] ?? '');
-                $finalMeta   = $metaDescription !== '' ? $metaDescription : ($art['meta_description'] ?? '');
-                $finalHandle = $handle !== '' ? $handle : ($art['handle'] ?? '');
+                $result = pushArticleSeoToShopify($db, $shopCfg, $activeStore, $art, $currentUser, $title, $metaDescription, $handle);
 
-                if (empty($token)) {
-                    throw new Exception('Access token is empty for the active store.');
-                }
-                if ($shopifyBid <= 0) {
-                    throw new Exception('Missing shopify_blog_id for this article. Please re-sync articles so the blog ID is populated.');
-                }
-                if ($shopifyAid <= 0) {
-                    throw new Exception('Missing shopify_article_id for this article. Please re-sync.');
-                }
-
-                // ---------------------------------------------------------------
-                // 1. Update only the handle on the article resource.
-                //    NEVER write the SEO title into the real article title field.
-                //    The visible blog-post title stays exactly as it is in Shopify.
-                // ---------------------------------------------------------------
-                $putUrl = "https://{$adminDomain}/admin/api/{$version}/blogs/{$shopifyBid}/articles/{$shopifyAid}.json";
-                $payload = [
-                    'article' => [
-                        'id'     => $shopifyAid,
-                        'handle' => $finalHandle,
-                    ]
-                ];
-
-                [$articleCode, $articleRes] = shopifySeoApiRequest('PUT', $putUrl, $token, $payload);
-
-                // ---------------------------------------------------------------
-                // 2. Upsert the real SEO metafields (these drive <title> and meta description)
-                // ---------------------------------------------------------------
-                [$titleTagCode, $titleTagRes] = upsertGlobalSeoMetafield(
-                    $adminDomain, $version, $token, $shopifyAid,
-                    'title_tag', 'single_line_text_field', $finalTitle
-                );
-                [$descTagCode, $descTagRes] = upsertGlobalSeoMetafield(
-                    $adminDomain, $version, $token, $shopifyAid,
-                    'description_tag', 'single_line_text_field', $finalMeta
-                );
-
-                $articleOk  = ($articleCode >= 200 && $articleCode < 300);
-                $titleTagOk = ($titleTagCode >= 200 && $titleTagCode < 300);
-                $descTagOk  = ($descTagCode >= 200 && $descTagCode < 300);
-
-                // Always persist local changes so the portal stays in sync with what the user just edited
-                $upStmt = $db->prepare("
-                    UPDATE shopify_blogs
-                    SET title = :title,
-                        meta_description = :meta_desc,
-                        handle = :handle,
-                        status = 'published',
-                        last_pushed_at = NOW(),
-                        updated_by = :user
-                    WHERE id = :id
-                ");
-                $upStmt->execute([
-                    ':title'     => $finalTitle,
-                    ':meta_desc' => $finalMeta,
-                    ':handle'    => $finalHandle,
-                    ':user'      => $currentUser,
-                    ':id'        => $blogId
-                ]);
-
-                // Build a clear, actionable message
-                if ($articleOk && $titleTagOk && $descTagOk) {
+                if ($result['success']) {
                     $message = "✅ Live SEO update pushed to Shopify store ({$shopCfg['name']}) successfully!<br>"
                              . "Handle + global title_tag + description_tag updated for article #{$blogId}.";
                     recordUserLog(
                         'Shopify Push',
-                        $finalTitle,
-                        "Pushed article #{$blogId} live to {$shopCfg['name']} (Shopify article ID: {$shopifyAid}). Handle and SEO metafields updated. Real article title left unchanged.",
+                        $result['title'],
+                        "Pushed article #{$blogId} live to {$shopCfg['name']} (Shopify article ID: {$art['shopify_article_id']}). Handle and SEO metafields updated. Real article title left unchanged.",
                         'article',
                         $blogId,
                         'success'
                     );
                 } else {
-                    $parts = [];
-                    if (!$articleOk) {
-                        $parts[] = "Article handle update HTTP {$articleCode}: " . htmlspecialchars(truncateForMessage($articleRes));
-                    }
-                    if (!$titleTagOk) {
-                        $parts[] = "title_tag metafield HTTP {$titleTagCode}: " . htmlspecialchars(truncateForMessage($titleTagRes));
-                    }
-                    if (!$descTagOk) {
-                        $parts[] = "description_tag metafield HTTP {$descTagCode}: " . htmlspecialchars(truncateForMessage($descTagRes));
-                    }
-                    $message = "⚠️ Local draft updated, but one or more Shopify calls failed:<br><ul><li>"
-                             . implode('</li><li>', $parts)
-                             . "</li></ul>"
-                             . "Please verify the values on Shopify or re-sync and try again.";
+                    $errDetails = !empty($result['errors']) ? implode('<br>', $result['errors']) : ($result['error'] ?? "HTTP {$result['http_code']}");
+                    $message = "⚠️ Shopify push failed for article #{$blogId}: {$errDetails}<br>"
+                             . "Local draft kept as draft so you can retry or verify Shopify settings.";
                     recordUserLog(
                         'Shopify Push Partial/Failed',
-                        $finalTitle,
-                        "Partial or failed push of article #{$blogId} to {$shopCfg['name']}. Details: " . implode(' | ', $parts),
+                        $result['title'],
+                        "Failed push of article #{$blogId} to {$shopCfg['name']}. Details: {$errDetails}",
                         'article',
                         $blogId,
                         'error'
@@ -1191,25 +1244,53 @@ if (isset($_POST['action']) && $_POST['action'] === 'push_shopify') {
     }
 }
 
-// F. BULK APPROVE & PUSH (still local-only – real multi-article push can be added later)
+// F. BULK APPROVE & PUSH TO SHOPIFY API (Calls live Shopify API, writes handle + SEO metafields, updates status ONLY on success)
 if (isset($_POST['action']) && $_POST['action'] === 'bulk_push') {
+    @set_time_limit(600);
+    @ini_set('max_execution_time', '600');
+
     try {
         if ($db) {
-            $bStmt = $db->prepare("
-                UPDATE shopify_blogs
-                SET status = 'published',
-                    last_pushed_at = NOW(),
-                    updated_by = :user
-                WHERE store_key = :store AND status = 'draft'
-            ");
-            $bStmt->execute([
-                ':user'  => $currentUser,
-                ':store' => $activeStore
-            ]);
-            $affected = $bStmt->rowCount();
-            $message  = "Bulk approved & marked published {$affected} draft article(s) for {$shopCfg['name']} (local status only). "
-                      . "Use individual Push to Shopify to write handle + SEO metafields live.";
-            recordUserLog('Bulk Approve & Push', 'Blogs & Articles', "Bulk approved & published {$affected} draft article(s) for {$shopCfg['name']} (store: {$activeStore}). Local only.", 'article', null, 'success');
+            $draftStmt = $db->prepare("SELECT * FROM shopify_blogs WHERE store_key = :store AND status = 'draft'");
+            $draftStmt->execute([':store' => $activeStore]);
+            $drafts = $draftStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $successCount = 0;
+            $failures     = [];
+
+            foreach ($drafts as $draftArt) {
+                $result = pushArticleSeoToShopify($db, $shopCfg, $activeStore, $draftArt, $currentUser);
+                if ($result['success']) {
+                    $successCount++;
+                } else {
+                    $errStr = !empty($result['errors']) ? implode(', ', $result['errors']) : ($result['error'] ?? "HTTP {$result['http_code']}");
+                    $failures[] = ($draftArt['handle'] ?: ($draftArt['title'] ?: "Article #{$draftArt['id']}")) . " ({$errStr})";
+                }
+                // Small throttle to stay well within Shopify REST API rate limits
+                usleep(50000);
+            }
+
+            $failCount = count($failures);
+            $total     = count($drafts);
+
+            if ($total === 0) {
+                $message = "No draft articles to push for {$shopCfg['name']}.";
+            } elseif ($failCount === 0) {
+                $message = "✅ Bulk push complete: <strong>{$successCount}</strong> of <strong>{$total}</strong> draft articles pushed live to Shopify ({$shopCfg['name']}) successfully. Handle + global title_tag + description_tag updated.";
+            } else {
+                $failList = htmlspecialchars(implode('; ', array_slice($failures, 0, 5)));
+                $more     = $failCount > 5 ? ' and ' . ($failCount - 5) . ' more' : '';
+                $message  = "⚠️ Bulk push finished with errors: <strong>{$successCount}</strong> succeeded, <strong>{$failCount}</strong> failed out of {$total}. Failed articles remain as drafts for review: {$failList}{$more}.";
+            }
+
+            recordUserLog(
+                'Bulk Push to Shopify',
+                'Blogs & Articles',
+                "Bulk pushed {$successCount}/{$total} draft articles to {$shopCfg['name']} live API. Failures: {$failCount}.",
+                'article',
+                null,
+                $failCount === 0 ? 'success' : 'warning'
+            );
         }
     } catch (Throwable $e) {
         $message = "ERROR: Bulk push failed – " . htmlspecialchars($e->getMessage());
@@ -1357,7 +1438,7 @@ include __DIR__ . '/../includes/sidebar.php';
                     </form>
                     <form method="POST" class="mb-1">
                       <input type="hidden" name="action" value="bulk_push">
-                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk mark drafts as published (local only)"><i class="fas fa-check-double mr-1"></i>Bulk Push (<?php echo $draftCount; ?>)</button>
+                      <button type="submit" class="btn btn-sm btn-success font-weight-bold" <?php echo $draftCount === 0 ? 'disabled' : ''; ?> title="Bulk push drafts live to Shopify API (writes handle & SEO metafields)"><i class="fas fa-check-double mr-1"></i>Bulk Push (<?php echo $draftCount; ?>)</button>
                     </form>
                   </div>
                 </div>

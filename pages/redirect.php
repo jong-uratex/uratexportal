@@ -35,17 +35,19 @@ $message     = '';
 /**
  * Returns the best .myshopify.com domain for Admin API calls.
  */
-function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
-{
-    if (!empty($shopCfg['url'])) {
-        return $shopCfg['url'];
+if (!function_exists('getShopifyAdminDomain')) {
+    function getShopifyAdminDomain(array $shopCfg, string $activeStore): string
+    {
+        if (!empty($shopCfg['url'])) {
+            return $shopCfg['url'];
+        }
+        if (!empty($shopCfg['fallback_url'])) {
+            return $shopCfg['fallback_url'];
+        }
+        return ($activeStore === 'business')
+            ? 'uratex-business.myshopify.com'
+            : 'uratex-philippines.myshopify.com';
     }
-    if (!empty($shopCfg['fallback_url'])) {
-        return $shopCfg['fallback_url'];
-    }
-    return ($activeStore === 'business')
-        ? 'uratex-business.myshopify.com'
-        : 'uratex-philippines.myshopify.com';
 }
 
 /**
@@ -750,6 +752,155 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete_redirect') {
     }
 }
 
+// F. EXPORT / IMPORT REDIRECTS (CSV like blogs.php)
+if (isset($_POST['action']) && $_POST['action'] === 'export_redirects') {
+    if (!$db) {
+        exit('Database connection unavailable.');
+    }
+    $exportStmt = $db->prepare('SELECT `path`, `target` FROM shopify_redirects WHERE store_key = :store ORDER BY id ASC');
+    $exportStmt->execute([':store' => $activeStore]);
+
+    $filename = 'uratex_redirects_' . $activeStore . '_' . date('Y-m-d_His') . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    $output = fopen('php://output', 'w');
+    fputcsv($output, ['Redirect From (Path)', 'Redirect To (Target)']);
+
+    while ($r = $exportStmt->fetch(PDO::FETCH_ASSOC)) {
+        fputcsv($output, [$r['path'], $r['target']]);
+    }
+    fclose($output);
+    exit;
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'import_redirects') {
+    @set_time_limit(300);
+    @ini_set('max_execution_time', '300');
+    $importedCount = 0;
+    $updatedCount  = 0;
+    $skippedCount  = 0;
+    $errors        = [];
+
+    if (!$db || empty($_FILES['redirects_csv']['tmp_name']) || $_FILES['redirects_csv']['error'] !== UPLOAD_ERR_OK) {
+        $message = 'ERROR: Please choose a valid redirects CSV file to import.';
+    } else {
+        $handle  = fopen($_FILES['redirects_csv']['tmp_name'], 'r');
+        $headers = $handle ? fgetcsv($handle) : false;
+        $headerMap = $headers ? array_flip(array_map('trim', $headers)) : [];
+
+        $pathCol = null;
+        if (isset($headerMap['Redirect From (Path)'])) $pathCol = 'Redirect From (Path)';
+        elseif (isset($headerMap['From URL'])) $pathCol = 'From URL';
+        elseif (isset($headerMap['Path'])) $pathCol = 'Path';
+        elseif (isset($headerMap['Redirect From'])) $pathCol = 'Redirect From';
+        elseif (isset($headerMap['From'])) $pathCol = 'From';
+
+        $targetCol = null;
+        if (isset($headerMap['Redirect To (Target)'])) $targetCol = 'Redirect To (Target)';
+        elseif (isset($headerMap['To URL'])) $targetCol = 'To URL';
+        elseif (isset($headerMap['Target'])) $targetCol = 'Target';
+        elseif (isset($headerMap['Redirect To'])) $targetCol = 'Redirect To';
+        elseif (isset($headerMap['To'])) $targetCol = 'To';
+
+        if (!$handle || !$pathCol || !$targetCol) {
+            $message = 'ERROR: The CSV must include "Redirect From (Path)" and "Redirect To (Target)" columns.';
+            if ($handle) fclose($handle);
+        } else {
+            $adminDomain = getShopifyAdminDomain($shopCfg, $activeStore);
+            $version     = !empty($shopCfg['version']) ? $shopCfg['version'] : '2025-10';
+            $token       = $shopCfg['access_token'] ?? '';
+
+            while (($row = fgetcsv($handle)) !== false) {
+                $rawPath   = trim($row[$headerMap[$pathCol]] ?? '');
+                $rawTarget = trim($row[$headerMap[$targetCol]] ?? '');
+
+                if ($rawPath === '' || $rawTarget === '') {
+                    $skippedCount++;
+                    continue;
+                }
+
+                $path   = normaliseRedirectPath($rawPath);
+                $target = $rawTarget;
+
+                if (!isValidRedirectTarget($target)) {
+                    $skippedCount++;
+                    $errors[] = "Invalid target URL: {$rawTarget}";
+                    continue;
+                }
+
+                // Check if redirect path already exists in database
+                $chkStmt = $db->prepare("SELECT * FROM shopify_redirects WHERE store_key = :store AND `path` = :path LIMIT 1");
+                $chkStmt->execute([':store' => $activeStore, ':path' => $path]);
+                $existing = $chkStmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($existing && !empty($existing['shopify_redirect_id'])) {
+                    // Update existing redirect on Shopify
+                    $shopifyRid = (int)$existing['shopify_redirect_id'];
+                    $putUrl     = "https://{$adminDomain}/admin/api/{$version}/redirects/{$shopifyRid}.json";
+                    $payload    = json_encode(['redirect' => ['id' => $shopifyRid, 'path' => $path, 'target' => $target]]);
+
+                    $ch = curl_init($putUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_CUSTOMREQUEST  => 'PUT',
+                        CURLOPT_POSTFIELDS     => $payload,
+                        CURLOPT_HTTPHEADER     => [
+                            "X-Shopify-Access-Token: " . $token,
+                            "Content-Type: application/json"
+                        ],
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_SSL_VERIFYPEER => false,
+                        CURLOPT_TIMEOUT        => 15,
+                    ]);
+                    $res      = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+
+                    if ($httpCode >= 200 && $httpCode < 300) {
+                        $upStmt = $db->prepare("
+                            UPDATE shopify_redirects
+                            SET `target` = :target, last_pushed_at = NOW(), updated_by = :user
+                            WHERE id = :id
+                        ");
+                        $upStmt->execute([
+                            ':target' => $target,
+                            ':user'   => $currentUser,
+                            ':id'     => $existing['id']
+                        ]);
+                        $updatedCount++;
+                    } else {
+                        $errors[] = "Failed to update {$path}: HTTP {$httpCode}";
+                        $skippedCount++;
+                    }
+                } else {
+                    // Create new redirect on Shopify and save to DB
+                    try {
+                        createShopifyRedirect($db, $shopCfg, $activeStore, $currentUser, $path, $target);
+                        $importedCount++;
+                    } catch (Throwable $ex) {
+                        $errors[] = "Failed {$path}: " . $ex->getMessage();
+                        $skippedCount++;
+                    }
+                }
+                usleep(50000); // 50ms throttle
+            }
+            fclose($handle);
+
+            $totalProcessed = $importedCount + $updatedCount;
+            if ($totalProcessed > 0) {
+                $message = "✅ CSV Import complete for {$shopCfg['name']}: Created <strong>{$importedCount}</strong> new redirect(s), updated <strong>{$updatedCount}</strong> existing redirect(s).";
+                if ($skippedCount > 0) {
+                    $message .= " {$skippedCount} row(s) skipped or failed.";
+                }
+                recordUserLog('Redirect Import', 'URL Redirects', "Imported {$importedCount} new, updated {$updatedCount}, skipped {$skippedCount} redirects for {$shopCfg['name']}.", 'redirect', null, 'success');
+            } else {
+                $errSummary = !empty($errors) ? implode('; ', array_slice($errors, 0, 3)) : 'No valid redirect rows found.';
+                $message = "⚠️ No redirects were imported. {$errSummary}";
+                recordUserLog('Redirect Import Failed', 'URL Redirects', "Redirect import resulted in 0 records. {$errSummary}", 'redirect', null, 'warning');
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // PAGINATION & QUERY (20 per page, search path / target)
 // -----------------------------------------------------------------------------
@@ -873,6 +1024,24 @@ include __DIR__ . '/../includes/sidebar.php';
                     <input type="hidden" name="action" value="sync_redirects">
                     <button type="submit" id="btnSyncRedirects" class="btn btn-sm btn-warning btn-block font-weight-bold"><i class="fas fa-sync-alt mr-1" id="syncIcon"></i>Sync Now</button>
                   </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-file-csv text-success mr-1"></i>CSV Actions</div>
+                  <div class="small text-muted mb-2">Export or import redirects.</div>
+                  <div class="d-flex flex-wrap">
+                    <form method="POST" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="export_redirects">
+                      <button type="submit" class="btn btn-sm btn-outline-secondary font-weight-bold" title="Export redirects to CSV"><i class="fas fa-file-export mr-1"></i>Export</button>
+                    </form>
+                    <form method="POST" enctype="multipart/form-data" class="mr-1 mb-1">
+                      <input type="hidden" name="action" value="import_redirects">
+                      <label class="btn btn-sm btn-outline-secondary font-weight-bold mb-0" style="cursor: pointer;" title="Import redirects from CSV"><i class="fas fa-file-import mr-1"></i>Import<input type="file" name="redirects_csv" accept=".csv,text/csv" class="d-none" onchange="this.form.submit()"></label>
+                    </form>
+                  </div>
                 </div>
               </div>
             </div>
