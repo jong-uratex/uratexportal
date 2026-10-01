@@ -1308,6 +1308,11 @@ include __DIR__ . '/../includes/sidebar.php';
         <div class="col-sm-6">
           <h1 class="m-0 font-weight-bold" style="color: #003087;">Blogs & Articles SEO Module</h1>
           <p class="text-muted small mb-0">Optimize article titles, meta descriptions, and handles.</p>
+          <div class="mt-2">
+            <a href="content.php" class="btn btn-sm btn-success font-weight-bold shadow-sm">
+              <i class="fas fa-feather-alt mr-1"></i> Write New Article
+            </a>
+          </div>
         </div>
 
         <div class="col-sm-6">
@@ -1464,6 +1469,12 @@ include __DIR__ . '/../includes/sidebar.php';
                        title="Live View"
                        style="padding: 0.2rem 0.5rem; font-size: 0.75rem;">
                       <i class="fas fa-eye"></i> <span class="d-none d-md-inline ml-1">Live View</span>
+                    </a>
+                    <a href="content.php?edit_id=<?php echo $blogId; ?>"
+                       class="btn btn-sm btn-outline-primary shadow-sm flex-shrink-0 ml-1"
+                       title="Write / Edit Article Content"
+                       style="padding: 0.2rem 0.5rem; font-size: 0.75rem;">
+                      <i class="fas fa-edit"></i> <span class="d-none d-md-inline ml-1">Edit</span>
                     </a>
                   </div>
                   <div class="d-flex align-items-center flex-shrink-0">

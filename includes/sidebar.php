@@ -63,6 +63,12 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Blogs & Articles</p>
           </a>
         </li>
+        <li class="nav-item">
+          <a href="content.php" class="nav-link <?php echo ($currentScript === 'content.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-feather-alt text-warning"></i>
+            <p>Write & Publish</p>
+          </a>
+        </li>
         <?php if (($_SESSION['user_role'] ?? 'editor') === 'admin'): ?>
         <li class="nav-item">
           <a href="orders.php" class="nav-link <?php echo ($currentScript === 'orders.php') ? 'active' : ''; ?>">
