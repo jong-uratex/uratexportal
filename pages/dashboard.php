@@ -2,32 +2,277 @@
 require_once __DIR__ . '/../config/config.php';
 
 if (!isset($_SESSION['user_logged_in'])) {
-    header("Location: ../login.php");
+    header('Location: ../login.php');
     exit;
 }
 
+// --- Store switch (whitelist) ---
 if (isset($_GET['switch_store'])) {
-    setActiveStore($_GET['switch_store']);
-    recordUserLog('Switch Store', 'Active Store', "Switched active store to '{$_GET['switch_store']}' from Dashboard.", 'system', null, 'success');
-    header("Location: dashboard.php");
+    $allowedStores = ['retail', 'business'];
+    $requested = strtolower(trim($_GET['switch_store']));
+    if (in_array($requested, $allowedStores, true)) {
+        setActiveStore($requested);
+        recordUserLog(
+            'Switch Store',
+            'Active Store',
+            "Switched active store to '{$requested}' from Dashboard.",
+            'system',
+            null,
+            'success'
+        );
+    }
+    header('Location: dashboard.php');
     exit;
 }
 
-$lastTokenRenewedAt = null;
+// --- Single DB connection ---
 $db = getDbConnection();
+$activeStore = $_SESSION['active_store'] ?? 'business';
+
+// --- Last token renewal timestamp ---
+$lastTokenRenewedAt = null;
 if ($db) {
-  $tokenTimestampStmt = $db->query("SELECT MAX(`updated_at`) FROM `settings` WHERE `handle` IN ('retail_access_token', 'business_access_token')");
-  $lastTokenRenewedAt = $tokenTimestampStmt->fetchColumn() ?: null;
+    try {
+        $stmt = $db->query(
+            "SELECT MAX(`updated_at`) FROM `settings` 
+             WHERE `handle` IN ('retail_access_token', 'business_access_token')"
+        );
+        $lastTokenRenewedAt = $stmt->fetchColumn() ?: null;
+    } catch (Exception $e) {
+        // silent – non-critical
+    }
 }
 
+// --- SEO Health helper ---
+if (!function_exists('calculateSeoHealth')) {
+    function calculateSeoHealth(string $title, string $metaDescription, string $handle): array
+    {
+        $score  = 100;
+        $issues = [];
+
+        $tLen = mb_strlen(trim($title));
+        $dLen = mb_strlen(trim($metaDescription));
+        $h    = trim($handle);
+
+        if ($tLen === 0) {
+            $score -= 35;
+            $issues[] = 'Missing Page Title';
+        } elseif ($tLen < 35) {
+            $score -= 15;
+            $issues[] = 'Title too short';
+        } elseif ($tLen > 65) {
+            $score -= 10;
+            $issues[] = 'Title too long';
+        }
+
+        if ($dLen === 0) {
+            $score -= 35;
+            $issues[] = 'Missing Meta Description';
+        } elseif ($dLen < 90) {
+            $score -= 15;
+            $issues[] = 'Meta description too short';
+        } elseif ($dLen > 165) {
+            $score -= 10;
+            $issues[] = 'Meta description exceeds 160 chars';
+        }
+
+        if ($h === '') {
+            $score -= 15;
+            $issues[] = 'Missing URL Handle';
+        }
+
+        return [
+            'score'  => max(10, min(100, $score)),
+            'issues' => $issues,
+        ];
+    }
+}
+
+// --- Resource configuration ---
+$resourceTypes = [
+    'products' => [
+        'icon'        => 'fa-tag text-primary',
+        'name'        => 'Products',
+        'table'       => 'shopify_products',
+        'id_field'    => 'id',
+        'title_field' => 'title',
+        'meta_field'  => 'meta_description',
+        'handle_field'=> 'handle',
+        'module'      => 'products.php',
+        'item_label'  => 'Items',
+    ],
+    'collections' => [
+        'icon'        => 'fa-layer-group text-success',
+        'name'        => 'Collections',
+        'table'       => 'shopify_collections',
+        'id_field'    => 'id',
+        'title_field' => 'title',
+        'meta_field'  => 'meta_description',
+        'handle_field'=> 'handle',
+        'module'      => 'collections.php',
+        'item_label'  => 'Collections',
+    ],
+    'pages' => [
+        'icon'        => 'fa-file-alt text-warning',
+        'name'        => 'Pages',
+        'table'       => 'shopify_pages',
+        'id_field'    => 'id',
+        'title_field' => 'title',
+        'meta_field'  => 'meta_description',
+        'handle_field'=> 'handle',
+        'module'      => 'pages.php',
+        'item_label'  => 'Items',
+    ],
+    'blogs' => [
+        'icon'        => 'fa-newspaper text-danger',
+        'name'        => 'Blogs & Articles',
+        'table'       => 'shopify_blogs',
+        'id_field'    => 'id',
+        'title_field' => 'title',
+        'meta_field'  => 'meta_description',
+        'handle_field'=> 'handle',
+        'module'      => 'blogs.php',
+        'item_label'  => 'Articles',
+    ],
+];
+
+// --- Compute SEO stats once ---
+$seoData = []; // key => ['avg_score' => int, 'total' => int, 'drafts' => int, 'items_with_issues' => int, 'issues' => []]
+
+if ($db) {
+    foreach ($resourceTypes as $key => $resource) {
+        $table = $resource['table'];
+        $seoData[$key] = [
+            'avg_score'         => 100,
+            'total'             => 0,
+            'drafts'            => 0,
+            'items_with_issues' => 0,
+            'issues'            => [],
+        ];
+
+        try {
+            // Total count
+            $stmt = $db->prepare("SELECT COUNT(*) FROM `{$table}` WHERE store_key = :store");
+            $stmt->execute([':store' => $activeStore]);
+            $seoData[$key]['total'] = (int)$stmt->fetchColumn();
+
+            // Draft count
+            $stmt = $db->prepare("SELECT COUNT(*) FROM `{$table}` WHERE store_key = :store AND status = 'draft'");
+            $stmt->execute([':store' => $activeStore]);
+            $seoData[$key]['drafts'] = (int)$stmt->fetchColumn();
+
+            // Sample for SEO scoring (max 100 rows)
+            if ($seoData[$key]['total'] > 0) {
+                $stmt = $db->prepare(
+                    "SELECT `{$resource['title_field']}`, `{$resource['meta_field']}`, `{$resource['handle_field']}` 
+                     FROM `{$table}` WHERE store_key = :store LIMIT 100"
+                );
+                $stmt->execute([':store' => $activeStore]);
+                $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $scores = [];
+                $allIssues = [];
+                $withIssues = 0;
+
+                foreach ($items as $item) {
+                    $analysis = calculateSeoHealth(
+                        $item[$resource['title_field']] ?? '',
+                        $item[$resource['meta_field']]  ?? '',
+                        $item[$resource['handle_field']] ?? ''
+                    );
+                    $scores[] = $analysis['score'];
+
+                    if (!empty($analysis['issues'])) {
+                        $allIssues = array_merge($allIssues, $analysis['issues']);
+                        $withIssues++;
+                    }
+                }
+
+                $seoData[$key]['avg_score']         = !empty($scores) ? (int)round(array_sum($scores) / count($scores)) : 100;
+                $seoData[$key]['items_with_issues'] = $withIssues;
+                $seoData[$key]['issues']            = array_unique($allIssues);
+            }
+        } catch (Exception $e) {
+            // Table missing or query error – keep defaults
+        }
+    }
+}
+
+// --- Connection status checks ---
+$dbConnected = (bool)$db;
+
+$recaptchaConfigured = !empty(RECAPTCHA_SITE_KEY) && !empty(RECAPTCHA_SECRET_KEY);
+
+$shopifyRetailConnected   = false;
+$shopifyBusinessConnected = false;
+$retailError   = '';
+$businessError = '';
+
+/**
+ * Safe Shopify connectivity probe (SSL verified, short timeout)
+ */
+function probeShopify(string $url, string $token, string $version): array
+{
+    if (empty($url) || empty($token)) {
+        return ['ok' => false, 'error' => 'Not configured'];
+    }
+
+    $testUrl = 'https://' . $url . '/admin/api/' . $version . '/shop.json';
+    $ch = curl_init($testUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/json',
+            'X-Shopify-Access-Token: ' . $token,
+        ],
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_TIMEOUT        => 8,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_FAILONERROR    => false,
+    ]);
+
+    curl_exec($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($httpCode === 200) {
+        return ['ok' => true, 'error' => ''];
+    }
+
+    $error = $curlErr ?: "HTTP {$httpCode}";
+    return ['ok' => false, 'error' => $error];
+}
+
+if (!empty($shopConfig['retail']['url']) && !empty($shopConfig['retail']['access_token'])) {
+    $result = probeShopify(
+        $shopConfig['retail']['url'],
+        $shopConfig['retail']['access_token'],
+        $shopConfig['retail']['version'] ?? '2024-01'
+    );
+    $shopifyRetailConnected = $result['ok'];
+    $retailError            = $result['error'];
+}
+
+if (!empty($shopConfig['business']['url']) && !empty($shopConfig['business']['access_token'])) {
+    $result = probeShopify(
+        $shopConfig['business']['url'],
+        $shopConfig['business']['access_token'],
+        $shopConfig['business']['version'] ?? '2024-01'
+    );
+    $shopifyBusinessConnected = $result['ok'];
+    $businessError            = $result['error'];
+}
+
+// --- Page setup ---
 $pageTitle = 'Dashboard - SEO Health & Analytics';
 include __DIR__ . '/../includes/header.php';
 include __DIR__ . '/../includes/sidebar.php';
 ?>
 
-<!-- Content Wrapper. Contains page content -->
+<!-- Content Wrapper -->
 <div class="content-wrapper">
-  <!-- Content Header (Page header) -->
   <div class="content-header">
     <div class="container-fluid">
       <div class="row mb-2">
@@ -37,31 +282,39 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
         <div class="col-sm-6 text-right">
           <button type="button" id="renewTokenBtn" class="btn btn-warning text-dark font-weight-bold mr-2">
-            <i class="fas fa-key mr-1"></i> Renew Token<?php if ($lastTokenRenewedAt): ?>
-              <small class="d-block font-weight-normal">Last renewed: <?= htmlspecialchars((new DateTime($lastTokenRenewedAt, new DateTimeZone('UTC')))->setTimezone(new DateTimeZone('Asia/Manila'))->format('M j, Y g:i A'), ENT_QUOTES, 'UTF-8') ?></small>
+            <i class="fas fa-key mr-1"></i> Renew Token
+            <?php if ($lastTokenRenewedAt): ?>
+              <small class="d-block font-weight-normal">
+                Last renewed:
+                <?= htmlspecialchars(
+                    (new DateTime($lastTokenRenewedAt, new DateTimeZone('UTC')))
+                        ->setTimezone(new DateTimeZone('Asia/Manila'))
+                        ->format('M j, Y g:i A'),
+                    ENT_QUOTES,
+                    'UTF-8'
+                ) ?>
+              </small>
             <?php endif; ?>
           </button>
           <button type="button" class="btn btn-uratex-sync mr-2">
             <i class="fas fa-sync-alt mr-1"></i> Sync from Shopify
-          </button>
-          <button type="button" class="btn btn-success">
-            <i class="fas fa-check-double mr-1"></i> Bulk Approve & Push
           </button>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Main content -->
   <section class="content">
     <div class="container-fluid">
-      <!-- Alert Container for AJAX Responses -->
+
       <div id="dashboardAlertContainer"></div>
 
       <!-- API Connection Status -->
       <div class="card card-outline card-primary shadow-sm mb-4">
         <div class="card-header border-0">
-          <h3 class="card-title font-weight-bold"><i class="fas fa-server mr-2 text-primary"></i> API Connection Status</h3>
+          <h3 class="card-title font-weight-bold">
+            <i class="fas fa-server mr-2 text-primary"></i> API Connection Status
+          </h3>
           <div class="card-tools">
             <button type="button" class="btn btn-tool" data-card-widget="collapse"><i class="fas fa-minus"></i></button>
             <button type="button" class="btn btn-tool" data-card-widget="remove"><i class="fas fa-times"></i></button>
@@ -69,142 +322,79 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
         <div class="card-body">
           <div class="row">
-            <?php
-            // Check Database Connection
-            $dbConnected = false;
-            $db = getDbConnection();
-            if ($db) {
-                $dbConnected = true;
-            }
-            
-            // Check reCAPTCHA Configuration
-            $recaptchaConfigured = !empty(RECAPTCHA_SITE_KEY) && !empty(RECAPTCHA_SECRET_KEY);
-            
-            // Check Shopify Connections
-            $shopifyRetailConnected = false;
-            $shopifyBusinessConnected = false;
-            $retailError = '';
-            $businessError = '';
-            
-            // Test Retail connection
-            if (!empty($shopConfig['retail']['url']) && !empty($shopConfig['retail']['access_token'])) {
-                try {
-                    $testUrl = "https://" . $shopConfig['retail']['url'] . "/admin/api/" . $shopConfig['retail']['version'] . "/shop.json";
-                    $ch = curl_init($testUrl);
-                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                        "Content-Type: application/json",
-                        "X-Shopify-Access-Token: " . $shopConfig['retail']['access_token']
-                    ]);
-                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-                    curl_setopt($ch, CURLOPT_FAILONERROR, true);
-                    curl_exec($ch);
-                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                    curl_close($ch);
-                    $shopifyRetailConnected = ($httpCode === 200);
-                    if (!$shopifyRetailConnected) {
-                        $retailError = "HTTP $httpCode";
-                    }
-                } catch (Exception $e) {
-                    $retailError = "Connection failed";
-                }
-            }
-            
-            // Test Business connection
-            if (!empty($shopConfig['business']['url']) && !empty($shopConfig['business']['access_token'])) {
-                try {
-                    $testUrl = "https://" . $shopConfig['business']['url'] . "/admin/api/" . $shopConfig['business']['version'] . "/shop.json";
-                    $ch = curl_init($testUrl);
-                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                        "Content-Type: application/json",
-                        "X-Shopify-Access-Token: " . $shopConfig['business']['access_token']
-                    ]);
-                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-                    curl_setopt($ch, CURLOPT_FAILONERROR, true);
-                    curl_exec($ch);
-                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                    curl_close($ch);
-                    $shopifyBusinessConnected = ($httpCode === 200);
-                    if (!$shopifyBusinessConnected) {
-                        $businessError = "HTTP $httpCode";
-                    }
-                } catch (Exception $e) {
-                    $businessError = "Connection failed";
-                }
-            }
-            ?>
-            
-            <!-- Database Status -->
+
+            <!-- Database -->
             <div class="col-12 col-sm-6 col-md-3 mb-3">
-              <div class="small-box <?php echo $dbConnected ? 'bg-success' : 'bg-danger'; ?>">
+              <div class="small-box <?= $dbConnected ? 'bg-success' : 'bg-danger' ?>">
                 <div class="inner">
-                  <h3><i class="fas <?php echo $dbConnected ? 'fa-database' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <h3><i class="fas <?= $dbConnected ? 'fa-database' : 'fa-exclamation-triangle' ?>"></i></h3>
                   <p>Database Connection</p>
                 </div>
                 <div class="icon">
-                  <i class="ion <?php echo $dbConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                  <i class="ion <?= $dbConnected ? 'ion-checkmark-circled' : 'ion-close-circled' ?>"></i>
                 </div>
                 <div class="small-box-footer">
-                  <?php echo $dbConnected ? 'Connected' : 'Disconnected'; ?>
+                  <?= $dbConnected ? 'Connected' : 'Disconnected' ?>
                 </div>
               </div>
             </div>
-            
-            <!-- reCAPTCHA Status -->
+
+            <!-- reCAPTCHA -->
             <div class="col-12 col-sm-6 col-md-3 mb-3">
-              <div class="small-box <?php echo $recaptchaConfigured ? 'bg-success' : 'bg-warning'; ?>">
+              <div class="small-box <?= $recaptchaConfigured ? 'bg-success' : 'bg-warning' ?>">
                 <div class="inner">
-                  <h3><i class="fas <?php echo $recaptchaConfigured ? 'fa-shield-alt' : 'fa-exclamation-circle'; ?>"></i></h3>
+                  <h3><i class="fas <?= $recaptchaConfigured ? 'fa-shield-alt' : 'fa-exclamation-circle' ?>"></i></h3>
                   <p>reCAPTCHA</p>
                 </div>
                 <div class="icon">
-                  <i class="ion <?php echo $recaptchaConfigured ? 'ion-checkmark-circled' : 'ion-alert-circled'; ?>"></i>
+                  <i class="ion <?= $recaptchaConfigured ? 'ion-checkmark-circled' : 'ion-alert-circled' ?>"></i>
                 </div>
                 <div class="small-box-footer">
-                  <?php echo $recaptchaConfigured ? 'Configured' : 'Not configured'; ?>
+                  <?= $recaptchaConfigured ? 'Configured' : 'Not configured' ?>
                 </div>
               </div>
             </div>
-            
-            <!-- Retail Store Status -->
+
+            <!-- Retail -->
             <div class="col-12 col-sm-6 col-md-3 mb-3">
-              <div class="small-box <?php echo $shopifyRetailConnected ? 'bg-success' : 'bg-danger'; ?>">
+              <div class="small-box <?= $shopifyRetailConnected ? 'bg-success' : 'bg-danger' ?>">
                 <div class="inner">
-                  <h3><i class="fas <?php echo $shopifyRetailConnected ? 'fa-shop' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <h3><i class="fas <?= $shopifyRetailConnected ? 'fa-shop' : 'fa-exclamation-triangle' ?>"></i></h3>
                   <p>Retail Store</p>
                 </div>
                 <div class="icon">
-                  <i class="ion <?php echo $shopifyRetailConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                  <i class="ion <?= $shopifyRetailConnected ? 'ion-checkmark-circled' : 'ion-close-circled' ?>"></i>
                 </div>
                 <div class="small-box-footer">
-                  <?php echo $shopifyRetailConnected ? 'Connected' : 'Connection failed'; ?>
-                  <?php echo $retailError ? '<br><small class="text-white">' . $retailError . '</small>' : ''; ?>
+                  <?= $shopifyRetailConnected ? 'Connected' : 'Connection failed' ?>
+                  <?php if ($retailError): ?>
+                    <br><small class="text-white"><?= htmlspecialchars($retailError, ENT_QUOTES, 'UTF-8') ?></small>
+                  <?php endif; ?>
                 </div>
               </div>
             </div>
-            
-            <!-- Business Store Status -->
+
+            <!-- Business -->
             <div class="col-12 col-sm-6 col-md-3 mb-3">
-              <div class="small-box <?php echo $shopifyBusinessConnected ? 'bg-success' : 'bg-danger'; ?>">
+              <div class="small-box <?= $shopifyBusinessConnected ? 'bg-success' : 'bg-danger' ?>">
                 <div class="inner">
-                  <h3><i class="fas <?php echo $shopifyBusinessConnected ? 'fa-store' : 'fa-exclamation-triangle'; ?>"></i></h3>
+                  <h3><i class="fas <?= $shopifyBusinessConnected ? 'fa-store' : 'fa-exclamation-triangle' ?>"></i></h3>
                   <p>Business Store</p>
                 </div>
                 <div class="icon">
-                  <i class="ion <?php echo $shopifyBusinessConnected ? 'ion-checkmark-circled' : 'ion-close-circled'; ?>"></i>
+                  <i class="ion <?= $shopifyBusinessConnected ? 'ion-checkmark-circled' : 'ion-close-circled' ?>"></i>
                 </div>
                 <div class="small-box-footer">
-                  <?php echo $shopifyBusinessConnected ? 'Connected' : 'Connection failed'; ?>
-                  <?php echo $businessError ? '<br><small class="text-white">' . $businessError . '</small>' : ''; ?>
+                  <?= $shopifyBusinessConnected ? 'Connected' : 'Connection failed' ?>
+                  <?php if ($businessError): ?>
+                    <br><small class="text-white"><?= htmlspecialchars($businessError, ENT_QUOTES, 'UTF-8') ?></small>
+                  <?php endif; ?>
                 </div>
               </div>
             </div>
           </div>
-          
-          <!-- Connection Details Table -->
+
+          <!-- Details table (no token values) -->
           <div class="row mt-4">
             <div class="col-12">
               <div class="table-responsive">
@@ -221,52 +411,56 @@ include __DIR__ . '/../includes/sidebar.php';
                     <tr>
                       <td><strong>MySQL Database</strong></td>
                       <td>**********</td>
-                      <td><span class="badge <?php echo $dbConnected ? 'badge-success' : 'badge-danger'; ?>">
-                          <?php echo $dbConnected ? 'Connected' : 'Disconnected'; ?>
-                        </span></td>
-                      <td><?php echo $dbConnected ? 'Database connection established' : 'Unable to connect to database'; ?></td>
+                      <td>
+                        <span class="badge <?= $dbConnected ? 'badge-success' : 'badge-danger' ?>">
+                          <?= $dbConnected ? 'Connected' : 'Disconnected' ?>
+                        </span>
+                      </td>
+                      <td><?= $dbConnected ? 'Database connection established' : 'Unable to connect to database' ?></td>
                     </tr>
                     <tr>
                       <td><strong>reCAPTCHA</strong></td>
                       <td>Google reCAPTCHA v2</td>
-                      <td><span class="badge <?php echo $recaptchaConfigured ? 'badge-success' : 'badge-warning'; ?>">
-                          <?php echo $recaptchaConfigured ? 'Configured' : 'Missing Keys'; ?>
-                        </span></td>
                       <td>
-                        <?php echo !empty(RECAPTCHA_SITE_KEY) ? 'Site Key: Set' : 'Site Key: Missing'; ?> |
-                        <?php echo !empty(RECAPTCHA_SECRET_KEY) ? 'Secret Key: Set' : 'Secret Key: Missing'; ?>
+                        <span class="badge <?= $recaptchaConfigured ? 'badge-success' : 'badge-warning' ?>">
+                          <?= $recaptchaConfigured ? 'Configured' : 'Missing Keys' ?>
+                        </span>
+                      </td>
+                      <td>
+                        Site Key: <?= !empty(RECAPTCHA_SITE_KEY) ? 'Set' : 'Missing' ?> |
+                        Secret Key: <?= !empty(RECAPTCHA_SECRET_KEY) ? 'Set' : 'Missing' ?>
                       </td>
                     </tr>
                     <tr>
                       <td><strong>Shopify Retail</strong></td>
-                      <td><?php echo !empty($shopConfig['retail']['url']) ? 'https://' . $shopConfig['retail']['url'] : 'Not configured'; ?></td>
-                      <td><span class="badge <?php echo $shopifyRetailConnected ? 'badge-success' : 'badge-danger'; ?>">
-                          <?php echo $shopifyRetailConnected ? 'Connected' : 'Failed'; ?>
-                        </span></td>
                       <td>
-                        <?php 
-                        if (!empty($shopConfig['retail']['access_token'])) {
-                            echo 'Token: ' . substr($shopConfig['retail']['access_token'], 0, 10) . '...' . substr($shopConfig['retail']['access_token'], -4);
-                        } else {
-                            echo 'Token: Not set';
-                        }
-                        ?>
+                        <?= !empty($shopConfig['retail']['url'])
+                            ? 'https://' . htmlspecialchars($shopConfig['retail']['url'], ENT_QUOTES, 'UTF-8')
+                            : 'Not configured' ?>
+                      </td>
+                      <td>
+                        <span class="badge <?= $shopifyRetailConnected ? 'badge-success' : 'badge-danger' ?>">
+                          <?= $shopifyRetailConnected ? 'Connected' : 'Failed' ?>
+                        </span>
+                      </td>
+                      <td>
+                        Token: <?= !empty($shopConfig['retail']['access_token']) ? 'Present' : 'Not set' ?>
                       </td>
                     </tr>
                     <tr>
                       <td><strong>Shopify Business</strong></td>
-                      <td><?php echo !empty($shopConfig['business']['url']) ? 'https://' . $shopConfig['business']['url'] : 'Not configured'; ?></td>
-                      <td><span class="badge <?php echo $shopifyBusinessConnected ? 'badge-success' : 'badge-danger'; ?>">
-                          <?php echo $shopifyBusinessConnected ? 'Connected' : 'Failed'; ?>
-                        </span></td>
                       <td>
-                        <?php 
-                        if (!empty($shopConfig['business']['access_token'])) {
-                            echo 'Token: ' . substr($shopConfig['business']['access_token'], 0, 10) . '...' . substr($shopConfig['business']['access_token'], -4);
-                        } else {
-                            echo 'Token: Not set';
-                        }
-                        ?>
+                        <?= !empty($shopConfig['business']['url'])
+                            ? 'https://' . htmlspecialchars($shopConfig['business']['url'], ENT_QUOTES, 'UTF-8')
+                            : 'Not configured' ?>
+                      </td>
+                      <td>
+                        <span class="badge <?= $shopifyBusinessConnected ? 'badge-success' : 'badge-danger' ?>">
+                          <?= $shopifyBusinessConnected ? 'Connected' : 'Failed' ?>
+                        </span>
+                      </td>
+                      <td>
+                        Token: <?= !empty($shopConfig['business']['access_token']) ? 'Present' : 'Not set' ?>
                       </td>
                     </tr>
                   </tbody>
@@ -276,183 +470,50 @@ include __DIR__ . '/../includes/sidebar.php';
           </div>
         </div>
       </div>
-      
-      <!-- Info boxes -->
+
+      <!-- Info boxes (reuse pre-computed scores) -->
       <div class="row">
         <?php
-        // Resource types configuration - used by both info boxes and health table
-        $resourceTypes = [
-            'products' => [
-                'icon' => 'fa-tag text-primary',
-                'name' => 'Products',
-                'table' => 'shopify_products',
-                'id_field' => 'id',
-                'title_field' => 'title',
-                'meta_field' => 'meta_description',
-                'handle_field' => 'handle',
-                'module' => 'products.php'
-            ],
-            'collections' => [
-                'icon' => 'fa-layer-group text-success',
-                'name' => 'Collections',
-                'table' => 'shopify_collections',
-                'id_field' => 'id',
-                'title_field' => 'title',
-                'meta_field' => 'meta_description',
-                'handle_field' => 'handle',
-                'module' => 'collections.php'
-            ],
-            'pages' => [
-                'icon' => 'fa-file-alt text-warning',
-                'name' => 'Pages',
-                'table' => 'shopify_pages',
-                'id_field' => 'id',
-                'title_field' => 'title',
-                'meta_field' => 'meta_description',
-                'handle_field' => 'handle',
-                'module' => 'pages.php'
-            ],
-            'blogs' => [
-                'icon' => 'fa-newspaper text-danger',
-                'name' => 'Blogs & Articles',
-                'table' => 'shopify_blogs',
-                'id_field' => 'id',
-                'title_field' => 'title',
-                'meta_field' => 'meta_description',
-                'handle_field' => 'handle',
-                'module' => 'blogs.php'
-            ]
-        ];
-        
-        // SEO Health function (replicate from config if not available)
-        if (!function_exists('calculateSeoHealth')) {
-            function calculateSeoHealth($title, $metaDescription, $handle) {
-                $score = 100;
-                $issues = [];
-                
-                $tLen = mb_strlen(trim($title));
-                $dLen = mb_strlen(trim($metaDescription));
-                $h = trim($handle);
-                
-                if ($tLen === 0) {
-                    $score -= 35;
-                    $issues[] = "Missing Page Title";
-                } elseif ($tLen < 35) {
-                    $score -= 15;
-                    $issues[] = "Title too short";
-                } elseif ($tLen > 65) {
-                    $score -= 10;
-                    $issues[] = "Title too long";
-                }
-                
-                if ($dLen === 0) {
-                    $score -= 35;
-                    $issues[] = "Missing Meta Description";
-                } elseif ($dLen < 90) {
-                    $score -= 15;
-                    $issues[] = "Meta description too short";
-                } elseif ($dLen > 165) {
-                    $score -= 10;
-                    $issues[] = "Meta description exceeds 160 chars";
-                }
-                
-                if (empty($h)) {
-                    $score -= 15;
-                    $issues[] = "Missing URL Handle";
-                }
-                
-                return [
-                    'score' => max(10, min(100, $score)),
-                    'issues' => $issues
-                ];
-            }
-        }
-        
-        // Pre-calculate SEO scores for info boxes
-        $seoScoresByResource = [];
-        $activeStore = $_SESSION['active_store'] ?? 'business';
-        $db = getDbConnection();
-        
-        if ($db) {
-            foreach ($resourceTypes as $key => $resource) {
-                $tableName = $resource['table'];
-                $seoScores = [];
-                
-                try {
-                    $itemsStmt = $db->prepare("SELECT `$resource[title_field]`, `$resource[meta_field]`, `$resource[handle_field]` FROM `$tableName` WHERE store_key = :store LIMIT 100");
-                    $itemsStmt->execute([':store' => $activeStore]);
-                    $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-                    
-                    foreach ($items as $item) {
-                        $title = $item[$resource['title_field']] ?? '';
-                        $meta = $item[$resource['meta_field']] ?? '';
-                        $handle = $item[$resource['handle_field']] ?? '';
-                        
-                        $seoAnalysis = calculateSeoHealth($title, $meta, $handle);
-                        $seoScores[] = $seoAnalysis['score'];
-                    }
-                    
-                    $seoScoresByResource[$key] = !empty($seoScores) ? round(array_sum($seoScores) / count($seoScores)) : 100;
-                } catch (Exception $e) {
-                    $seoScoresByResource[$key] = 100; // Default if table doesn't exist
-                }
-            }
-        }
-        
-        // Define info box configurations
         $infoBoxes = [
-            'products' => [
-                'icon' => 'fa-tag',
-                'bg' => 'bg-info',
-                'text' => 'Product SEO Score',
-                'text_class' => ''
-            ],
-            'collections' => [
-                'icon' => 'fa-layer-group',
-                'bg' => 'bg-success',
-                'text' => 'Collections Health',
-                'text_class' => ''
-            ],
-            'pages' => [
-                'icon' => 'fa-file-alt text-white',
-                'bg' => 'bg-warning',
-                'text' => 'Pages SEO Score',
-                'text_class' => ''
-            ],
-            'blogs' => [
-                'icon' => 'fa-newspaper',
-                'bg' => 'bg-danger',
-                'text' => 'Blogs & Articles',
-                'text_class' => ''
-            ]
+            'products'    => ['icon' => 'fa-tag',        'bg' => 'bg-info',    'text' => 'Product SEO Score'],
+            'collections' => ['icon' => 'fa-layer-group','bg' => 'bg-success', 'text' => 'Collections Health'],
+            'pages'       => ['icon' => 'fa-file-alt',   'bg' => 'bg-warning', 'text' => 'Pages SEO Score'],
+            'blogs'       => ['icon' => 'fa-newspaper',  'bg' => 'bg-danger',  'text' => 'Blogs & Articles'],
         ];
-        
+
         foreach ($infoBoxes as $key => $box) {
-            $score = $seoScoresByResource[$key] ?? 100;
+            $score = $seoData[$key]['avg_score'] ?? 100;
             $textClass = 'text-success';
             if ($score < 70) {
                 $textClass = 'text-danger';
             } elseif ($score < 85) {
                 $textClass = 'text-warning';
             }
-            
-            echo '<div class="col-12 col-sm-6 col-md-3">';
-            echo '<div class="info-box shadow-sm">';
-            echo '<span class="info-box-icon ' . $box['bg'] . ' elevation-1"><i class="fas ' . $box['icon'] . '"></i></span>';
-            echo '<div class="info-box-content">';
-            echo '<span class="info-box-text">' . $box['text'] . '</span>';
-            echo '<span class="info-box-number font-weight-bold ' . $textClass . '">' . $score . '% <small class="text-muted">Avg Health</small></span>';
-            echo '</div>';
-            echo '</div>';
-            echo '</div>';
+            ?>
+            <div class="col-12 col-sm-6 col-md-3">
+              <div class="info-box shadow-sm">
+                <span class="info-box-icon <?= $box['bg'] ?> elevation-1">
+                  <i class="fas <?= $box['icon'] ?>"></i>
+                </span>
+                <div class="info-box-content">
+                  <span class="info-box-text"><?= htmlspecialchars($box['text'], ENT_QUOTES, 'UTF-8') ?></span>
+                  <span class="info-box-number font-weight-bold <?= $textClass ?>">
+                    <?= (int)$score ?>% <small class="text-muted">Avg Health</small>
+                  </span>
+                </div>
+              </div>
+            </div>
+            <?php
         }
         ?>
       </div>
 
-      <!-- Quick Summary Table -->
+      <!-- Health Audit Table -->
       <div class="card card-outline card-primary shadow-sm">
         <div class="card-header border-0">
-          <h3 class="card-title font-weight-bold"><i class="fas fa-heartbeat mr-2 text-danger"></i> Store Health Audit Breakdown</h3>
+          <h3 class="card-title font-weight-bold">
+            <i class="fas fa-heartbeat mr-2 text-danger"></i> Store Health Audit Breakdown
+          </h3>
         </div>
         <div class="card-body table-responsive p-0">
           <table class="table table-striped table-valign-middle">
@@ -467,160 +528,112 @@ include __DIR__ . '/../includes/sidebar.php';
               </tr>
             </thead>
             <tbody>
-              <?php
-              // Store Health Audit Breakdown - Dynamic Data
-              // Reuse the resourceTypes and calculateSeoHealth from above
-              $db = getDbConnection(); // Re-establish db connection for this section
-              foreach ($resourceTypes as $key => $resource) {
-                  $tableName = $resource['table'];
-                  $totalItems = 0;
-                  $draftCount = 0;
-                  $seoScores = [];
-                  $allIssues = [];
-                  $itemsWithIssues = 0;
-                  
-                  if ($db) {
-                      try {
-                          // Count total items for this store
-                          $countStmt = $db->prepare("SELECT COUNT(*) FROM `$tableName` WHERE store_key = :store");
-                          $countStmt->execute([':store' => $activeStore]);
-                          $totalItems = (int)$countStmt->fetchColumn();
-                          
-                          // Count drafts
-                          $draftStmt = $db->prepare("SELECT COUNT(*) FROM `$tableName` WHERE store_key = :store AND status = 'draft'");
-                          $draftStmt->execute([':store' => $activeStore]);
-                          $draftCount = (int)$draftStmt->fetchColumn();
-                          
-                          // Get items for SEO analysis (limit to first 100 for performance)
-                          if ($totalItems > 0) {
-                              $itemsStmt = $db->prepare("SELECT `$resource[title_field]`, `$resource[meta_field]`, `$resource[handle_field]` FROM `$tableName` WHERE store_key = :store LIMIT 100");
-                              $itemsStmt->execute([':store' => $activeStore]);
-                              $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-                              
-                              foreach ($items as $item) {
-                                  $title = $item[$resource['title_field']] ?? '';
-                                  $meta = $item[$resource['meta_field']] ?? '';
-                                  $handle = $item[$resource['handle_field']] ?? '';
-                                  
-                                  $seoAnalysis = calculateSeoHealth($title, $meta, $handle);
-                                  $seoScores[] = $seoAnalysis['score'];
-                                  
-                                  if (!empty($seoAnalysis['issues'])) {
-                                      $allIssues = array_merge($allIssues, $seoAnalysis['issues']);
-                                      $itemsWithIssues++;
-                                  }
-                              }
-                          }
-                      } catch (Exception $e) {
-                          // Table doesn't exist or other error
-                          $totalItems = 0;
-                          $draftCount = 0;
-                          $seoScores = [];
-                      }
+              <?php foreach ($resourceTypes as $key => $resource):
+                  $data = $seoData[$key] ?? [
+                      'avg_score' => 100, 'total' => 0, 'drafts' => 0,
+                      'items_with_issues' => 0, 'issues' => []
+                  ];
+
+                  $scoreBadge = 'badge-success';
+                  if ($data['avg_score'] < 70) {
+                      $scoreBadge = 'badge-danger';
+                  } elseif ($data['avg_score'] < 85) {
+                      $scoreBadge = 'badge-warning';
                   }
-                  
-                  // Calculate average SEO score
-                  $avgSeoScore = !empty($seoScores) ? round(array_sum($seoScores) / count($seoScores)) : 100;
-                  
-                  // Determine score badge class
-                  $scoreBadgeClass = 'badge-success';
-                  if ($avgSeoScore < 70) {
-                      $scoreBadgeClass = 'badge-danger';
-                  } elseif ($avgSeoScore < 85) {
-                      $scoreBadgeClass = 'badge-warning';
-                  }
-                  
-                  // Generate issue summary
-                  if (empty($allIssues) && $itemsWithIssues === 0) {
+
+                  if ($data['items_with_issues'] === 0) {
                       $issueSummary = '<span class="text-success"><i class="fas fa-check-circle mr-1"></i> 0 Critical issues</span>';
                   } else {
-                      $uniqueIssues = array_unique($allIssues);
-                      $issueText = implode(', ', array_slice($uniqueIssues, 0, 3)); // Show first 3 issues
-                      if (count($uniqueIssues) > 3) {
-                          $issueText .= '...';
-                      }
-                      $issueSummary = '<span class="text-danger"><i class="fas fa-exclamation-triangle mr-1"></i> ' . $itemsWithIssues . ' Items need optimization</span>';
+                      $issueSummary = '<span class="text-danger"><i class="fas fa-exclamation-triangle mr-1"></i> '
+                                    . (int)$data['items_with_issues'] . ' Items need optimization</span>';
                   }
-                  
-                  // Display row
-                  echo '<tr>';
-                  echo '<td><strong><i class="fas ' . $resource['icon'] . ' mr-2"></i> ' . $resource['name'] . '</strong></td>';
-                  echo '<td>' . $totalItems . ' ' . ($key === 'blogs' ? 'Articles' : ($key === 'collections' ? 'Collections' : 'Items')) . '</td>';
-                  echo '<td><span class="badge ' . $scoreBadgeClass . ' font-weight-bold">' . $avgSeoScore . '%</span></td>';
-                  echo '<td>' . $issueSummary . '</td>';
-                  echo '<td><span class="badge badge-secondary">' . $draftCount . ' Draft' . ($draftCount !== 1 ? 's' : '') . '</span></td>';
-                  echo '<td><a href="' . $resource['module'] . '" class="btn btn-sm btn-primary">Open Module</a></td>';
-                  echo '</tr>';
-              }
               ?>
+              <tr>
+                <td>
+                  <strong>
+                    <i class="fas <?= htmlspecialchars($resource['icon'], ENT_QUOTES, 'UTF-8') ?> mr-2"></i>
+                    <?= htmlspecialchars($resource['name'], ENT_QUOTES, 'UTF-8') ?>
+                  </strong>
+                </td>
+                <td>
+                  <?= (int)$data['total'] ?> <?= htmlspecialchars($resource['item_label'], ENT_QUOTES, 'UTF-8') ?>
+                </td>
+                <td>
+                  <span class="badge <?= $scoreBadge ?> font-weight-bold"><?= (int)$data['avg_score'] ?>%</span>
+                </td>
+                <td><?= $issueSummary ?></td>
+                <td>
+                  <span class="badge badge-secondary">
+                    <?= (int)$data['drafts'] ?> Draft<?= $data['drafts'] !== 1 ? 's' : '' ?>
+                  </span>
+                </td>
+                <td>
+                  <a href="<?= htmlspecialchars($resource['module'], ENT_QUOTES, 'UTF-8') ?>"
+                     class="btn btn-sm btn-primary">Open Module</a>
+                </td>
+              </tr>
+              <?php endforeach; ?>
             </tbody>
           </table>
         </div>
       </div>
+
     </div>
   </section>
 </div>
 
 <script>
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', function () {
   const renewBtn = document.getElementById('renewTokenBtn');
   const alertContainer = document.getElementById('dashboardAlertContainer');
 
-  if (renewBtn) {
-    renewBtn.addEventListener('click', function() {
-      if (!confirm('Are you sure you want to request a new Shopify access token and save it to the database?')) {
-        return;
+  if (!renewBtn) return;
+
+  renewBtn.addEventListener('click', function () {
+    if (!confirm('Are you sure you want to request a new Shopify access token and save it to the database?')) {
+      return;
+    }
+
+    const originalHtml = renewBtn.innerHTML;
+    renewBtn.disabled = true;
+    renewBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Renewing...';
+
+    fetch('renew_token.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin'
+    })
+    .then(response => response.json())
+    .then(data => {
+      const type = data.success ? 'success' : 'danger';
+      const icon = data.success ? 'fa-check-circle' : 'fa-exclamation-circle';
+      alertContainer.innerHTML = `
+        <div class="alert alert-${type} alert-dismissible fade show" role="alert">
+          <i class="fas ${icon} mr-2"></i> ${data.message || 'Unknown response'}
+          <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>`;
+
+      if (data.success) {
+        setTimeout(() => window.location.reload(), 1500);
       }
-
-      const originalHtml = renewBtn.innerHTML;
-      renewBtn.disabled = true;
-      renewBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Renewing...';
-
-      fetch('renew_token.php', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      })
-      .then(response => response.json())
-      .then(data => {
-        if (data.success) {
-          alertContainer.innerHTML = `
-            <div class="alert alert-success alert-dismissible fade show" role="alert">
-              <i class="fas fa-check-circle mr-2"></i> ${data.message}
-              <button type="button" class="close" data-dismiss="alert" aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
-            </div>`;
-          setTimeout(() => {
-            window.location.reload();
-          }, 1500);
-        } else {
-          alertContainer.innerHTML = `
-            <div class="alert alert-danger alert-dismissible fade show" role="alert">
-              <i class="fas fa-exclamation-circle mr-2"></i> ${data.message}
-              <button type="button" class="close" data-dismiss="alert" aria-label="Close">
-                <span aria-hidden="true">&times;</span>
-              </button>
-            </div>`;
-        }
-      })
-      .catch(error => {
-        console.error('Error renewing token:', error);
-        alertContainer.innerHTML = `
-          <div class="alert alert-danger alert-dismissible fade show" role="alert">
-            <i class="fas fa-exclamation-triangle mr-2"></i> An error occurred while renewing the access token.
-            <button type="button" class="close" data-dismiss="alert" aria-label="Close">
-              <span aria-hidden="true">&times;</span>
-            </button>
-          </div>`;
-      })
-      .finally(() => {
-        renewBtn.disabled = false;
-        renewBtn.innerHTML = originalHtml;
-      });
+    })
+    .catch(error => {
+      console.error('Error renewing token:', error);
+      alertContainer.innerHTML = `
+        <div class="alert alert-danger alert-dismissible fade show" role="alert">
+          <i class="fas fa-exclamation-triangle mr-2"></i> An error occurred while renewing the access token.
+          <button type="button" class="close" data-dismiss="alert" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>`;
+    })
+    .finally(() => {
+      renewBtn.disabled = false;
+      renewBtn.innerHTML = originalHtml;
     });
-  }
+  });
 });
 </script>
 
