@@ -51,12 +51,14 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Collections</p>
           </a>
         </li>
+        <?php if (($_SESSION['user_role'] ?? 'editor') === 'admin'): ?>
         <li class="nav-item">
           <a href="image.php" class="nav-link <?php echo ($currentScript === 'image.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-image"></i>
             <p>Images</p>
           </a>
         </li>
+        <?php endif; ?>
         <li class="nav-item">
           <a href="pages.php" class="nav-link <?php echo ($currentScript === 'pages.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-file-alt"></i>

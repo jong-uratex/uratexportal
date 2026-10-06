@@ -10,6 +10,11 @@ if (!isset($_SESSION['user_logged_in'])) {
     exit;
 }
 
+if (($_SESSION['user_role'] ?? 'editor') !== 'admin') {
+    header("Location: dashboard.php");
+    exit;
+}
+
 if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'], true)) {
     $_SESSION['active_store'] = $_GET['switch_store'];
 }
