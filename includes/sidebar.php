@@ -52,6 +52,12 @@ $currentScript = basename($_SERVER['PHP_SELF']);
           </a>
         </li>
         <li class="nav-item">
+          <a href="image.php" class="nav-link <?php echo ($currentScript === 'image.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-image"></i>
+            <p>Images</p>
+          </a>
+        </li>
+        <li class="nav-item">
           <a href="pages.php" class="nav-link <?php echo ($currentScript === 'pages.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-file-alt"></i>
             <p>Pages Manager</p>
