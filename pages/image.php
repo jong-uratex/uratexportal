@@ -161,6 +161,7 @@ $search  = trim($_GET['q'] ?? '');
 $after   = $_GET['after'] ?? null;
 $refresh = isset($_GET['refresh']);
 $error   = '';
+$debug   = '';
 $images  = [];
 $pageInfo = ['hasNextPage' => false, 'endCursor' => null];
 
@@ -177,6 +178,12 @@ $r = shopifyGraphQLRequest($q, ['after' => $after ?: null, 'query' => $searchQue
 $files = $r['data']['data']['files'] ?? null;
 if (!$files) {
     $error = $r['data']['errors'][0]['message'] ?? ($r['error'] ?: 'Unable to load files from Shopify (check API scopes read_files/write_files).');
+    $sc = shopifyGraphQLRequest('{currentAppInstallation{accessScopes{handle}}}', [], $activeStore);
+    $granted = array_column($sc['data']['data']['currentAppInstallation']['accessScopes'] ?? [], 'handle');
+    $debug = 'Store: ' . ($shopCfg['url'] ?? '') . ' | API version: ' . ($shopCfg['version'] ?? '')
+        . ' | Token has read_files: ' . (in_array('read_files', $granted, true) ? 'yes' : 'NO')
+        . ' | write_files: ' . (in_array('write_files', $granted, true) ? 'yes' : 'NO')
+        . ' | Granted scopes: ' . ($granted ? implode(', ', $granted) : ($sc['data']['errors'][0]['message'] ?? 'unavailable'));
 } else {
     $pageInfo = $files['pageInfo'];
     $usage    = buildUsageMap($activeStore, $storeDomain, $refresh);
@@ -212,7 +219,9 @@ include __DIR__ . '/../includes/sidebar.php';
       </div>
 
       <?php if ($error): ?>
-        <div class="alert alert-danger"><?php echo htmlspecialchars($error); ?></div>
+        <div class="alert alert-danger"><?php echo htmlspecialchars($error); ?>
+          <?php if ($debug): ?><div class="small mt-2"><?php echo htmlspecialchars($debug); ?></div><?php endif; ?>
+        </div>
       <?php endif; ?>
 
       <div class="card shadow-sm">
