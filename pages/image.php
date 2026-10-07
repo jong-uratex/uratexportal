@@ -264,8 +264,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'impor
                 if (!$batch) {
                     return;
                 }
+                $altOnlyBatch = array_map(static function (array $file): array {
+                    return ['id' => $file['id'], 'alt' => $file['alt']];
+                }, $batch);
                 $m = 'mutation($files:[FileUpdateInput!]!){fileUpdate(files:$files){files{id}userErrors{field message}}}';
-                $r = shopifyGraphQLRequest($m, ['files' => $batch], $activeStore);
+                $r = shopifyGraphQLRequest($m, ['files' => $altOnlyBatch], $activeStore);
                 $errs = $r['data']['data']['fileUpdate']['userErrors'] ?? [];
                 if ($r['status'] !== 200 || !empty($r['data']['errors'])) {
                     $failed += count($batch);
