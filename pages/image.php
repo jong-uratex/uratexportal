@@ -179,7 +179,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'sync_
     }
 }
 
-// Export all images (File ID, name, alt text, URL) as CSV
+// Export all images (File ID, name, alt text, URL, and usage references) as CSV
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'export_images') {
     if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
         http_response_code(403);
@@ -195,10 +195,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'expor
             break;
         }
     }
+    $exportUsage = buildUsageMap($activeStore, $storeDomain, false);
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="uratex_images_' . $activeStore . '_' . date('Y-m-d_His') . '.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['File ID', 'File Name', 'Alt Text', 'Image URL']);
+    fputcsv($out, ['File ID', 'File Name', 'Alt Text', 'Image URL', 'Used in']);
     $cursor = null;
     for ($i = 0; $i < 200; $i++) {
         $q = 'query($after:String,$query:String){files(first:100,after:$after,query:$query,sortKey:CREATED_AT,reverse:true){
@@ -212,7 +213,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'expor
             if (empty($n['image']['url'])) {
                 continue;
             }
-            fputcsv($out, [$n['id'], basename(parse_url($n['image']['url'], PHP_URL_PATH)), $n['alt'] ?? '', $n['image']['url']]);
+            $usages = array_merge($exportUsage[$n['id']] ?? [], $exportUsage[imgKey($n['image']['url'])] ?? []);
+            $usedIn = [];
+            foreach ($usages as $usage) {
+              $usedIn[$usage['url']] = $usage['type'] . ': ' . $usage['title'] . ' (' . $usage['url'] . ')';
+            }
+            fputcsv($out, [
+              $n['id'],
+              basename(parse_url($n['image']['url'], PHP_URL_PATH)),
+              $n['alt'] ?? '',
+              $n['image']['url'],
+              $usedIn ? implode('; ', $usedIn) : 'No product/collection/article reference found'
+            ]);
         }
         if (empty($f['pageInfo']['hasNextPage'])) {
             break;
