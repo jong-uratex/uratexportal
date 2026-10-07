@@ -10,11 +10,6 @@ if (!isset($_SESSION['user_logged_in'])) {
     exit;
 }
 
-if (($_SESSION['user_role'] ?? 'editor') !== 'admin') {
-    header("Location: dashboard.php");
-    exit;
-}
-
 if (isset($_GET['switch_store']) && in_array($_GET['switch_store'], ['retail', 'business'], true)) {
     $_SESSION['active_store'] = $_GET['switch_store'];
 }
@@ -163,7 +158,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'updat
 
 // List files
 $search  = trim($_GET['q'] ?? '');
-$after   = $_GET['after'] ?? null;
+$page    = max(1, (int)($_GET['page'] ?? 1));
+$pgKey   = 'img_cursors_' . $activeStore . '_' . md5(trim($_GET['q'] ?? ''));
+$cursors = $_SESSION[$pgKey] ?? [];
+$after   = $page > 1 ? ($cursors[$page] ?? null) : null;
+if ($page > 1 && $after === null) {
+    $page = 1;
+}
 $refresh = isset($_GET['refresh']);
 $error   = '';
 $debug   = '';
@@ -191,6 +192,10 @@ if (!$files) {
         . ' | Granted scopes: ' . ($granted ? implode(', ', $granted) : ($sc['data']['errors'][0]['message'] ?? 'unavailable'));
 } else {
     $pageInfo = $files['pageInfo'];
+    if (!empty($pageInfo['hasNextPage'])) {
+        $cursors[$page + 1] = $pageInfo['endCursor'];
+    }
+    $_SESSION[$pgKey] = $cursors;
     $usage    = buildUsageMap($activeStore, $storeDomain, $refresh);
     foreach ($files['nodes'] as $f) {
         if (empty($f['image']['url'])) {
@@ -282,11 +287,21 @@ include __DIR__ . '/../includes/sidebar.php';
             </tbody>
           </table>
         </div>
-        <div class="card-footer d-flex justify-content-between">
-          <a class="btn btn-sm btn-outline-secondary" href="?q=<?php echo urlencode($search); ?>">First page</a>
-          <?php if (!empty($pageInfo['hasNextPage'])): ?>
-            <a class="btn btn-sm btn-primary" href="?q=<?php echo urlencode($search); ?>&after=<?php echo urlencode($pageInfo['endCursor']); ?>">Next &raquo;</a>
-          <?php endif; ?>
+        <?php
+          $lastPage = $page + (!empty($pageInfo['hasNextPage']) ? 1 : 0);
+          $lastPage = max($lastPage, $cursors ? max(array_keys($cursors)) : 1);
+          $pageUrl  = function (int $n) use ($search) {
+              return '?q=' . urlencode($search) . '&page=' . $n;
+          };
+        ?>
+        <div class="card-footer">
+          <ul class="pagination pagination-sm mb-0 justify-content-center flex-wrap">
+            <li class="page-item <?php echo $page <= 1 ? 'disabled' : ''; ?>"><a class="page-link" href="<?php echo $pageUrl(max(1, $page - 1)); ?>">&laquo;</a></li>
+            <?php for ($n = 1; $n <= $lastPage; $n++): ?>
+              <li class="page-item <?php echo $n === $page ? 'active' : ''; ?>"><a class="page-link" href="<?php echo $pageUrl($n); ?>"><?php echo $n; ?></a></li>
+            <?php endfor; ?>
+            <li class="page-item <?php echo empty($pageInfo['hasNextPage']) ? 'disabled' : ''; ?>"><a class="page-link" href="<?php echo $pageUrl($page + 1); ?>">&raquo;</a></li>
+          </ul>
         </div>
       </div>
     </div>
