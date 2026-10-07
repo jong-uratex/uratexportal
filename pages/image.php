@@ -127,6 +127,157 @@ function buildUsageMap(string $store, string $domain, bool $force): array
     return $map;
 }
 
+$notice     = '';
+$noticeType = 'success';
+
+// Test connection / scopes
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'test_connection') {
+    if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        $notice = 'Invalid CSRF token.';
+        $noticeType = 'danger';
+    } else {
+        $sc = shopifyGraphQLRequest('{shop{name} currentAppInstallation{accessScopes{handle}}}', [], $activeStore);
+        $granted = array_column($sc['data']['data']['currentAppInstallation']['accessScopes'] ?? [], 'handle');
+        if ($sc['status'] === 200 && !empty($sc['data']['data']['shop']['name'])) {
+            $missing = array_diff(['read_files', 'write_files'], $granted);
+            $notice = 'Connected to ' . htmlspecialchars($sc['data']['data']['shop']['name']) . '.';
+            if ($missing) {
+                $notice .= ' Missing scopes: ' . implode(', ', $missing) . '.';
+                $noticeType = 'warning';
+            }
+        } else {
+            $notice = 'Connection failed: ' . htmlspecialchars($sc['data']['errors'][0]['message'] ?? ($sc['error'] ?: 'Unknown error.'));
+            $noticeType = 'danger';
+        }
+    }
+}
+
+// Sync: rebuild the usage cache
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'sync_images') {
+    if (hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        buildUsageMap($activeStore, $storeDomain, true);
+        $notice = 'Image usage refreshed from Shopify.';
+    } else {
+        $notice = 'Invalid CSRF token.';
+        $noticeType = 'danger';
+    }
+}
+
+// Export all images (File ID, name, alt text, URL) as CSV
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'export_images') {
+    if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        http_response_code(403);
+        exit('Invalid CSRF token.');
+    }
+    set_time_limit(300);
+    $exQuery = 'media_type:IMAGE';
+    $exSearch = trim((string)($_POST['q'] ?? ''));
+    if ($exSearch !== '') {
+        $exQuery .= ' AND filename:"' . str_replace(['"', '\\'], '', $exSearch) . '*"';
+    }
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="uratex_images_' . $activeStore . '_' . date('Y-m-d_His') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fputcsv($out, ['File ID', 'File Name', 'Alt Text', 'Image URL']);
+    $cursor = null;
+    for ($i = 0; $i < 200; $i++) {
+        $q = 'query($after:String,$query:String){files(first:100,after:$after,query:$query,sortKey:CREATED_AT,reverse:true){
+                pageInfo{hasNextPage endCursor} nodes{id alt ... on MediaImage{image{url}}}}}';
+        $r = shopifyGraphQLRequest($q, ['after' => $cursor, 'query' => $exQuery], $activeStore);
+        $f = $r['data']['data']['files'] ?? null;
+        if (!$f) {
+            break;
+        }
+        foreach ($f['nodes'] as $n) {
+            if (empty($n['image']['url'])) {
+                continue;
+            }
+            fputcsv($out, [$n['id'], basename(parse_url($n['image']['url'], PHP_URL_PATH)), $n['alt'] ?? '', $n['image']['url']]);
+        }
+        if (empty($f['pageInfo']['hasNextPage'])) {
+            break;
+        }
+        $cursor = $f['pageInfo']['endCursor'];
+    }
+    fclose($out);
+    exit;
+}
+
+// Import CSV (File ID + Alt Text) and push to the live store immediately
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'import_images') {
+    set_time_limit(300);
+    if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        $notice = 'Invalid CSRF token.';
+        $noticeType = 'danger';
+    } elseif (empty($_FILES['images_csv']['tmp_name']) || $_FILES['images_csv']['error'] !== UPLOAD_ERR_OK) {
+        $notice = 'Please choose a valid CSV file to import.';
+        $noticeType = 'danger';
+    } else {
+        $h = fopen($_FILES['images_csv']['tmp_name'], 'r');
+        $headers = $h ? fgetcsv($h) : false;
+        if ($headers && isset($headers[0])) {
+            $headers[0] = preg_replace('/^\xEF\xBB\xBF/', '', $headers[0]);
+        }
+        $map = $headers ? array_flip(array_map('trim', $headers)) : [];
+        if (!$h || !isset($map['File ID'], $map['Alt Text'])) {
+            $notice = 'The CSV must include File ID and Alt Text columns.';
+            $noticeType = 'danger';
+        } else {
+            $batch = [];
+            $pushed = 0;
+            $skipped = 0;
+            $failed = 0;
+            $firstErr = '';
+            $flush = function () use (&$batch, &$pushed, &$failed, &$firstErr, $activeStore) {
+                if (!$batch) {
+                    return;
+                }
+                $m = 'mutation($files:[FileUpdateInput!]!){fileUpdate(files:$files){files{id}userErrors{field message}}}';
+                $r = shopifyGraphQLRequest($m, ['files' => $batch], $activeStore);
+                $errs = $r['data']['data']['fileUpdate']['userErrors'] ?? [];
+                if ($r['status'] !== 200 || !empty($r['data']['errors'])) {
+                    $failed += count($batch);
+                    $firstErr = $firstErr ?: ($r['data']['errors'][0]['message'] ?? ($r['error'] ?: 'Shopify request failed.'));
+                } else {
+                    $pushed += count($r['data']['data']['fileUpdate']['files'] ?? []);
+                    if ($errs) {
+                        $failed += count($batch) - count($r['data']['data']['fileUpdate']['files'] ?? []);
+                        $firstErr = $firstErr ?: $errs[0]['message'];
+                    }
+                }
+                $batch = [];
+            };
+            $seen = [];
+            while (($row = fgetcsv($h)) !== false) {
+                $id  = trim($row[$map['File ID']] ?? '');
+                $alt = trim($row[$map['Alt Text']] ?? '');
+                if (!preg_match('#^gid://shopify/MediaImage/\d+$#', $id) || isset($seen[$id])) {
+                    $skipped++;
+                    continue;
+                }
+                $seen[$id] = true;
+                $batch[] = ['id' => $id, 'alt' => mb_substr($alt, 0, 512)];
+                if (count($batch) >= 25) {
+                    $flush();
+                }
+            }
+            $flush();
+            fclose($h);
+            $notice = "Pushed alt text for <strong>{$pushed}</strong> image(s) to " . htmlspecialchars($shopCfg['name']) . ".";
+            if ($skipped) {
+                $notice .= " {$skipped} row(s) skipped (invalid or duplicate File ID).";
+            }
+            if ($failed) {
+                $notice .= " {$failed} failed: " . htmlspecialchars($firstErr);
+                $noticeType = 'warning';
+            }
+            if (function_exists('recordUserLog')) {
+                recordUserLog('Image Import', 'Image', "Pushed {$pushed} alt text update(s) to {$shopCfg['name']}; skipped {$skipped}; failed {$failed}.", 'image', null, $failed ? 'warning' : 'success');
+            }
+        }
+    }
+}
+
 // AJAX: update alt text
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update_alt') {
     header('Content-Type: application/json');
@@ -220,13 +371,67 @@ include __DIR__ . '/../includes/sidebar.php';
           <p class="text-muted small mb-0">Browse store images, see where they are used, and edit alt text.</p>
         </div>
         <div class="col-sm-6">
-          <form method="GET" class="form-inline justify-content-sm-end">
-            <input type="text" name="q" value="<?php echo htmlspecialchars($search); ?>" class="form-control form-control-sm mr-2" placeholder="Search file name">
-            <button class="btn btn-sm btn-primary mr-2" type="submit">Search</button>
-            <a class="btn btn-sm btn-outline-secondary" href="?refresh=1&q=<?php echo urlencode($search); ?>" title="Rebuild the usage cache">Refresh usage</a>
-          </form>
+          <div class="row justify-content-end">
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #007bff !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-plug text-primary mr-1"></i>Test Connection</div>
+                  <div class="small text-muted mb-2">Verify Shopify API access.</div>
+                  <form method="POST">
+                    <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                    <input type="hidden" name="action" value="test_connection">
+                    <button type="submit" class="btn btn-sm btn-primary btn-block font-weight-bold">Run Test</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4 mb-2 mb-md-0">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #eab308 !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-sync-alt text-warning mr-1"></i>Sync Images</div>
+                  <div class="small text-muted mb-2">Refresh where images are used.</div>
+                  <form method="POST">
+                    <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                    <input type="hidden" name="action" value="sync_images">
+                    <button type="submit" class="btn btn-sm btn-warning btn-block font-weight-bold">Sync Now</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-4">
+              <div class="card h-100 mb-0 shadow-sm border-0" style="border-top: 4px solid #16a34a !important; border-radius: 8px;">
+                <div class="card-body p-2">
+                  <div class="small font-weight-bold text-dark"><i class="fas fa-layer-group text-success mr-1"></i>Bulk Updates</div>
+                  <div class="small text-muted mb-2">Import pushes alt text live.</div>
+                  <div class="d-flex flex-wrap">
+                    <form method="POST" class="mr-1 mb-1">
+                      <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                      <input type="hidden" name="action" value="export_images">
+                      <input type="hidden" name="q" value="<?php echo htmlspecialchars($search); ?>">
+                      <button type="submit" class="btn btn-sm btn-outline-secondary font-weight-bold" title="Export images and alt text"><i class="fas fa-file-export mr-1"></i>Export</button>
+                    </form>
+                    <form method="POST" enctype="multipart/form-data" class="mr-1 mb-1" onsubmit="return confirm('Import will push alt text to the live store immediately. Continue?');">
+                      <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                      <input type="hidden" name="action" value="import_images">
+                      <label class="btn btn-sm btn-outline-secondary font-weight-bold mb-0" title="Import alt text and push to Shopify"><i class="fas fa-file-import mr-1"></i>Import<input type="file" name="images_csv" accept=".csv,text/csv" class="d-none" onchange="if(this.form.onsubmit()){this.form.submit()}else{this.value=''}"></label>
+                    </form>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
+
+      <form method="GET" class="form-inline mb-3">
+        <input type="text" name="q" value="<?php echo htmlspecialchars($search); ?>" class="form-control form-control-sm mr-2" placeholder="Search file name">
+        <button class="btn btn-sm btn-primary mr-2" type="submit">Search</button>
+        <a class="btn btn-sm btn-outline-secondary" href="?refresh=1&q=<?php echo urlencode($search); ?>" title="Rebuild the usage cache">Refresh usage</a>
+      </form>
+
+      <?php if ($notice): ?>
+        <div class="alert alert-<?php echo $noticeType; ?>"><?php echo $notice; ?></div>
+      <?php endif; ?>
 
       <?php if ($error): ?>
         <div class="alert alert-danger"><?php echo htmlspecialchars($error); ?>
