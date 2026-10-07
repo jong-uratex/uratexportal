@@ -451,7 +451,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         }
 
         // Determine Publish State
-        $isPublished = ($submitAction === 'publish' || $visibility === 'visible');
+        $isPublished = ($submitAction === 'publish' && $visibility === 'visible');
         $statusStr   = $isPublished ? 'published' : 'draft';
         $publishedAt = $isPublished ? date('c') : null;
 
