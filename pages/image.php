@@ -32,6 +32,22 @@ function imgKey(?string $url): string
     return strtolower(pathinfo(basename($path), PATHINFO_FILENAME));
 }
 
+/** Candidate Shopify file queries for a search term, from most to least specific (quoted wildcards don't match). */
+function fileQueryVariants(string $term): array
+{
+    $base = 'media_type:IMAGE';
+    $term = trim(str_replace(['"', '\\', '(', ')', ':', '*'], '', $term));
+    if ($term === '') {
+        return [$base];
+    }
+    $v = [$base . ' AND filename:' . str_replace(' ', '', $term) . '*', $base . ' AND ' . $term . '*'];
+    $tokens = preg_split('/[^A-Za-z0-9]+/', $term, -1, PREG_SPLIT_NO_EMPTY);
+    if ($tokens && $tokens[0] !== $term) {
+        $v[] = $base . ' AND filename:' . $tokens[0] . '*';
+    }
+    return $v;
+}
+
 /**
  * Builds a map of image key (media id / filename) => list of ['type','title','url'] usages.
  * Covers products, collections and blog articles. Cached in session for 10 minutes.
@@ -170,10 +186,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'expor
         exit('Invalid CSRF token.');
     }
     set_time_limit(300);
-    $exQuery = 'media_type:IMAGE';
-    $exSearch = trim((string)($_POST['q'] ?? ''));
-    if ($exSearch !== '') {
-        $exQuery .= ' AND filename:"' . str_replace(['"', '\\'], '', $exSearch) . '*"';
+    $exVariants = fileQueryVariants(trim((string)($_POST['q'] ?? '')));
+    $exQuery = $exVariants[0];
+    foreach ($exVariants as $cand) {
+        $probe = shopifyGraphQLRequest('query($query:String){files(first:1,query:$query){nodes{id}}}', ['query' => $cand], $activeStore);
+        if (!empty($probe['data']['data']['files']['nodes'])) {
+            $exQuery = $cand;
+            break;
+        }
     }
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="uratex_images_' . $activeStore . '_' . date('Y-m-d_His') . '.csv"');
@@ -322,10 +342,9 @@ $debug   = '';
 $images  = [];
 $pageInfo = ['hasNextPage' => false, 'endCursor' => null];
 
-$searchQuery = 'media_type:IMAGE';
-if ($search !== '') {
-    $searchQuery .= ' AND filename:' . '"' . str_replace(['"', '\\'], '', $search) . '*"';
-}
+$variants = fileQueryVariants($search);
+$vIdx     = $page > 1 ? min((int)($_SESSION[$pgKey . '_v'] ?? 0), count($variants) - 1) : 0;
+$searchQuery = $variants[$vIdx];
 
 $q = 'query($after:String,$query:String){files(first:25,after:$after,query:$query,sortKey:CREATED_AT,reverse:true){
         pageInfo{hasNextPage endCursor}
@@ -333,6 +352,14 @@ $q = 'query($after:String,$query:String){files(first:25,after:$after,query:$quer
           ... on MediaImage{image{url width height} originalSource{fileSize}}}}}';
 $r = shopifyGraphQLRequest($q, ['after' => $after ?: null, 'query' => $searchQuery], $activeStore);
 $files = $r['data']['data']['files'] ?? null;
+if ($page === 1) {
+    while ($files && !$files['nodes'] && $vIdx + 1 < count($variants)) {
+        $vIdx++;
+        $r = shopifyGraphQLRequest($q, ['after' => null, 'query' => $variants[$vIdx]], $activeStore);
+        $files = $r['data']['data']['files'] ?? null;
+    }
+    $_SESSION[$pgKey . '_v'] = $vIdx;
+}
 if (!$files) {
     $error = $r['data']['errors'][0]['message'] ?? ($r['error'] ?: 'Unable to load files from Shopify (check API scopes read_files/write_files).');
     $sc = shopifyGraphQLRequest('{currentAppInstallation{accessScopes{handle}}}', [], $activeStore);
