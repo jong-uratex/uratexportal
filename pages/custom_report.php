@@ -26,6 +26,8 @@ $page = max(1, (int)($_GET['page'] ?? 1));
 $search = trim($_GET['search'] ?? '');
 
 $rows = [];
+$kpi = ['orders' => 0, 'revenue' => 0, 'customers' => 0];
+$monthly = $byPayment = $byFulfillment = $byCity = [];
 $total = 0;
 $error = '';
 
@@ -45,9 +47,60 @@ if (!$db) {
             $params[':q1'] = $params[':q2'] = $params[':q3'] = $params[':q4'] = $like;
         }
 
+        if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+            $stmt = $db->prepare(
+                "SELECT order_number, created_at, full_name, email, phone, shipping_address, shipping_city, shipping_zip,
+                        order_details, total_price, financial_status, fulfillment_status
+                 FROM shopify_orders WHERE $where ORDER BY created_at DESC, id DESC"
+            );
+            $stmt->execute($params);
+            header('Content-Type: text/csv; charset=utf-8');
+            header('Content-Disposition: attachment; filename="orders_report_' . REPORT_YEAR . '_' . $activeStore . '_' . date('Ymd_His') . '.csv"');
+            $out = fopen('php://output', 'w');
+            fwrite($out, "\xEF\xBB\xBF");
+            fputcsv($out, ['Order #', 'Order Date', 'Customer', 'Email', 'Phone', 'Shipping Address', 'City', 'ZIP', 'Order Details', 'Total', 'Payment Status', 'Fulfillment Status']);
+            while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                $r['total_price'] = number_format((float)$r['total_price'], 2, '.', '');
+                $r = array_map(function ($v) {
+                    $v = str_replace(["\r\n", "\r", "\n"], ' | ', (string)$v);
+                    return preg_match('/^[=+\-@\t]/', $v) ? "'" . $v : $v;
+                }, $r);
+                fputcsv($out, array_values($r));
+            }
+            fclose($out);
+            exit;
+        }
+
         $stmt = $db->prepare("SELECT COUNT(*) FROM shopify_orders WHERE $where");
         $stmt->execute($params);
         $total = (int)$stmt->fetchColumn();
+
+        $stmt = $db->prepare(
+            "SELECT COUNT(*) AS orders, COALESCE(SUM(total_price),0) AS revenue,
+                    COUNT(DISTINCT NULLIF(LOWER(email),'')) AS customers
+             FROM shopify_orders WHERE $where"
+        );
+        $stmt->execute($params);
+        $kpi = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        $stmt = $db->prepare(
+            "SELECT DATE_FORMAT(created_at,'%Y-%m') AS m, COUNT(*) AS orders, SUM(total_price) AS revenue
+             FROM shopify_orders WHERE $where GROUP BY m ORDER BY m"
+        );
+        $stmt->execute($params);
+        $monthly = array_column($stmt->fetchAll(PDO::FETCH_ASSOC), null, 'm');
+
+        $group = function (string $col, int $limit = 10) use ($db, $where, $params) {
+            $stmt = $db->prepare(
+                "SELECT COALESCE(NULLIF(TRIM($col),''),'Unknown') AS label, COUNT(*) AS c
+                 FROM shopify_orders WHERE $where GROUP BY label ORDER BY c DESC LIMIT $limit"
+            );
+            $stmt->execute($params);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC);
+        };
+        $byPayment = $group('financial_status');
+        $byFulfillment = $group('fulfillment_status');
+        $byCity = $group('shipping_city');
 
         $totalPages = max(1, (int)ceil($total / $perPage));
         $page = min($page, $totalPages);
@@ -76,7 +129,7 @@ function reportUrl(array $over = []): string
     if ($q['search'] === '') {
         unset($q['search']);
     }
-    return '?' . http_build_query($q);
+    return '?' . http_build_query(array_filter($q, fn($v) => $v !== null));
 }
 
 function e($v): string
@@ -100,6 +153,20 @@ function pageWindow(int $current, int $last): array
     }
     return $out;
 }
+
+$monthLabels = $monthOrders = $monthRevenue = [];
+for ($m = 1; $m <= 12; $m++) {
+    $key = sprintf('%d-%02d', REPORT_YEAR, $m);
+    $monthLabels[] = date('M', mktime(0, 0, 0, $m, 1));
+    $monthOrders[] = (int)($monthly[$key]['orders'] ?? 0);
+    $monthRevenue[] = round((float)($monthly[$key]['revenue'] ?? 0), 2);
+}
+$pie = fn(array $d) => ['labels' => array_column($d, 'label'), 'data' => array_map('intval', array_column($d, 'c'))];
+$chartData = [
+    'months' => $monthLabels, 'orders' => $monthOrders, 'revenue' => $monthRevenue,
+    'payment' => $pie($byPayment), 'fulfillment' => $pie($byFulfillment), 'city' => $pie($byCity),
+];
+$avgOrder = $kpi['orders'] ? $kpi['revenue'] / $kpi['orders'] : 0;
 
 $from = $total ? ($page - 1) * $perPage + 1 : 0;
 $to = min($total, $page * $perPage);
@@ -125,6 +192,36 @@ include __DIR__ . '/../includes/sidebar.php';
         <div class="alert alert-danger"><?php echo e($error); ?></div>
       <?php endif; ?>
 
+      <div class="row">
+        <?php foreach ([
+            ['Orders', number_format($kpi['orders']), 'fa-shopping-cart', 'primary'],
+            ['Revenue', '₱' . number_format((float)$kpi['revenue'], 2), 'fa-peso-sign', 'success'],
+            ['Avg. Order Value', '₱' . number_format($avgOrder, 2), 'fa-chart-line', 'info'],
+            ['Unique Customers', number_format($kpi['customers']), 'fa-users', 'warning'],
+        ] as [$label, $val, $icon, $color]): ?>
+          <div class="col-6 col-lg-3">
+            <div class="small-box bg-<?php echo $color; ?>">
+              <div class="inner"><h3 style="font-size: 1.6rem;"><?php echo e($val); ?></h3><p><?php echo e($label); ?></p></div>
+              <div class="icon"><i class="fas <?php echo $icon; ?>"></i></div>
+            </div>
+          </div>
+        <?php endforeach; ?>
+      </div>
+
+      <div class="row">
+        <div class="col-lg-8"><div class="card shadow-sm"><div class="card-header font-weight-bold">Monthly Orders &amp; Revenue</div>
+          <div class="card-body"><canvas id="chartMonthly" height="110"></canvas></div></div></div>
+        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Payment Status</div>
+          <div class="card-body"><canvas id="chartPayment" height="220"></canvas></div></div></div>
+      </div>
+      <div class="row">
+        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Fulfillment Status</div>
+          <div class="card-body"><canvas id="chartFulfillment" height="220"></canvas></div></div></div>
+        <div class="col-lg-8"><div class="card shadow-sm"><div class="card-header font-weight-bold">Top 10 Shipping Cities</div>
+          <div class="card-body"><canvas id="chartCity" height="110"></canvas></div></div></div>
+      </div>
+      <p class="small text-muted">Summary reflects the current search filter.</p>
+
       <div class="card shadow-sm" style="border-radius: 12px;">
         <div class="card-header bg-white">
           <form method="get" class="form-inline justify-content-between">
@@ -138,6 +235,7 @@ include __DIR__ . '/../includes/sidebar.php';
               </div>
             </div>
             <div class="form-group form-group-sm mt-2 mt-md-0">
+              <a class="btn btn-success btn-sm mr-3" href="<?php echo e(reportUrl(['export' => 'csv', 'page' => null])); ?>"><i class="fas fa-download mr-1"></i> Download CSV</a>
               <label class="small text-muted mr-2" for="per_page">Rows per page</label>
               <select name="per_page" id="per_page" class="form-control form-control-sm" onchange="this.form.submit()">
                 <?php foreach ($perPageOptions as $opt): ?>
@@ -218,6 +316,39 @@ include __DIR__ . '/../includes/sidebar.php';
     </div>
   </section>
 </div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+(function () {
+  var d = <?php echo json_encode($chartData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+  var colors = ['#003399', '#FFCC00', '#17a2b8', '#28a745', '#dc3545', '#6f42c1', '#fd7e14', '#20c997', '#6c757d', '#e83e8c'];
+  var pie = function (id, src) {
+    new Chart(document.getElementById(id), {
+      type: 'doughnut',
+      data: { labels: src.labels, datasets: [{ data: src.data, backgroundColor: colors }] },
+      options: { plugins: { legend: { position: 'bottom' } } }
+    });
+  };
+  new Chart(document.getElementById('chartMonthly'), {
+    data: {
+      labels: d.months,
+      datasets: [
+        { type: 'bar', label: 'Orders', data: d.orders, backgroundColor: '#003399', yAxisID: 'y' },
+        { type: 'line', label: 'Revenue (₱)', data: d.revenue, borderColor: '#e6b800', backgroundColor: '#FFCC00', tension: 0.3, yAxisID: 'y1' }
+      ]
+    },
+    options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Orders' } },
+                         y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Revenue' } } } }
+  });
+  pie('chartPayment', d.payment);
+  pie('chartFulfillment', d.fulfillment);
+  new Chart(document.getElementById('chartCity'), {
+    type: 'bar',
+    data: { labels: d.city.labels, datasets: [{ label: 'Orders', data: d.city.data, backgroundColor: '#17a2b8' }] },
+    options: { indexAxis: 'y', plugins: { legend: { display: false } } }
+  });
+})();
+</script>
 
 <?php
 include __DIR__ . '/../includes/footer.php';
