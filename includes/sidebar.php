@@ -82,6 +82,12 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Orders</p>
           </a>
         </li>
+        <li class="nav-item">
+          <a href="custom_report.php" class="nav-link <?php echo ($currentScript === 'custom_report.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-file-alt"></i>
+            <p>Custom Report</p>
+          </a>
+        </li>
         <?php endif; ?>
         <li class="nav-header text-uppercase text-secondary font-weight-bold" style="font-size: 11px;">Tools & Utilities</li>
         <li class="nav-item">
