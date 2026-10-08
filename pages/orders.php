@@ -80,6 +80,73 @@ function buildExtraQuery(string $search, string $filterStatus): string
     return $params ? '&' . implode('&', $params) : '';
 }
 
+$exportDateRanges = [
+    'all'        => 'All dates',
+    '24_hours'   => '24 hours',
+    '48_hours'   => '48 hours',
+    '1_week'     => '1 week',
+    '2_weeks'    => '2 weeks',
+    '1_month'    => '1 month',
+    '3_months'   => '3 months',
+    '1_year'     => '1 year',
+    'custom'     => 'Custom date'
+];
+$requestedExportDateRange = $_GET['date_range'] ?? 'all';
+$selectedExportDateRange = is_string($requestedExportDateRange) ? $requestedExportDateRange : 'all';
+$exportDateFromInput = isset($_GET['date_from']) && is_string($_GET['date_from']) ? $_GET['date_from'] : '';
+$exportDateToInput = isset($_GET['date_to']) && is_string($_GET['date_to']) ? $_GET['date_to'] : '';
+$exportDateFrom = '';
+$exportDateTo = '';
+$exportDateParams = [];
+$exportDateDescription = $exportDateRanges[$selectedExportDateRange] ?? 'All dates';
+
+if (isset($_GET['export']) && in_array($_GET['export'], ['email', 'sms'], true)) {
+    if (!is_string($requestedExportDateRange) || !array_key_exists($requestedExportDateRange, $exportDateRanges)) {
+        http_response_code(400);
+        exit('Invalid export date range.');
+    }
+
+    if ($selectedExportDateRange === 'custom') {
+        $startDate = DateTimeImmutable::createFromFormat('!Y-m-d', $exportDateFromInput);
+        $endDate = DateTimeImmutable::createFromFormat('!Y-m-d', $exportDateToInput);
+
+        if (
+            !$startDate || !$endDate ||
+            $startDate->format('Y-m-d') !== $exportDateFromInput ||
+            $endDate->format('Y-m-d') !== $exportDateToInput ||
+            $startDate > $endDate
+        ) {
+            http_response_code(400);
+            exit('Select a valid custom start and end date for the export.');
+        }
+
+        $exportDateFrom = $startDate->format('Y-m-d 00:00:00');
+        $exportDateTo = $endDate->format('Y-m-d 23:59:59');
+        $exportDateParams = [
+            ':created_from' => $exportDateFrom,
+            ':created_to' => $exportDateTo
+        ];
+        $exportDateDescription = $exportDateFromInput . ' to ' . $exportDateToInput;
+    } elseif ($selectedExportDateRange !== 'all') {
+        $relativeRanges = [
+            '24_hours' => '-24 hours',
+            '48_hours' => '-48 hours',
+            '1_week' => '-1 week',
+            '2_weeks' => '-2 weeks',
+            '1_month' => '-1 month',
+            '3_months' => '-3 months',
+            '1_year' => '-1 year'
+        ];
+        $now = new DateTimeImmutable();
+        $exportDateFrom = $now->modify($relativeRanges[$selectedExportDateRange])->format('Y-m-d H:i:s');
+        $exportDateTo = $now->format('Y-m-d H:i:s');
+        $exportDateParams = [
+            ':created_from' => $exportDateFrom,
+            ':created_to' => $exportDateTo
+        ];
+    }
+}
+
 /**
  * Normalize marketing consent value to "yes" / "no"
  */
@@ -562,7 +629,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
-    recordUserLog('Export Orders CSV', 'Email Marketing Export', "Exported email-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "').", 'system', null, 'success');
+    recordUserLog('Export Orders CSV', 'Email Marketing Export', "Exported email-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "', date range: '{$exportDateDescription}').", 'system', null, 'success');
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -593,6 +660,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
             if ($filterStatus !== '') {
                 $where .= " AND fulfillment_status = :status";
                 $params[':status'] = $filterStatus;
+            }
+            if ($exportDateParams) {
+                $where .= " AND created_at >= :created_from AND created_at <= :created_to";
+                $params = array_merge($params, $exportDateParams);
             }
 
             $stmt = $db->prepare("SELECT * FROM shopify_orders WHERE {$where} ORDER BY created_at DESC");
@@ -628,7 +699,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
-    recordUserLog('Export Orders CSV', 'SMS Marketing Export', "Exported sms-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "').", 'system', null, 'success');
+    recordUserLog('Export Orders CSV', 'SMS Marketing Export', "Exported sms-marketing orders CSV for {$activeStore} store (search: '" . ($search !== '' ? $search : '—') . "', status filter: '" . ($filterStatus !== '' ? $filterStatus : 'all') . "', date range: '{$exportDateDescription}').", 'system', null, 'success');
 
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -659,6 +730,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
             if ($filterStatus !== '') {
                 $where .= " AND fulfillment_status = :status";
                 $params[':status'] = $filterStatus;
+            }
+            if ($exportDateParams) {
+                $where .= " AND created_at >= :created_from AND created_at <= :created_to";
+                $params = array_merge($params, $exportDateParams);
             }
 
             $stmt = $db->prepare("SELECT * FROM shopify_orders WHERE {$where} ORDER BY created_at DESC");
@@ -722,14 +797,42 @@ include __DIR__ . '/../includes/sidebar.php';
               <i class="fas fa-sync-alt mr-1"></i> Sync Orders Data
             </button>
           </form>
-          <a href="orders.php?export=email<?php echo $extraQuery; ?>" class="btn btn-success btn-sm shadow-sm font-weight-bold mr-1">
-            <i class="fas fa-envelope mr-1"></i> Export with Email
-          </a>
-          <a href="orders.php?export=sms<?php echo $extraQuery; ?>" class="btn btn-primary btn-sm shadow-sm font-weight-bold">
-            <i class="fas fa-sms mr-1"></i> Export with SMS
-          </a>
         </div>
       </div>
+      <form method="get" action="orders.php" id="marketingExportForm" class="row justify-content-end align-items-end mt-3">
+        <?php if ($search !== ''): ?>
+          <input type="hidden" name="search" value="<?php echo htmlspecialchars($search); ?>">
+        <?php endif; ?>
+        <?php if ($filterStatus !== ''): ?>
+          <input type="hidden" name="status" value="<?php echo htmlspecialchars($filterStatus); ?>">
+        <?php endif; ?>
+        <div class="col-auto mb-2">
+          <label for="exportDateRange" class="small text-muted mb-1">Export orders from</label>
+          <select name="date_range" id="exportDateRange" class="form-control form-control-sm">
+            <?php foreach ($exportDateRanges as $rangeValue => $rangeLabel): ?>
+              <option value="<?php echo htmlspecialchars($rangeValue); ?>" <?php echo $selectedExportDateRange === $rangeValue ? 'selected' : ''; ?>>
+                <?php echo htmlspecialchars($rangeLabel); ?>
+              </option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <div class="col-auto mb-2 custom-export-date" style="display: none;">
+          <label for="exportDateFrom" class="small text-muted mb-1">From</label>
+          <input type="date" name="date_from" id="exportDateFrom" class="form-control form-control-sm" value="<?php echo htmlspecialchars($exportDateFromInput); ?>">
+        </div>
+        <div class="col-auto mb-2 custom-export-date" style="display: none;">
+          <label for="exportDateTo" class="small text-muted mb-1">To</label>
+          <input type="date" name="date_to" id="exportDateTo" class="form-control form-control-sm" value="<?php echo htmlspecialchars($exportDateToInput); ?>">
+        </div>
+        <div class="col-auto mb-2">
+          <button type="submit" name="export" value="email" class="btn btn-success btn-sm shadow-sm font-weight-bold mr-1">
+            <i class="fas fa-envelope mr-1"></i> Export with Email
+          </button>
+          <button type="submit" name="export" value="sms" class="btn btn-primary btn-sm shadow-sm font-weight-bold">
+            <i class="fas fa-sms mr-1"></i> Export with SMS
+          </button>
+        </div>
+      </form>
     </div>
   </div>
 
@@ -1186,6 +1289,21 @@ document.getElementById('syncOrdersForm').addEventListener('submit', async funct
     btn.innerHTML = label;
   }
 });
+
+var exportDateRange = document.getElementById('exportDateRange');
+var customExportDateFields = document.querySelectorAll('.custom-export-date');
+var exportDateFrom = document.getElementById('exportDateFrom');
+var exportDateTo = document.getElementById('exportDateTo');
+function updateCustomExportDateFields() {
+  var isCustomRange = exportDateRange.value === 'custom';
+  customExportDateFields.forEach(function (field) {
+    field.style.display = isCustomRange ? '' : 'none';
+  });
+  exportDateFrom.required = isCustomRange;
+  exportDateTo.required = isCustomRange;
+}
+exportDateRange.addEventListener('change', updateCustomExportDateFields);
+updateCustomExportDateFields();
 </script>
 <?php
 include __DIR__ . '/../includes/footer.php';
