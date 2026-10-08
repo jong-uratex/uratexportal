@@ -168,7 +168,7 @@ if ($db) {
 // SYNC ORDERS DATA FROM SHOPIFY API
 // -----------------------------------------------------------------------------
 if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
-    @set_time_limit(300);
+    @set_time_limit(0);
     @ini_set('max_execution_time', '300');
     @ini_set('memory_limit', '512M');
 
@@ -227,12 +227,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     last_synced_at = NOW()
             ") : null;
 
-            while ($hasMore && $pageNum <= 50) {
+            while ($hasMore && $pageNum <= 400) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
                 } else {
-                    $endpoint .= '&status=any';
+                    $endpoint .= '&status=any&order=created_at+desc';
                 }
                 $url = "https://" . trim($targetUrl, '/') . $endpoint;
 
@@ -245,7 +245,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 60);
                 curl_setopt($ch, CURLOPT_HEADER, true);
                 curl_setopt($ch, CURLOPT_FAILONERROR, false);
 

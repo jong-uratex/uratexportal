@@ -27,6 +27,7 @@ $search = trim($_GET['search'] ?? '');
 
 $rows = [];
 $kpi = ['orders' => 0, 'revenue' => 0, 'customers' => 0];
+$freshness = ['latest' => null, 'synced' => null];
 $monthly = $byPayment = $byFulfillment = $byCity = [];
 $total = 0;
 $error = '';
@@ -74,6 +75,10 @@ if (!$db) {
         $stmt = $db->prepare("SELECT COUNT(*) FROM shopify_orders WHERE $where");
         $stmt->execute($params);
         $total = (int)$stmt->fetchColumn();
+
+        $stmt = $db->prepare("SELECT MAX(created_at) AS latest, MAX(last_synced_at) AS synced FROM shopify_orders WHERE store_key = :store");
+        $stmt->execute([':store' => $activeStore]);
+        $freshness = $stmt->fetch(PDO::FETCH_ASSOC);
 
         $stmt = $db->prepare(
             "SELECT COUNT(*) AS orders, COALESCE(SUM(total_price),0) AS revenue,
@@ -188,6 +193,12 @@ include __DIR__ . '/../includes/sidebar.php';
 
   <section class="content">
     <div class="container-fluid">
+      <?php if (!empty($freshness['latest'])): ?>
+        <div class="alert alert-<?php echo strtotime($freshness['latest']) < strtotime('-2 days') ? 'warning' : 'light'; ?> py-2 small">
+          Data comes from the last Orders sync (<?php echo e($freshness['synced']); ?>); newest order stored: <?php echo e($freshness['latest']); ?>.
+          Newer orders appear after you click <a href="orders.php">Sync Orders Data on the Orders page</a>.
+        </div>
+      <?php endif; ?>
       <?php if ($error): ?>
         <div class="alert alert-danger"><?php echo e($error); ?></div>
       <?php endif; ?>
