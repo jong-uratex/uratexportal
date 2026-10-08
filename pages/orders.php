@@ -185,10 +185,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
         recordUserLog('Sync Orders Failed', 'Shopify API', "Orders sync aborted for {$activeStore} store — missing: " . implode(', ', $missing) . '.', 'system', null, 'error');
     } else {
         try {
-            $pageInfo  = null;
-            $hasMore   = true;
-            $pageNum   = 1;
-            $syncCount = 0;
+            $isAjaxSync = !empty($_POST['ajax']);
+            $pageInfo   = ($isAjaxSync && !empty($_POST['page_info'])) ? (string)$_POST['page_info'] : null;
+            $hasMore    = true;
+            $pageNum    = 1;
+            $syncCount  = 0;
+            // Small batches per request keep each call under the web server timeout.
+            $maxPages   = $isAjaxSync ? 2 : 400;
 
             $insertStmt = $db ? $db->prepare("
                 INSERT INTO shopify_orders (
@@ -227,7 +230,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     last_synced_at = NOW()
             ") : null;
 
-            while ($hasMore && $pageNum <= 400) {
+            while ($hasMore && $pageNum <= $maxPages) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
@@ -424,6 +427,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 $pageNum++;
             }
 
+            if ($isAjaxSync) {
+                header('Content-Type: application/json');
+                echo json_encode(['ok' => true, 'synced' => $syncCount, 'next' => $hasMore ? $pageInfo : null]);
+                exit;
+            }
+
             $message     = 'Successfully synced ' . number_format($syncCount) . ' orders from ' . $activeStore . ' store into the database.';
             $messageType = 'success';
 
@@ -432,6 +441,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             }
 
         } catch (Exception $e) {
+            if (!empty($isAjaxSync)) {
+                if ($db && $db->inTransaction()) {
+                    $db->rollBack();
+                }
+                header('Content-Type: application/json');
+                echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+                exit;
+            }
             $message     = 'Error syncing orders: ' . $e->getMessage();
             $messageType = 'danger';
             recordUserLog('Sync Orders Failed', 'Shopify API', "Orders sync failed for {$activeStore} store: " . $e->getMessage(), 'system', null, 'error');
@@ -699,9 +716,9 @@ include __DIR__ . '/../includes/sidebar.php';
               <i class="fas fa-plug mr-1"></i> Test Connection
             </button>
           </form>
-          <form method="post" class="d-inline-block mr-2" onsubmit="return confirm('This will pull all orders from Shopify into the database. Continue?');">
+          <form method="post" id="syncOrdersForm" class="d-inline-block mr-2">
             <input type="hidden" name="action" value="sync_orders">
-            <button type="submit" class="btn btn-warning btn-sm shadow-sm font-weight-bold">
+            <button type="submit" id="syncOrdersBtn" class="btn btn-warning btn-sm shadow-sm font-weight-bold">
               <i class="fas fa-sync-alt mr-1"></i> Sync Orders Data
             </button>
           </form>
@@ -719,6 +736,19 @@ include __DIR__ . '/../includes/sidebar.php';
   <!-- Main Content -->
   <section class="content">
     <div class="container-fluid">
+
+      <div id="syncProgress" class="card shadow-sm border-warning" style="display:none; border-radius: 12px;">
+        <div class="card-body py-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <strong><i class="fas fa-sync-alt fa-spin mr-2 text-warning"></i>Syncing orders in batches...</strong>
+            <span class="small text-muted" id="syncStatus"></span>
+          </div>
+          <div class="progress" style="height: 18px;">
+            <div class="progress-bar progress-bar-striped progress-bar-animated bg-warning" style="width: 100%;"></div>
+          </div>
+          <div class="small text-muted mt-2">Batch <span id="syncBatch">0</span> &middot; <span id="syncCount">0</span> orders saved. Please keep this page open.</div>
+        </div>
+      </div>
 
       <!-- Connection Test Results -->
       <?php if (!empty($testResults)): ?>
@@ -1108,6 +1138,55 @@ include __DIR__ . '/../includes/sidebar.php';
   </section>
 </div>
 
+<?php
+?>
+<script>
+document.getElementById('syncOrdersForm').addEventListener('submit', async function (ev) {
+  ev.preventDefault();
+  if (!confirm('This will pull all orders from Shopify into the database. Continue?')) return;
+  var btn = document.getElementById('syncOrdersBtn'), label = btn.innerHTML;
+  btn.disabled = true;
+  var panel = document.getElementById('syncProgress'), status = document.getElementById('syncStatus');
+  var batchEl = document.getElementById('syncBatch'), countEl = document.getElementById('syncCount');
+  var warn = function (e) { e.preventDefault(); e.returnValue = ''; };
+  window.addEventListener('beforeunload', warn);
+  panel.style.display = '';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  var total = 0, next = '', failures = 0, batch = 0;
+  try {
+    do {
+      var body = new URLSearchParams({ action: 'sync_orders', ajax: '1', page_info: next });
+      var res, json;
+      status.textContent = 'Fetching batch ' + (batch + 1) + '...';
+      try {
+        res = await fetch(window.location.pathname, { method: 'POST', body: body, credentials: 'same-origin' });
+        json = await res.json();
+      } catch (e) {
+        if (++failures <= 3) { status.textContent = 'Retrying (' + failures + '/3)...'; await new Promise(function (r) { setTimeout(r, 2000); }); continue; }
+        throw new Error('Server busy or unreachable. Synced ' + total + ' orders so far; run the sync again to continue.');
+      }
+      failures = 0;
+      if (!json.ok) throw new Error(json.error || 'Sync failed');
+      total += json.synced;
+      batch++;
+      batchEl.textContent = batch;
+      countEl.textContent = total.toLocaleString();
+      next = json.next || '';
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Synced ' + total.toLocaleString() + ' orders...';
+    } while (next);
+    window.removeEventListener('beforeunload', warn);
+    status.textContent = 'Done';
+    alert('Synced ' + total.toLocaleString() + ' orders.');
+    window.location.reload();
+  } catch (e) {
+    window.removeEventListener('beforeunload', warn);
+    panel.style.display = 'none';
+    alert(e.message);
+    btn.disabled = false;
+    btn.innerHTML = label;
+  }
+});
+</script>
 <?php
 include __DIR__ . '/../includes/footer.php';
 ?>
