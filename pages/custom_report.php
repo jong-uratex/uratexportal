@@ -192,6 +192,10 @@ include __DIR__ . '/../includes/sidebar.php';
         <div class="alert alert-danger"><?php echo e($error); ?></div>
       <?php endif; ?>
 
+      <div class="d-flex justify-content-end mb-2">
+        <button type="button" id="btnPdf" class="btn btn-danger btn-sm"><i class="fas fa-file-pdf mr-1"></i> Download Analytics PDF</button>
+      </div>
+      <div id="analytics" class="bg-white p-2">
       <div class="row">
         <?php foreach ([
             ['Orders', number_format($kpi['orders']), 'fa-shopping-cart', 'primary'],
@@ -221,6 +225,7 @@ include __DIR__ . '/../includes/sidebar.php';
           <div class="card-body"><canvas id="chartCity" height="110"></canvas></div></div></div>
       </div>
       <p class="small text-muted">Summary reflects the current search filter.</p>
+      </div>
 
       <div class="card shadow-sm" style="border-radius: 12px;">
         <div class="card-header bg-white">
@@ -318,6 +323,8 @@ include __DIR__ . '/../includes/sidebar.php';
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script>
 (function () {
   var d = <?php echo json_encode($chartData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
@@ -346,6 +353,36 @@ include __DIR__ . '/../includes/sidebar.php';
     type: 'bar',
     data: { labels: d.city.labels, datasets: [{ label: 'Orders', data: d.city.data, backgroundColor: '#17a2b8' }] },
     options: { indexAxis: 'y', plugins: { legend: { display: false } } }
+  });
+
+  document.getElementById('btnPdf').addEventListener('click', function () {
+    var btn = this, label = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Generating...';
+    var el = document.getElementById('analytics');
+    html2canvas(el, { scale: 2, backgroundColor: '#ffffff' }).then(function (canvas) {
+      var pdf = new window.jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+      var pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight(), m = 30;
+      var title = <?php echo json_encode(ucfirst($activeStore) . ' Orders Analytics ' . REPORT_YEAR . ($search !== '' ? ' (filter: ' . $search . ')' : '')); ?>;
+      pdf.setFontSize(16);
+      pdf.text(title, m, m + 10);
+      pdf.setFontSize(9);
+      pdf.text('Generated ' + new Date().toLocaleString(), m, m + 26);
+      var top = m + 40, w = pw - m * 2, scale = w / canvas.width;
+      var sliceH = Math.floor((ph - top - m) / scale), y = 0, first = true;
+      while (y < canvas.height) {
+        var h = Math.min(sliceH, canvas.height - y);
+        var part = document.createElement('canvas');
+        part.width = canvas.width; part.height = h;
+        part.getContext('2d').drawImage(canvas, 0, y, canvas.width, h, 0, 0, canvas.width, h);
+        if (!first) { pdf.addPage(); }
+        pdf.addImage(part.toDataURL('image/png'), 'PNG', m, first ? top : m, w, h * scale);
+        y += h; first = false;
+        sliceH = Math.floor((ph - m * 2) / scale);
+      }
+      pdf.save('orders_analytics_<?php echo REPORT_YEAR . '_' . e($activeStore); ?>.pdf');
+    }).catch(function () { alert('Could not generate PDF.'); })
+      .finally(function () { btn.disabled = false; btn.innerHTML = label; });
   });
 })();
 </script>
