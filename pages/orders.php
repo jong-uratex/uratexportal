@@ -204,6 +204,7 @@ if ($db) {
                 `order_details` TEXT NULL DEFAULT NULL,
                 `shipping_city` VARCHAR(255) NULL DEFAULT NULL,
                 `shipping_zip` VARCHAR(50) NULL DEFAULT NULL,
+                `delivery_date` DATETIME NULL DEFAULT NULL,
                 `last_synced_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (`id`),
                 UNIQUE KEY `uq_store_order` (`store_key`, `shopify_order_id`),
@@ -215,7 +216,8 @@ if ($db) {
         ");
 
         // Ensure columns exist even if table was created earlier
-        $cols = $db->query("SHOW COLUMNS FROM `shopify_orders`")->fetchAll(PDO::FETCH_COLUMN);
+        $columnDetails = $db->query("SHOW COLUMNS FROM `shopify_orders`")->fetchAll(PDO::FETCH_ASSOC);
+        $cols = array_column($columnDetails, 'Field');
 
         if (!in_array('accepts_email_marketing', $cols, true)) {
             $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `accepts_email_marketing` VARCHAR(10) NULL DEFAULT NULL COMMENT 'yes / no' AFTER `phone`");
@@ -226,8 +228,20 @@ if ($db) {
         if (!in_array('order_details', $cols, true)) {
             $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `order_details` TEXT NULL DEFAULT NULL COMMENT 'Product name(s) + qty' AFTER `line_items`");
         }
+        if (!in_array('delivery_date', $cols, true)) {
+            $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `delivery_date` DATETIME NULL DEFAULT NULL AFTER `shipping_zip`");
+        } else {
+            foreach ($columnDetails as $column) {
+                if ($column['Field'] === 'delivery_date' && $column['Null'] === 'NO') {
+                    $db->exec("ALTER TABLE `shopify_orders` MODIFY COLUMN `delivery_date` DATETIME NULL DEFAULT NULL");
+                    break;
+                }
+            }
+        }
     } catch (PDOException $e) {
-        // keep going
+        $message = 'Unable to prepare the orders database table: ' . $e->getMessage();
+        $messageType = 'danger';
+        recordUserLog('Orders Database Setup Failed', 'Database', $message, 'system', null, 'error');
     }
 }
 
@@ -260,19 +274,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             // Small batches per request keep each call under the web server timeout.
             $maxPages   = $isAjaxSync ? 2 : 400;
 
-            $insertStmt = $db ? $db->prepare("
+            if (!$db || $messageType === 'danger') {
+                throw new Exception($message !== '' ? $message : 'Database connection is unavailable.');
+            }
+
+            $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
                     accepts_email_marketing, accepts_sms_marketing,
                     shipping_address, billing_address, order_number, total_price,
                     financial_status, fulfillment_status, fulfillment_details,
-                    created_at, updated_at, line_items, order_details, shipping_city, shipping_zip, last_synced_at
+                    created_at, updated_at, line_items, order_details, shipping_city, shipping_zip, delivery_date, last_synced_at
                 ) VALUES (
                     :store_key, :shopify_order_id, :customer_id, :full_name, :email, :phone,
                     :accepts_email_marketing, :accepts_sms_marketing,
                     :shipping_address, :billing_address, :order_number, :total_price,
                     :financial_status, :fulfillment_status, :fulfillment_details,
-                    :created_at, :updated_at, :line_items, :order_details, :shipping_city, :shipping_zip, NOW()
+                    :created_at, :updated_at, :line_items, :order_details, :shipping_city, :shipping_zip, :delivery_date, NOW()
                 )
                 ON DUPLICATE KEY UPDATE
                     customer_id = VALUES(customer_id),
@@ -294,8 +312,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     order_details = VALUES(order_details),
                     shipping_city = VALUES(shipping_city),
                     shipping_zip = VALUES(shipping_zip),
+                    delivery_date = VALUES(delivery_date),
                     last_synced_at = NOW()
-            ") : null;
+            ");
 
             while ($hasMore && $pageNum <= $maxPages) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
@@ -440,6 +459,25 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ? date('Y-m-d H:i:s', strtotime($order['updated_at']))
                             : null;
 
+                        $deliveryDate = null;
+                        if (!empty($order['fulfillments']) && is_array($order['fulfillments'])) {
+                            foreach ($order['fulfillments'] as $fulfillment) {
+                                if (empty($fulfillment['created_at'])) {
+                                    continue;
+                                }
+                                $fulfillmentTimestamp = strtotime($fulfillment['created_at']);
+                                if ($fulfillmentTimestamp !== false && ($deliveryDate === null || $fulfillmentTimestamp > strtotime($deliveryDate))) {
+                                    $deliveryDate = date('Y-m-d H:i:s', $fulfillmentTimestamp);
+                                }
+                            }
+                        }
+                        if ($deliveryDate === null && !empty($order['closed_at'])) {
+                            $closedTimestamp = strtotime($order['closed_at']);
+                            if ($closedTimestamp !== false) {
+                                $deliveryDate = date('Y-m-d H:i:s', $closedTimestamp);
+                            }
+                        }
+
                         $rawLineItems = $order['line_items'] ?? [];
                         $lineItems    = json_encode($rawLineItems);
                         $orderDetails = buildOrderDetails(is_array($rawLineItems) ? $rawLineItems : []);
@@ -468,7 +506,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ':line_items'               => $lineItems,
                             ':order_details'            => $orderDetails,
                             ':shipping_city'            => $shippingCity,
-                            ':shipping_zip'             => $shippingZip
+                            ':shipping_zip'             => $shippingZip,
+                            ':delivery_date'            => $deliveryDate
                         ]);
                     }
                     if ($db && $db->inTransaction()) {
