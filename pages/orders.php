@@ -664,7 +664,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 // -----------------------------------------------------------------------------
 // CSV EXPORT – Email Marketing (accepts_email_marketing = yes)
 // Columns: Order ID, Order Number, Customer Name, Address, Email,
-//          Order Details, Date of purchase, Financial Status, Fulfillment Status
+//          Order Details, Date of purchase, Delivery Date, Financial Status, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
@@ -683,6 +683,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
         'Email',
         'Order Details (Product name)',
         'Date of purchase (Created at)',
+        'Delivery Date',
         'Financial Status',
         'Fulfillment Status'
     ]);
@@ -718,6 +719,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
                     $order['email'] ?? '',
                     $order['order_details'] ?? '',
                     $order['created_at'] ?? '',
+                    $order['delivery_date'] ?? '',
                     $order['financial_status'] ?? '',
                     $order['fulfillment_status'] ?? ''
                 ]);
@@ -734,7 +736,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
 // -----------------------------------------------------------------------------
 // CSV EXPORT – SMS Marketing (accepts_sms_marketing = yes)
 // Columns: Order ID, Order Number, Customer Name, Address, Phone Number,
-//          Order Details, Date of purchase, Financial Status, Fulfillment Status
+//          Order Details, Date of purchase, Delivery Date, Financial Status, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
@@ -753,6 +755,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
         'Phone Number',
         'Order Details (Product name)',
         'Date of purchase (Created at)',
+        'Delivery Date',
         'Financial Status',
         'Fulfillment Status'
     ]);
@@ -788,6 +791,7 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
                     $order['phone'] ?? '',
                     $order['order_details'] ?? '',
                     $order['created_at'] ?? '',
+                    $order['delivery_date'] ?? '',
                     $order['financial_status'] ?? '',
                     $order['fulfillment_status'] ?? ''
                 ]);
@@ -1099,6 +1103,7 @@ include __DIR__ . '/../includes/sidebar.php';
                 <tr>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Order ID</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Order #</th>
+                  <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Delivery Date</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Customer</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Email</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Phone</th>
@@ -1115,7 +1120,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <tbody>
                 <?php if (empty($orders)): ?>
                   <tr>
-                    <td colspan="13" class="text-center py-4 text-muted">
+                    <td colspan="14" class="text-center py-4 text-muted">
                       <i class="fas fa-inbox fa-2x mb-2"></i><br>
                       No orders found<?php echo ($filterStatus !== '' || $search !== '') ? ' matching your filters.' : '.'; ?>
                       <?php if ($totalRows === 0 && $filterStatus === '' && $search === ''): ?>
@@ -1131,6 +1136,20 @@ include __DIR__ . '/../includes/sidebar.php';
                       </td>
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
                         <strong><?php echo htmlspecialchars($order['order_number'] ?? ''); ?></strong>
+                      </td>
+                      <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
+                        <?php
+                        $deliveryDate = $order['delivery_date'] ?? '';
+                        if (!empty($deliveryDate)) {
+                            try {
+                                echo (new DateTime($deliveryDate))->format('Y-m-d H:i:s');
+                            } catch (Exception $e) {
+                                echo htmlspecialchars($deliveryDate);
+                            }
+                        } else {
+                            echo 'N/A';
+                        }
+                        ?>
                       </td>
                       <td style="padding: 12px; font-size: 13px;">
                         <?php echo htmlspecialchars($order['full_name'] ?? 'N/A'); ?>
