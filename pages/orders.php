@@ -278,6 +278,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 throw new Exception($message !== '' ? $message : 'Database connection is unavailable.');
             }
 
+            $latestOrderStmt = $db->prepare("
+                SELECT shopify_order_id
+                FROM shopify_orders
+                WHERE store_key = :store
+                  AND order_number IS NOT NULL
+                  AND order_number <> ''
+                ORDER BY CAST(REPLACE(order_number, '#', '') AS UNSIGNED) DESC, shopify_order_id DESC
+                LIMIT 1
+            ");
+            $latestOrderStmt->execute([':store' => $activeStore]);
+            $latestOrderId = (int)$latestOrderStmt->fetchColumn();
+
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
                     store_key, shopify_order_id, customer_id, full_name, email, phone,
@@ -322,6 +334,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
                 } else {
                     $endpoint .= '&status=any&order=created_at+desc';
+                    if ($latestOrderId > 0) {
+                        $endpoint .= '&since_id=' . $latestOrderId;
+                    }
                 }
                 $url = "https://" . trim($targetUrl, '/') . $endpoint;
 
@@ -1304,7 +1319,7 @@ include __DIR__ . '/../includes/sidebar.php';
 <script>
 document.getElementById('syncOrdersForm').addEventListener('submit', async function (ev) {
   ev.preventDefault();
-  if (!confirm('This will pull all orders from Shopify into the database. Continue?')) return;
+  if (!confirm('This will sync orders after the latest order number saved in the database. If no orders are saved yet, it will sync all orders. Continue?')) return;
   var btn = document.getElementById('syncOrdersBtn'), label = btn.innerHTML;
   btn.disabled = true;
   var panel = document.getElementById('syncProgress'), status = document.getElementById('syncStatus');
