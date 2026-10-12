@@ -137,6 +137,12 @@ $isCustomerService = ($_SESSION['user_role'] ?? '') === 'customer_service';
         </li>
         <?php endif; ?>
         <li class="nav-item">
+          <a href="user_profile.php" class="nav-link <?php echo ($currentScript === 'user_profile.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-user-cog"></i>
+            <p>My Profile</p>
+          </a>
+        </li>
+        <li class="nav-item">
           <a href="../logout.php" class="nav-link text-danger">
             <i class="nav-icon fas fa-sign-out-alt"></i>
             <p>Logout</p>

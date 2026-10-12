@@ -76,6 +76,10 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <strong>Partner SEO Specialist</strong>
           </div>
           <div class="dropdown-divider"></div>
+          <a href="user_profile.php" class="dropdown-item">
+            <i class="fas fa-user-cog mr-2"></i> My Profile
+          </a>
+          <div class="dropdown-divider"></div>
           <a href="../logout.php" class="dropdown-item text-danger">
             <i class="fas fa-sign-out-alt mr-2"></i> Logout
           </a>

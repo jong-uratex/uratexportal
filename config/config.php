@@ -150,7 +150,7 @@ function enforceCustomerServicePageAccess(): void {
         return;
     }
 
-    $allowedPages = ['dashboard.php', 'orders.php', 'user_logs.php', 'index.php', 'logout.php'];
+    $allowedPages = ['dashboard.php', 'orders.php', 'user_logs.php', 'user_profile.php', 'index.php', 'logout.php'];
     $currentPage = basename($_SERVER['PHP_SELF'] ?? '');
 
     if (!in_array($currentPage, $allowedPages, true)) {
