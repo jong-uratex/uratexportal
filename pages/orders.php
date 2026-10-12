@@ -147,6 +147,42 @@ if (isset($_GET['export']) && in_array($_GET['export'], ['email', 'sms'], true))
     }
 }
 
+$analyticsEndDate = new DateTimeImmutable('today');
+$analyticsStartDate = $analyticsEndDate->modify('-29 days');
+$analyticsFromInput = $analyticsStartDate->format('Y-m-d');
+$analyticsToInput = $analyticsEndDate->format('Y-m-d');
+$analyticsError = '';
+
+if (isset($_GET['analytics_from']) || isset($_GET['analytics_to'])) {
+    $requestedAnalyticsFrom = $_GET['analytics_from'] ?? '';
+    $requestedAnalyticsTo = $_GET['analytics_to'] ?? '';
+    $requestedAnalyticsFrom = is_string($requestedAnalyticsFrom) ? $requestedAnalyticsFrom : '';
+    $requestedAnalyticsTo = is_string($requestedAnalyticsTo) ? $requestedAnalyticsTo : '';
+    $requestedStartDate = DateTimeImmutable::createFromFormat('!Y-m-d', $requestedAnalyticsFrom);
+    $requestedEndDate = DateTimeImmutable::createFromFormat('!Y-m-d', $requestedAnalyticsTo);
+
+    if (
+        !$requestedStartDate || !$requestedEndDate ||
+        $requestedStartDate->format('Y-m-d') !== $requestedAnalyticsFrom ||
+        $requestedEndDate->format('Y-m-d') !== $requestedAnalyticsTo ||
+        $requestedStartDate > $requestedEndDate
+    ) {
+        $analyticsError = 'Select a valid analytics start and end date.';
+    } else {
+        $analyticsStartDate = $requestedStartDate;
+        $analyticsEndDate = $requestedEndDate;
+        $analyticsFromInput = $requestedAnalyticsFrom;
+        $analyticsToInput = $requestedAnalyticsTo;
+    }
+}
+
+$analyticsParams = [
+    ':s' => $activeStore,
+    ':analytics_from' => $analyticsStartDate->format('Y-m-d 00:00:00'),
+    ':analytics_to' => $analyticsEndDate->format('Y-m-d 23:59:59'),
+];
+$analyticsWhere = 'store_key = :s AND created_at >= :analytics_from AND created_at <= :analytics_to';
+
 /**
  * Normalize marketing consent value to "yes" / "no"
  */
@@ -1046,34 +1082,33 @@ include __DIR__ . '/../includes/sidebar.php';
       </div>
 
       <?php
-      // ---------- Analytics (all orders of the active store) ----------
-      $an = ['kpi' => [], 'fulfillment' => [], 'financial' => [], 'email' => [], 'sms' => [], 'monthly' => [], 'cities' => [], 'products' => [], 'weekday' => []];
+      // ---------- Analytics (selected date range for the active store) ----------
+      $an = ['kpi' => [], 'fulfillment' => [], 'financial' => [], 'email' => [], 'sms' => [], 'daily' => [], 'cities' => [], 'products' => [], 'weekday' => []];
       try {
-          $q = function (string $sql) use ($db, $activeStore) {
+          $q = function (string $sql) use ($db, $analyticsParams) {
               $st = $db->prepare($sql);
-              $st->execute([':s' => $activeStore]);
+              $st->execute($analyticsParams);
               return $st->fetchAll(PDO::FETCH_ASSOC);
           };
           $an['kpi'] = $q("SELECT COUNT(*) AS orders, COALESCE(SUM(total_price),0) AS revenue, COALESCE(AVG(total_price),0) AS aov,
                   COALESCE(MAX(total_price),0) AS max_order, COUNT(DISTINCT NULLIF(customer_id,0)) AS customers,
                   SUM(CASE WHEN financial_status='paid' THEN 1 ELSE 0 END) AS paid_orders
-              FROM shopify_orders WHERE store_key = :s")[0] ?? [];
-          $rep = $q("SELECT COUNT(*) AS c FROM (SELECT customer_id FROM shopify_orders WHERE store_key = :s AND customer_id > 0 GROUP BY customer_id HAVING COUNT(*) > 1) t");
+              FROM shopify_orders WHERE {$analyticsWhere}")[0] ?? [];
+          $rep = $q("SELECT COUNT(*) AS c FROM (SELECT customer_id FROM shopify_orders WHERE {$analyticsWhere} AND customer_id > 0 GROUP BY customer_id HAVING COUNT(*) > 1) t");
           $an['kpi']['repeat'] = (int)($rep[0]['c'] ?? 0);
-          $an['fulfillment'] = $q("SELECT COALESCE(NULLIF(fulfillment_status,''),'unfulfilled') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label ORDER BY cnt DESC");
-          $an['financial']   = $q("SELECT COALESCE(NULLIF(financial_status,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label ORDER BY cnt DESC");
-          $an['email']       = $q("SELECT COALESCE(NULLIF(accepts_email_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label");
-          $an['sms']         = $q("SELECT COALESCE(NULLIF(accepts_sms_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label");
-          $an['monthly']     = $q("SELECT DATE_FORMAT(created_at,'%Y-%m') AS label, COUNT(*) AS cnt, COALESCE(SUM(total_price),0) AS revenue
-              FROM shopify_orders WHERE store_key = :s AND created_at IS NOT NULL GROUP BY label ORDER BY label DESC LIMIT 12");
-          $an['monthly']     = array_reverse($an['monthly']);
+          $an['fulfillment'] = $q("SELECT COALESCE(NULLIF(fulfillment_status,''),'unfulfilled') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE {$analyticsWhere} GROUP BY label ORDER BY cnt DESC");
+          $an['financial']   = $q("SELECT COALESCE(NULLIF(financial_status,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE {$analyticsWhere} GROUP BY label ORDER BY cnt DESC");
+          $an['email']       = $q("SELECT COALESCE(NULLIF(accepts_email_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE {$analyticsWhere} GROUP BY label");
+          $an['sms']         = $q("SELECT COALESCE(NULLIF(accepts_sms_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE {$analyticsWhere} GROUP BY label");
+          $an['daily']       = $q("SELECT DATE(created_at) AS label, COUNT(*) AS cnt, COALESCE(AVG(total_price),0) AS aov
+              FROM shopify_orders WHERE {$analyticsWhere} GROUP BY DATE(created_at) ORDER BY label ASC");
           $an['cities']      = $q("SELECT shipping_city AS label, COUNT(*) AS cnt, COALESCE(SUM(total_price),0) AS revenue FROM shopify_orders
-              WHERE store_key = :s AND shipping_city IS NOT NULL AND shipping_city <> '' GROUP BY shipping_city ORDER BY cnt DESC LIMIT 8");
-          $an['weekday']     = $q("SELECT DAYOFWEEK(created_at) AS d, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s AND created_at IS NOT NULL GROUP BY d");
+              WHERE {$analyticsWhere} AND shipping_city IS NOT NULL AND shipping_city <> '' GROUP BY shipping_city ORDER BY cnt DESC LIMIT 8");
+          $an['weekday']     = $q("SELECT DAYOFWEEK(created_at) AS d, COUNT(*) AS cnt FROM shopify_orders WHERE {$analyticsWhere} GROUP BY d");
 
           $prodCounts = [];
-          $st = $db->prepare("SELECT line_items FROM shopify_orders WHERE store_key = :s AND line_items IS NOT NULL");
-          $st->execute([':s' => $activeStore]);
+          $st = $db->prepare("SELECT line_items FROM shopify_orders WHERE {$analyticsWhere} AND line_items IS NOT NULL");
+          $st->execute($analyticsParams);
           while ($row = $st->fetch(PDO::FETCH_NUM)) {
               $items = json_decode((string)$row[0], true);
               if (!is_array($items)) continue;
@@ -1101,7 +1136,7 @@ include __DIR__ . '/../includes/sidebar.php';
           'financial'   => $pairs($an['financial']),
           'email'       => $pairs($an['email']),
           'sms'         => $pairs($an['sms']),
-          'monthly'     => ['labels' => array_column($an['monthly'], 'label'), 'orders' => array_map('intval', array_column($an['monthly'], 'cnt')), 'revenue' => array_map('floatval', array_column($an['monthly'], 'revenue'))],
+          'daily'       => ['labels' => array_column($an['daily'], 'label'), 'orders' => array_map('intval', array_column($an['daily'], 'cnt')), 'aov' => array_map('floatval', array_column($an['daily'], 'aov'))],
           'cities'      => $pairs($an['cities']),
           'products'    => ['labels' => array_keys($an['products']), 'data' => array_values($an['products'])],
           'weekday'     => ['labels' => array_values($wdNames), 'data' => array_values($wdData)],
@@ -1119,10 +1154,25 @@ include __DIR__ . '/../includes/sidebar.php';
       <div class="card shadow-sm border-0 mb-3" style="border-radius: 12px;">
         <div class="card-header bg-white d-flex justify-content-between align-items-center" style="border-radius: 12px 12px 0 0;">
           <h3 class="card-title font-weight-bold m-0"><i class="fas fa-chart-pie mr-2 text-primary"></i>Orders Analytics</h3>
-          <button class="btn btn-sm btn-light" type="button" data-toggle="collapse" data-target="#ordersAnalytics"><i class="fas fa-chevron-down"></i></button>
+          <div class="d-flex align-items-center">
+            <form method="get" action="orders.php" class="form-inline mr-2">
+              <label for="analyticsFrom" class="sr-only">Analytics start date</label>
+              <input type="date" name="analytics_from" id="analyticsFrom" class="form-control form-control-sm mr-1" value="<?php echo htmlspecialchars($analyticsFromInput); ?>" required>
+              <label for="analyticsTo" class="sr-only">Analytics end date</label>
+              <input type="date" name="analytics_to" id="analyticsTo" class="form-control form-control-sm mr-1" value="<?php echo htmlspecialchars($analyticsToInput); ?>" required>
+              <button type="submit" class="btn btn-primary btn-sm" style="background-color: #003399; border-color: #002266;">Apply</button>
+            </form>
+            <button class="btn btn-sm btn-light" type="button" data-toggle="collapse" data-target="#ordersAnalytics" aria-label="Toggle analytics"><i class="fas fa-chevron-down"></i></button>
+          </div>
         </div>
         <div id="ordersAnalytics" class="collapse show">
           <div class="card-body">
+            <?php if ($analyticsError !== ''): ?>
+              <div class="alert alert-danger mb-3" role="alert"><?php echo htmlspecialchars($analyticsError); ?></div>
+            <?php endif; ?>
+            <p class="small text-muted mb-3">
+              Showing analytics for <strong><?php echo htmlspecialchars($analyticsFromInput); ?></strong> through <strong><?php echo htmlspecialchars($analyticsToInput); ?></strong>.
+            </p>
             <div class="row">
               <?php foreach ($kpiCards as [$lbl, $val, $ico, $clr]): ?>
                 <div class="col-lg-2 col-md-4 col-6 mb-3">
@@ -1143,12 +1193,13 @@ include __DIR__ . '/../includes/sidebar.php';
               <div class="col-lg-3 col-md-6 mb-3"><h6 class="text-center font-weight-bold">SMS Marketing Consent</h6><div style="height:230px"><canvas id="chSms"></canvas></div></div>
             </div>
             <div class="row">
-              <div class="col-lg-8 mb-3"><h6 class="text-center font-weight-bold">Monthly Orders &amp; Revenue (last 12 months)</h6><div style="height:280px"><canvas id="chMonthly"></canvas></div></div>
-              <div class="col-lg-4 mb-3"><h6 class="text-center font-weight-bold">Orders by Weekday</h6><div style="height:280px"><canvas id="chWeekday"></canvas></div></div>
+              <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Orders Over Time</h6><div style="height:280px"><canvas id="chOrdersOverTime"></canvas></div></div>
+              <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Average Order Value Over Time</h6><div style="height:280px"><canvas id="chAovOverTime"></canvas></div></div>
             </div>
             <div class="row">
+              <div class="col-lg-4 mb-3"><h6 class="text-center font-weight-bold">Orders by Weekday</h6><div style="height:280px"><canvas id="chWeekday"></canvas></div></div>
               <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Top Shipping Cities</h6><div style="height:280px"><canvas id="chCities"></canvas></div></div>
-              <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Top Products (units sold)</h6><div style="height:280px"><canvas id="chProducts"></canvas></div></div>
+              <div class="col-lg-2 mb-3"><h6 class="text-center font-weight-bold">Top Products (units sold)</h6><div style="height:280px"><canvas id="chProducts"></canvas></div></div>
             </div>
             <?php endif; ?>
           </div>
@@ -1520,15 +1571,21 @@ include __DIR__ . '/../includes/sidebar.php';
   bar('chWeekday', D.weekday, false);
   bar('chCities', D.cities, true);
   bar('chProducts', D.products, true);
-  new Chart(document.getElementById('chMonthly'), {
+  new Chart(document.getElementById('chOrdersOverTime'), {
+    type: 'line',
     data: {
-      labels: D.monthly.labels,
-      datasets: [
-        { type: 'bar', label: 'Orders', data: D.monthly.orders, backgroundColor: palette[0], yAxisID: 'y' },
-        { type: 'line', label: 'Revenue (₱)', data: D.monthly.revenue, borderColor: palette[1], backgroundColor: palette[1], yAxisID: 'y1', tension: 0.3 }
-      ]
+      labels: D.daily.labels,
+      datasets: [{ label: 'Orders', data: D.daily.orders, borderColor: palette[0], backgroundColor: 'rgba(0, 123, 255, 0.12)', fill: true, tension: 0.3 }]
     },
-    options: { maintainAspectRatio: false, scales: { y: { beginAtZero: true, position: 'left' }, y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false } } } }
+    options: { maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+  });
+  new Chart(document.getElementById('chAovOverTime'), {
+    type: 'line',
+    data: {
+      labels: D.daily.labels,
+      datasets: [{ label: 'Average Order Value (₱)', data: D.daily.aov, borderColor: palette[1], backgroundColor: 'rgba(40, 167, 69, 0.12)', fill: true, tension: 0.3 }]
+    },
+    options: { maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { callback: function (value) { return '₱' + Number(value).toLocaleString(); } } } } }
   });
 })();
 </script>
