@@ -175,6 +175,28 @@ function buildOrderDetails(array $lineItems): string
     return implode("\n", $parts);
 }
 
+function getOrderItemExportFields(?string $lineItems, ?string $orderDetails): array
+{
+    $items = json_decode($lineItems ?? '', true);
+    if (!is_array($items)) {
+        return [$orderDetails ?? '', ''];
+    }
+
+    $descriptions = [];
+    $quantities = [];
+    foreach ($items as $item) {
+        $description = trim($item['name'] ?? $item['title'] ?? 'Unknown Product');
+        if ($description === '') {
+            continue;
+        }
+
+        $descriptions[] = $description;
+        $quantities[] = (string) ((int) ($item['quantity'] ?? 1));
+    }
+
+    return [implode("\n", $descriptions), implode("\n", $quantities)];
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE / MIGRATE TABLE (safe - IF NOT EXISTS + add missing columns)
 // -----------------------------------------------------------------------------
@@ -678,8 +700,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
 
 // -----------------------------------------------------------------------------
 // CSV EXPORT – Email Marketing (accepts_email_marketing = yes)
-// Columns: Order ID, Order Number, Customer Name, Address, Email,
-//          Order Details, Date of purchase, Delivery Date, Financial Status, Fulfillment Status
+// Columns: Email, Order Number, Order Date, Delivery Date, Customer Name,
+//          Item Description, Quantity of Item, Address, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $filename = $activeStore . '_orders_email_marketing_' . date('Y-m-d') . '.csv';
@@ -691,15 +713,14 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
     $output = fopen('php://output', 'w');
 
     fputcsv($output, [
-        'Order ID',
+        'EMAIL',
         'Order Number',
-        'Customer Name',
-        'Address',
-        'Email',
-        'Order Details (Product name)',
-        'Date of purchase (Created at)',
+        'Order Date',
         'Delivery Date',
-        'Financial Status',
+        'Customer Name',
+        'Item Description',
+        'Quantity of Item',
+        'Address',
         'Fulfillment Status'
     ]);
 
@@ -726,16 +747,19 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
             $allOrders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             foreach ($allOrders as $order) {
+                [$itemDescriptions, $itemQuantities] = getOrderItemExportFields(
+                    $order['line_items'] ?? null,
+                    $order['order_details'] ?? null
+                );
                 fputcsv($output, [
-                    $order['shopify_order_id'] ?? '',
-                    $order['order_number'] ?? '',
-                    $order['full_name'] ?? '',
-                    $order['shipping_address'] ?? '',
                     $order['email'] ?? '',
-                    $order['order_details'] ?? '',
+                    $order['order_number'] ?? '',
                     $order['created_at'] ?? '',
                     $order['delivery_date'] ?? '',
-                    $order['financial_status'] ?? '',
+                    $order['full_name'] ?? '',
+                    $itemDescriptions,
+                    $itemQuantities,
+                    $order['shipping_address'] ?? '',
                     $order['fulfillment_status'] ?? ''
                 ]);
             }
@@ -750,8 +774,8 @@ if (isset($_GET['export']) && $_GET['export'] === 'email') {
 
 // -----------------------------------------------------------------------------
 // CSV EXPORT – SMS Marketing (accepts_sms_marketing = yes)
-// Columns: Order ID, Order Number, Customer Name, Address, Phone Number,
-//          Order Details, Date of purchase, Delivery Date, Financial Status, Fulfillment Status
+// Columns: Contact No, Order Number, Order Date, Delivery Date, Customer Name,
+//          Item Description, Quantity of Item, Address, Fulfillment Status
 // -----------------------------------------------------------------------------
 if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $filename = $activeStore . '_orders_sms_marketing_' . date('Y-m-d') . '.csv';
@@ -763,15 +787,14 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
     $output = fopen('php://output', 'w');
 
     fputcsv($output, [
-        'Order ID',
+        'CONTACT NO',
         'Order Number',
-        'Customer Name',
-        'Address',
-        'Phone Number',
-        'Order Details (Product name)',
-        'Date of purchase (Created at)',
+        'Order Date',
         'Delivery Date',
-        'Financial Status',
+        'Customer Name',
+        'Item Description',
+        'Quantity of Item',
+        'Address',
         'Fulfillment Status'
     ]);
 
@@ -798,16 +821,19 @@ if (isset($_GET['export']) && $_GET['export'] === 'sms') {
             $allOrders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
             foreach ($allOrders as $order) {
+                [$itemDescriptions, $itemQuantities] = getOrderItemExportFields(
+                    $order['line_items'] ?? null,
+                    $order['order_details'] ?? null
+                );
                 fputcsv($output, [
-                    $order['shopify_order_id'] ?? '',
-                    $order['order_number'] ?? '',
-                    $order['full_name'] ?? '',
-                    $order['shipping_address'] ?? '',
                     $order['phone'] ?? '',
-                    $order['order_details'] ?? '',
+                    $order['order_number'] ?? '',
                     $order['created_at'] ?? '',
                     $order['delivery_date'] ?? '',
-                    $order['financial_status'] ?? '',
+                    $order['full_name'] ?? '',
+                    $itemDescriptions,
+                    $itemQuantities,
+                    $order['shipping_address'] ?? '',
                     $order['fulfillment_status'] ?? ''
                 ]);
             }
