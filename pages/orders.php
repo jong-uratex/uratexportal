@@ -857,46 +857,26 @@ include __DIR__ . '/../includes/sidebar.php';
           </form>
         </div>
       </div>
-      <form method="get" action="orders.php" id="marketingExportForm" class="row justify-content-end align-items-end mt-3">
-        <?php if ($search !== ''): ?>
-          <input type="hidden" name="search" value="<?php echo htmlspecialchars($search); ?>">
-        <?php endif; ?>
-        <?php if ($filterStatus !== ''): ?>
-          <input type="hidden" name="status" value="<?php echo htmlspecialchars($filterStatus); ?>">
-        <?php endif; ?>
-        <div class="col-auto mb-2">
-          <label for="exportDateRange" class="small text-muted mb-1">Export orders from</label>
-          <select name="date_range" id="exportDateRange" class="form-control form-control-sm">
-            <?php foreach ($exportDateRanges as $rangeValue => $rangeLabel): ?>
-              <option value="<?php echo htmlspecialchars($rangeValue); ?>" <?php echo $selectedExportDateRange === $rangeValue ? 'selected' : ''; ?>>
-                <?php echo htmlspecialchars($rangeLabel); ?>
-              </option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div class="col-auto mb-2 custom-export-date" style="display: none;">
-          <label for="exportDateFrom" class="small text-muted mb-1">From</label>
-          <input type="date" name="date_from" id="exportDateFrom" class="form-control form-control-sm" value="<?php echo htmlspecialchars($exportDateFromInput); ?>">
-        </div>
-        <div class="col-auto mb-2 custom-export-date" style="display: none;">
-          <label for="exportDateTo" class="small text-muted mb-1">To</label>
-          <input type="date" name="date_to" id="exportDateTo" class="form-control form-control-sm" value="<?php echo htmlspecialchars($exportDateToInput); ?>">
-        </div>
-        <div class="col-auto mb-2">
-          <button type="submit" name="export" value="email" class="btn btn-success btn-sm shadow-sm font-weight-bold mr-1">
-            <i class="fas fa-envelope mr-1"></i> Export with Email
-          </button>
-          <button type="submit" name="export" value="sms" class="btn btn-primary btn-sm shadow-sm font-weight-bold">
-            <i class="fas fa-sms mr-1"></i> Export with SMS
-          </button>
-        </div>
-      </form>
     </div>
   </div>
 
   <!-- Main Content -->
   <section class="content">
     <div class="container-fluid">
+
+      <div class="card shadow-sm border-0 mb-3" style="border-radius: 12px;">
+        <div class="card-body d-flex flex-column flex-sm-row align-items-sm-center justify-content-between py-3">
+          <div class="mb-3 mb-sm-0">
+            <h2 class="h6 font-weight-bold text-dark mb-1">
+              <i class="fas fa-file-download text-primary mr-2"></i>Download Customer Data
+            </h2>
+            <p class="small text-muted mb-0">Export customer email addresses or mobile numbers for a selected order date range.</p>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm shadow-sm font-weight-bold px-3" data-toggle="modal" data-target="#customerDataDownloadModal" style="background-color: #003399; border-color: #002266;">
+            <i class="fas fa-download mr-1"></i> Download Customer Data
+          </button>
+        </div>
+      </div>
 
       <div id="syncProgress" class="card shadow-sm border-warning" style="display:none; border-radius: 12px;">
         <div class="card-body py-3">
@@ -1422,6 +1402,66 @@ include __DIR__ . '/../includes/sidebar.php';
 
     </div>
   </section>
+</div>
+
+<div class="modal fade" id="customerDataDownloadModal" tabindex="-1" role="dialog" aria-labelledby="customerDataDownloadModalTitle" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered" role="document">
+    <form method="get" action="orders.php" class="modal-content border-0 shadow-lg">
+      <?php if ($search !== ''): ?>
+        <input type="hidden" name="search" value="<?php echo htmlspecialchars($search); ?>">
+      <?php endif; ?>
+      <?php if ($filterStatus !== ''): ?>
+        <input type="hidden" name="status" value="<?php echo htmlspecialchars($filterStatus); ?>">
+      <?php endif; ?>
+      <div class="modal-header text-white" style="background-color: #003399;">
+        <h5 class="modal-title font-weight-bold" id="customerDataDownloadModalTitle">
+          <i class="fas fa-file-download mr-2"></i>Download Customer Data
+        </h5>
+        <button type="button" class="close text-white" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body p-4">
+        <div class="form-group">
+          <label for="exportDateRange" class="font-weight-bold">Order date range</label>
+          <select name="date_range" id="exportDateRange" class="form-control" required>
+            <?php foreach ($exportDateRanges as $rangeValue => $rangeLabel): ?>
+              <option value="<?php echo htmlspecialchars($rangeValue); ?>" <?php echo $selectedExportDateRange === $rangeValue ? 'selected' : ''; ?>>
+                <?php echo htmlspecialchars($rangeLabel); ?>
+              </option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <div class="form-row custom-export-date" style="display: none;">
+          <div class="form-group col-sm-6">
+            <label for="exportDateFrom" class="font-weight-bold">From</label>
+            <input type="date" name="date_from" id="exportDateFrom" class="form-control" value="<?php echo htmlspecialchars($exportDateFromInput); ?>">
+          </div>
+          <div class="form-group col-sm-6">
+            <label for="exportDateTo" class="font-weight-bold">To</label>
+            <input type="date" name="date_to" id="exportDateTo" class="form-control" value="<?php echo htmlspecialchars($exportDateToInput); ?>">
+          </div>
+        </div>
+        <fieldset class="mb-0">
+          <legend class="col-form-label pt-0 font-weight-bold">Customer data to download</legend>
+          <div class="custom-control custom-radio mb-2">
+            <input type="radio" id="exportEmail" name="export" value="email" class="custom-control-input" checked>
+            <label class="custom-control-label" for="exportEmail"><i class="fas fa-envelope text-success mr-1"></i>Email addresses</label>
+          </div>
+          <div class="custom-control custom-radio">
+            <input type="radio" id="exportSms" name="export" value="sms" class="custom-control-input">
+            <label class="custom-control-label" for="exportSms"><i class="fas fa-sms text-primary mr-1"></i>Mobile numbers for SMS</label>
+          </div>
+        </fieldset>
+      </div>
+      <div class="modal-footer bg-light">
+        <button type="button" class="btn btn-outline-secondary btn-sm" data-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-sm font-weight-bold" style="background-color: #003399; border-color: #002266;">
+          <i class="fas fa-download mr-1"></i> Download
+        </button>
+      </div>
+    </form>
+  </div>
 </div>
 
 <?php
