@@ -1162,6 +1162,15 @@ include __DIR__ . '/../includes/sidebar.php';
               <input type="date" name="analytics_to" id="analyticsTo" class="form-control form-control-sm mr-1" value="<?php echo htmlspecialchars($analyticsToInput); ?>" required>
               <button type="submit" class="btn btn-primary btn-sm" style="background-color: #003399; border-color: #002266;">Apply</button>
             </form>
+            <?php if ($kOrders > 0): ?>
+              <button id="downloadAnalyticsPdf" type="button" class="btn btn-danger btn-sm mr-2" title="Download the selected analytics period as a PDF">
+                <i class="fas fa-file-pdf mr-1"></i> PDF
+              </button>
+            <?php else: ?>
+              <button type="button" class="btn btn-outline-secondary btn-sm mr-2" disabled title="No analytics data is available for the selected dates">
+                <i class="fas fa-file-pdf mr-1"></i> PDF
+              </button>
+            <?php endif; ?>
             <button class="btn btn-sm btn-light" type="button" data-toggle="collapse" data-target="#ordersAnalytics" aria-label="Toggle analytics"><i class="fas fa-chevron-down"></i></button>
           </div>
         </div>
@@ -1545,6 +1554,8 @@ include __DIR__ . '/../includes/sidebar.php';
 ?>
 <?php if ($kOrders > 0): ?>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
 <script>
 (function () {
   if (typeof Chart === 'undefined') return;
@@ -1586,6 +1597,61 @@ include __DIR__ . '/../includes/sidebar.php';
       datasets: [{ label: 'Average Order Value (₱)', data: D.daily.aov, borderColor: palette[1], backgroundColor: 'rgba(40, 167, 69, 0.12)', fill: true, tension: 0.3 }]
     },
     options: { maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { callback: function (value) { return '₱' + Number(value).toLocaleString(); } } } } }
+  });
+
+  document.getElementById('downloadAnalyticsPdf').addEventListener('click', function () {
+    var button = this;
+    var originalLabel = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Generating...';
+
+    html2canvas(document.getElementById('ordersAnalytics'), {
+      scale: 2,
+      backgroundColor: '#ffffff'
+    }).then(function (canvas) {
+      var pdf = new window.jspdf.jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+      var pageWidth = pdf.internal.pageSize.getWidth();
+      var pageHeight = pdf.internal.pageSize.getHeight();
+      var margin = 30;
+      var reportTitle = <?php echo json_encode(ucfirst($activeStore) . ' Orders Analytics'); ?>;
+      var period = <?php echo json_encode($analyticsFromInput . ' through ' . $analyticsToInput); ?>;
+
+      pdf.setFontSize(16);
+      pdf.text(reportTitle, margin, margin + 10);
+      pdf.setFontSize(9);
+      pdf.text('Period: ' + period, margin, margin + 26);
+      pdf.text('Generated: ' + new Date().toLocaleString(), margin, margin + 40);
+
+      var contentTop = margin + 54;
+      var contentWidth = pageWidth - margin * 2;
+      var scale = contentWidth / canvas.width;
+      var sliceHeight = Math.floor((pageHeight - contentTop - margin) / scale);
+      var sourceY = 0;
+      var firstPage = true;
+
+      while (sourceY < canvas.height) {
+        var height = Math.min(sliceHeight, canvas.height - sourceY);
+        var slice = document.createElement('canvas');
+        slice.width = canvas.width;
+        slice.height = height;
+        slice.getContext('2d').drawImage(canvas, 0, sourceY, canvas.width, height, 0, 0, canvas.width, height);
+
+        if (!firstPage) {
+          pdf.addPage();
+        }
+        pdf.addImage(slice.toDataURL('image/png'), 'PNG', margin, firstPage ? contentTop : margin, contentWidth, height * scale);
+        sourceY += height;
+        firstPage = false;
+        sliceHeight = Math.floor((pageHeight - margin * 2) / scale);
+      }
+
+      pdf.save('orders_analytics_<?php echo htmlspecialchars($activeStore, ENT_QUOTES); ?>_<?php echo htmlspecialchars($analyticsFromInput, ENT_QUOTES); ?>_to_<?php echo htmlspecialchars($analyticsToInput, ENT_QUOTES); ?>.pdf');
+    }).catch(function () {
+      alert('Could not generate the analytics PDF. Please try again.');
+    }).finally(function () {
+      button.disabled = false;
+      button.innerHTML = originalLabel;
+    });
   });
 })();
 </script>
