@@ -8,7 +8,7 @@
  *  3. 20 Orders Per Page Pagination
  *  4. Shows customer details, order details (products), and fulfillment status
  *  5. Filter orders by status
- *  6. Admin-only access
+ *  6. Admin and Customer Service access
  *  7. Syncs Accepts Email / SMS Marketing from customer data
  *  8. Export with Email / Export with SMS (custom columns)
  *  9. Syncs & displays Order Details (product names + qty)
@@ -21,8 +21,8 @@ if (!isset($_SESSION['user_logged_in'])) {
     exit;
 }
 
-// Admin-only access
-if (($_SESSION['user_role'] ?? 'editor') !== 'admin') {
+// Admin and Customer Service access
+if (!in_array($_SESSION['user_role'] ?? 'editor', ['admin', 'customer_service'], true)) {
     header("Location: dashboard.php");
     exit;
 }

@@ -42,7 +42,7 @@ if ($db) {
           `email` VARCHAR(100) NOT NULL,
           `password_hash` VARCHAR(255) NOT NULL,
           `full_name` VARCHAR(100) NOT NULL,
-          `role` ENUM('admin', 'editor') NOT NULL DEFAULT 'editor',
+          `role` ENUM('admin', 'editor', 'customer_service') NOT NULL DEFAULT 'editor',
           `status` ENUM('active', 'inactive', 'suspended') NOT NULL DEFAULT 'active',
           `store_access` VARCHAR(100) NOT NULL DEFAULT 'retail,business',
           `failed_login_attempts` TINYINT UNSIGNED NOT NULL DEFAULT 0,
@@ -58,6 +58,7 @@ if ($db) {
           KEY `idx_users_role` (`role`),
           KEY `idx_users_status` (`status`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;");
+        $db->exec("ALTER TABLE `users` MODIFY `role` ENUM('admin', 'editor', 'customer_service') NOT NULL DEFAULT 'editor'");
 
         // Seed default users if empty
         $checkUsers = $db->query("SELECT COUNT(*) FROM users");
@@ -88,7 +89,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $isAdmin) {
         $email = strtolower(trim($_POST['email'] ?? ''));
         $fullName = trim($_POST['full_name'] ?? '');
         $password = $_POST['password'] ?? '';
-        $role = in_array($_POST['role'] ?? '', ['admin', 'editor']) ? $_POST['role'] : 'editor';
+        $role = in_array($_POST['role'] ?? '', ['admin', 'editor', 'customer_service'], true) ? $_POST['role'] : 'editor';
         $status = in_array($_POST['status'] ?? '', ['active', 'inactive', 'suspended']) ? $_POST['status'] : 'active';
         
         $stores = $_POST['store_access'] ?? ['business'];
@@ -176,7 +177,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $isAdmin) {
         $email = strtolower(trim($_POST['email'] ?? ''));
         $fullName = trim($_POST['full_name'] ?? '');
         $password = $_POST['password'] ?? '';
-        $role = in_array($_POST['role'] ?? '', ['admin', 'editor']) ? $_POST['role'] : 'editor';
+        $role = in_array($_POST['role'] ?? '', ['admin', 'editor', 'customer_service'], true) ? $_POST['role'] : 'editor';
         $status = in_array($_POST['status'] ?? '', ['active', 'inactive', 'suspended']) ? $_POST['status'] : 'active';
         
         $stores = $_POST['store_access'] ?? ['business'];
@@ -345,6 +346,7 @@ $totalUsersCount = 0;
 $adminCount = 0;
 $editorCount = 0;
 $activeCount = 0;
+$customerServiceCount = 0;
 
 if ($isAdmin) {
     if ($db) {
@@ -357,7 +359,7 @@ if ($isAdmin) {
                 $params[':search'] = "%{$search}%";
             }
 
-            if (!empty($filterRole) && in_array($filterRole, ['admin', 'editor'])) {
+            if (!empty($filterRole) && in_array($filterRole, ['admin', 'editor', 'customer_service'], true)) {
                 $whereSql .= " AND role = :role_filter";
                 $params[':role_filter'] = $filterRole;
             }
@@ -376,6 +378,7 @@ if ($isAdmin) {
                 COUNT(*) as total,
                 SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) as admins,
                 SUM(CASE WHEN role = 'editor' THEN 1 ELSE 0 END) as editors,
+                SUM(CASE WHEN role = 'customer_service' THEN 1 ELSE 0 END) as customer_service,
                 SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active_users
                 FROM users");
             $kpi = $kpiStmt->fetch(PDO::FETCH_ASSOC);
@@ -383,6 +386,7 @@ if ($isAdmin) {
                 $totalUsersCount = (int)$kpi['total'];
                 $adminCount = (int)$kpi['admins'];
                 $editorCount = (int)$kpi['editors'];
+                $customerServiceCount = (int)$kpi['customer_service'];
                 $activeCount = (int)$kpi['active_users'];
             }
         } catch (Exception $e) {
@@ -418,6 +422,7 @@ if ($isAdmin) {
         $totalUsersCount = count($demo);
         $adminCount = count(array_filter($demo, fn($u) => $u['role'] === 'admin'));
         $editorCount = count(array_filter($demo, fn($u) => $u['role'] === 'editor'));
+        $customerServiceCount = count(array_filter($demo, fn($u) => $u['role'] === 'customer_service'));
         $activeCount = count(array_filter($demo, fn($u) => $u['status'] === 'active'));
     }
 }
@@ -443,7 +448,7 @@ include __DIR__ . '/../includes/sidebar.php';
             </span>
           </div>
           <p class="text-muted small mb-0 mt-1">
-            Manage partner portal user accounts, role-based permissions (Admin &amp; Editor), and Shopify store access privileges.
+            Manage partner portal user accounts, role-based permissions, and Shopify store access privileges.
           </p>
         </div>
         <div class="col-sm-5 text-right">
@@ -491,11 +496,15 @@ include __DIR__ . '/../includes/sidebar.php';
             </a>
           </div>
         </div>
+      <?php elseif ($u['role'] === 'customer_service'): ?>
+        <span class="badge px-2.5 py-1 font-weight-bold" style="background-color: #fef3c7; color: #92400e; border: 1px solid #fde68a; font-size: 11px; border-radius: 6px;">
+          <i class="fas fa-headset mr-1"></i> Customer Service
+        </span>
       <?php else: ?>
 
         <!-- KPI Summary Cards -->
         <div class="row mb-3">
-          <div class="col-12 col-sm-6 col-md-3">
+          <div class="col-12 col-sm-6 col-md-2">
             <div class="info-box shadow-sm border">
               <span class="info-box-icon bg-primary elevation-1" style="background-color: #003399 !important;"><i class="fas fa-users"></i></span>
               <div class="info-box-content">
@@ -505,7 +514,7 @@ include __DIR__ . '/../includes/sidebar.php';
             </div>
           </div>
 
-          <div class="col-12 col-sm-6 col-md-3">
+          <div class="col-12 col-sm-6 col-md-2">
             <div class="info-box shadow-sm border">
               <span class="info-box-icon bg-danger elevation-1"><i class="fas fa-user-shield"></i></span>
               <div class="info-box-content">
@@ -515,12 +524,22 @@ include __DIR__ . '/../includes/sidebar.php';
             </div>
           </div>
 
-          <div class="col-12 col-sm-6 col-md-3">
+          <div class="col-12 col-sm-6 col-md-2">
             <div class="info-box shadow-sm border">
               <span class="info-box-icon bg-info elevation-1"><i class="fas fa-user-edit"></i></span>
               <div class="info-box-content">
                 <span class="info-box-text text-muted text-uppercase font-weight-bold" style="font-size: 11px;">SEO Editors</span>
                 <span class="info-box-number font-weight-bold text-info" style="font-size: 20px;"><?php echo number_format($editorCount); ?></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-12 col-sm-6 col-md-3">
+            <div class="info-box shadow-sm border">
+              <span class="info-box-icon bg-warning elevation-1"><i class="fas fa-headset"></i></span>
+              <div class="info-box-content">
+                <span class="info-box-text text-muted text-uppercase font-weight-bold" style="font-size: 11px;">Customer Service</span>
+                <span class="info-box-number font-weight-bold text-warning" style="font-size: 20px;"><?php echo number_format($customerServiceCount); ?></span>
               </div>
             </div>
           </div>
@@ -560,6 +579,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   <option value="">All Roles</option>
                   <option value="admin" <?php echo ($filterRole === 'admin') ? 'selected' : ''; ?>>Admin (Full Access)</option>
                   <option value="editor" <?php echo ($filterRole === 'editor') ? 'selected' : ''; ?>>Editor (SEO Only)</option>
+                  <option value="customer_service" <?php echo ($filterRole === 'customer_service') ? 'selected' : ''; ?>>Customer Service (Orders, Home &amp; Logs)</option>
                 </select>
               </div>
 
@@ -798,6 +818,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <label class="font-weight-bold text-dark small text-uppercase mb-1">Portal Role <span class="text-danger">*</span></label>
               <select name="role" class="form-control text-sm" required>
                 <option value="editor">Editor (SEO Editing Only)</option>
+                <option value="customer_service">Customer Service (Orders, Home &amp; User Logs)</option>
                 <option value="admin">Admin (Full System Access)</option>
               </select>
             </div>
@@ -891,6 +912,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <label class="font-weight-bold text-dark small text-uppercase mb-1">Portal Role <span class="text-danger">*</span></label>
               <select name="role" id="editRoleInput" class="form-control text-sm" required>
                 <option value="editor">Editor (SEO Only)</option>
+                <option value="customer_service">Customer Service (Orders, Home &amp; User Logs)</option>
                 <option value="admin">Admin (Full Access)</option>
               </select>
             </div>

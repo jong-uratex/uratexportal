@@ -2,6 +2,7 @@
 require_once __DIR__ . '/../config/config.php';
 $sidebarStore = getActiveStore();
 $currentScript = basename($_SERVER['PHP_SELF']);
+$isCustomerService = ($_SESSION['user_role'] ?? '') === 'customer_service';
 ?>
 <!-- Main Sidebar Container -->
 <aside class="main-sidebar sidebar-dark-primary elevation-4">
@@ -39,6 +40,7 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Home (Dashboard)</p>
           </a>
         </li>
+        <?php if (!$isCustomerService): ?>
         <li class="nav-item">
           <a href="products.php" class="nav-link <?php echo ($currentScript === 'products.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-tag"></i>
@@ -75,13 +77,15 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>Write & Publish</p>
           </a>
         </li>
-        <?php if (($_SESSION['user_role'] ?? 'editor') === 'admin'): ?>
+        <?php endif; ?>
+        <?php if (in_array($_SESSION['user_role'] ?? 'editor', ['admin', 'customer_service'], true)): ?>
         <li class="nav-item">
           <a href="orders.php" class="nav-link <?php echo ($currentScript === 'orders.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-shopping-cart"></i>
             <p>Orders</p>
           </a>
         </li>
+        <?php if (($_SESSION['user_role'] ?? 'editor') === 'admin'): ?>
         <li class="nav-item">
           <a href="custom_report.php" class="nav-link <?php echo ($currentScript === 'custom_report.php') ? 'active' : ''; ?>">
             <i class="nav-icon fas fa-file-alt"></i>
@@ -89,6 +93,8 @@ $currentScript = basename($_SERVER['PHP_SELF']);
           </a>
         </li>
         <?php endif; ?>
+        <?php endif; ?>
+        <?php if (!$isCustomerService): ?>
         <li class="nav-header text-uppercase text-secondary font-weight-bold" style="font-size: 11px;">Tools & Utilities</li>
         <li class="nav-item">
           <a href="redirect.php" class="nav-link <?php echo ($currentScript === 'redirect.php') ? 'active' : ''; ?>">
@@ -114,6 +120,14 @@ $currentScript = basename($_SERVER['PHP_SELF']);
             <p>User Logs</p>
           </a>
         </li>
+        <?php else: ?>
+        <li class="nav-item">
+          <a href="user_logs.php" class="nav-link <?php echo ($currentScript === 'user_logs.php') ? 'active' : ''; ?>">
+            <i class="nav-icon fas fa-history"></i>
+            <p>User Logs</p>
+          </a>
+        </li>
+        <?php endif; ?>
         <?php if (($_SESSION['user_role'] ?? 'editor') === 'admin'): ?>
         <li class="nav-item">
           <a href="user_management.php" class="nav-link <?php echo ($currentScript === 'user_management.php') ? 'active' : ''; ?>">

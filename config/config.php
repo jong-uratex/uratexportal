@@ -145,6 +145,25 @@ if (!isset($_SESSION['active_store'])) {
     $_SESSION['active_store'] = 'business';
 }
 
+function enforceCustomerServicePageAccess(): void {
+    if (($_SESSION['user_role'] ?? '') !== 'customer_service') {
+        return;
+    }
+
+    $allowedPages = ['dashboard.php', 'orders.php', 'user_logs.php', 'index.php', 'logout.php'];
+    $currentPage = basename($_SERVER['PHP_SELF'] ?? '');
+
+    if (!in_array($currentPage, $allowedPages, true)) {
+        $dashboardPath = strpos($_SERVER['PHP_SELF'] ?? '', '/pages/') !== false
+            ? 'dashboard.php'
+            : 'pages/dashboard.php';
+        header('Location: ' . $dashboardPath);
+        exit;
+    }
+}
+
+enforceCustomerServicePageAccess();
+
 function getActiveStore() {
     global $shopConfig;
     $key = $_SESSION['active_store'] ?? 'business';

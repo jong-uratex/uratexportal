@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- DATABASE SCHEMA: Uratex Shopify SEO Partner Portal
 -- Database: u390249810_seomini
--- Purpose: User Authentication, RBAC (Admin & Editor), Audit Logging,
+-- Purpose: User Authentication, RBAC (Admin, Editor & Customer Service), Audit Logging,
 --          and Product SEO Module (shopify_products) with API Sync & Pagination
 -- Compatible with: MySQL 5.7+, MySQL 8.0+, MariaDB 10.3+
 -- ==============================================================================
@@ -25,7 +25,7 @@ CREATE TABLE `users` (
   `email` VARCHAR(100) NOT NULL,
   `password_hash` VARCHAR(255) NOT NULL COMMENT 'Bcrypt hash generated via password_hash()',
   `full_name` VARCHAR(100) NOT NULL,
-  `role` ENUM('admin', 'editor') NOT NULL DEFAULT 'editor' COMMENT 'admin = full access, editor = SEO editing only',
+  `role` ENUM('admin', 'editor', 'customer_service') NOT NULL DEFAULT 'editor' COMMENT 'admin = full access, editor = SEO editing only, customer_service = orders, home, and user logs only',
   `status` ENUM('active', 'inactive', 'suspended') NOT NULL DEFAULT 'active',
   `store_access` VARCHAR(100) NOT NULL DEFAULT 'retail,business' COMMENT 'Comma-separated store keys user can manage',
   `failed_login_attempts` TINYINT UNSIGNED NOT NULL DEFAULT 0,
