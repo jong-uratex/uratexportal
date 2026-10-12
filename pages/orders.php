@@ -1039,6 +1039,116 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
       </div>
 
+      <?php
+      // ---------- Analytics (all orders of the active store) ----------
+      $an = ['kpi' => [], 'fulfillment' => [], 'financial' => [], 'email' => [], 'sms' => [], 'monthly' => [], 'cities' => [], 'products' => [], 'weekday' => []];
+      try {
+          $q = function (string $sql) use ($db, $activeStore) {
+              $st = $db->prepare($sql);
+              $st->execute([':s' => $activeStore]);
+              return $st->fetchAll(PDO::FETCH_ASSOC);
+          };
+          $an['kpi'] = $q("SELECT COUNT(*) AS orders, COALESCE(SUM(total_price),0) AS revenue, COALESCE(AVG(total_price),0) AS aov,
+                  COALESCE(MAX(total_price),0) AS max_order, COUNT(DISTINCT NULLIF(customer_id,0)) AS customers,
+                  SUM(CASE WHEN financial_status='paid' THEN 1 ELSE 0 END) AS paid_orders
+              FROM shopify_orders WHERE store_key = :s")[0] ?? [];
+          $rep = $q("SELECT COUNT(*) AS c FROM (SELECT customer_id FROM shopify_orders WHERE store_key = :s AND customer_id > 0 GROUP BY customer_id HAVING COUNT(*) > 1) t");
+          $an['kpi']['repeat'] = (int)($rep[0]['c'] ?? 0);
+          $an['fulfillment'] = $q("SELECT COALESCE(NULLIF(fulfillment_status,''),'unfulfilled') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label ORDER BY cnt DESC");
+          $an['financial']   = $q("SELECT COALESCE(NULLIF(financial_status,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label ORDER BY cnt DESC");
+          $an['email']       = $q("SELECT COALESCE(NULLIF(accepts_email_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label");
+          $an['sms']         = $q("SELECT COALESCE(NULLIF(accepts_sms_marketing,''),'unknown') AS label, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s GROUP BY label");
+          $an['monthly']     = $q("SELECT DATE_FORMAT(created_at,'%Y-%m') AS label, COUNT(*) AS cnt, COALESCE(SUM(total_price),0) AS revenue
+              FROM shopify_orders WHERE store_key = :s AND created_at IS NOT NULL GROUP BY label ORDER BY label DESC LIMIT 12");
+          $an['monthly']     = array_reverse($an['monthly']);
+          $an['cities']      = $q("SELECT shipping_city AS label, COUNT(*) AS cnt, COALESCE(SUM(total_price),0) AS revenue FROM shopify_orders
+              WHERE store_key = :s AND shipping_city IS NOT NULL AND shipping_city <> '' GROUP BY shipping_city ORDER BY cnt DESC LIMIT 8");
+          $an['weekday']     = $q("SELECT DAYOFWEEK(created_at) AS d, COUNT(*) AS cnt FROM shopify_orders WHERE store_key = :s AND created_at IS NOT NULL GROUP BY d");
+
+          $prodCounts = [];
+          $st = $db->prepare("SELECT line_items FROM shopify_orders WHERE store_key = :s AND line_items IS NOT NULL");
+          $st->execute([':s' => $activeStore]);
+          while ($row = $st->fetch(PDO::FETCH_NUM)) {
+              $items = json_decode((string)$row[0], true);
+              if (!is_array($items)) continue;
+              foreach ($items as $it) {
+                  $n = trim((string)($it['name'] ?? $it['title'] ?? ''));
+                  if ($n === '') continue;
+                  $prodCounts[$n] = ($prodCounts[$n] ?? 0) + (int)($it['quantity'] ?? 1);
+              }
+          }
+          arsort($prodCounts);
+          $an['products'] = array_slice($prodCounts, 0, 8, true);
+      } catch (Throwable $e) {
+          error_log('Orders analytics error: ' . $e->getMessage());
+      }
+      $kOrders = (int)($an['kpi']['orders'] ?? 0);
+      $kCust   = (int)($an['kpi']['customers'] ?? 0);
+      $wdNames = [1 => 'Sun', 2 => 'Mon', 3 => 'Tue', 4 => 'Wed', 5 => 'Thu', 6 => 'Fri', 7 => 'Sat'];
+      $wdData  = array_fill(1, 7, 0);
+      foreach ($an['weekday'] as $w) { $wdData[(int)$w['d']] = (int)$w['cnt']; }
+      $pairs = function (array $rows, string $k = 'cnt') {
+          return ['labels' => array_map(fn($r) => ucfirst(str_replace('_', ' ', (string)$r['label'])), $rows), 'data' => array_map(fn($r) => (float)$r[$k], $rows)];
+      };
+      $chartData = [
+          'fulfillment' => $pairs($an['fulfillment']),
+          'financial'   => $pairs($an['financial']),
+          'email'       => $pairs($an['email']),
+          'sms'         => $pairs($an['sms']),
+          'monthly'     => ['labels' => array_column($an['monthly'], 'label'), 'orders' => array_map('intval', array_column($an['monthly'], 'cnt')), 'revenue' => array_map('floatval', array_column($an['monthly'], 'revenue'))],
+          'cities'      => $pairs($an['cities']),
+          'products'    => ['labels' => array_keys($an['products']), 'data' => array_values($an['products'])],
+          'weekday'     => ['labels' => array_values($wdNames), 'data' => array_values($wdData)],
+      ];
+      $kpiCards = [
+          ['Total Revenue', '₱' . number_format((float)($an['kpi']['revenue'] ?? 0), 2), 'fa-peso-sign', 'success'],
+          ['Avg. Order Value', '₱' . number_format((float)($an['kpi']['aov'] ?? 0), 2), 'fa-receipt', 'primary'],
+          ['Largest Order', '₱' . number_format((float)($an['kpi']['max_order'] ?? 0), 2), 'fa-trophy', 'warning'],
+          ['Unique Customers', number_format($kCust), 'fa-users', 'info'],
+          ['Repeat Customers', number_format((int)($an['kpi']['repeat'] ?? 0)) . ' (' . ($kCust ? round(($an['kpi']['repeat'] ?? 0) / $kCust * 100, 1) : 0) . '%)', 'fa-redo', 'purple'],
+          ['Paid Orders', number_format((int)($an['kpi']['paid_orders'] ?? 0)) . ' (' . ($kOrders ? round(($an['kpi']['paid_orders'] ?? 0) / $kOrders * 100, 1) : 0) . '%)', 'fa-check-circle', 'success'],
+      ];
+      ?>
+      <!-- Analytics Summary -->
+      <div class="card shadow-sm border-0 mb-3" style="border-radius: 12px;">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center" style="border-radius: 12px 12px 0 0;">
+          <h3 class="card-title font-weight-bold m-0"><i class="fas fa-chart-pie mr-2 text-primary"></i>Orders Analytics</h3>
+          <button class="btn btn-sm btn-light" type="button" data-toggle="collapse" data-target="#ordersAnalytics"><i class="fas fa-chevron-down"></i></button>
+        </div>
+        <div id="ordersAnalytics" class="collapse show">
+          <div class="card-body">
+            <div class="row">
+              <?php foreach ($kpiCards as [$lbl, $val, $ico, $clr]): ?>
+                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                  <div class="border rounded p-2 h-100">
+                    <div class="text-muted text-uppercase font-weight-bold" style="font-size:11px;"><i class="fas <?php echo $ico; ?> mr-1 text-<?php echo $clr; ?>"></i><?php echo $lbl; ?></div>
+                    <div class="font-weight-bold" style="font-size:18px;"><?php echo htmlspecialchars($val); ?></div>
+                  </div>
+                </div>
+              <?php endforeach; ?>
+            </div>
+            <?php if ($kOrders === 0): ?>
+              <p class="text-muted text-center m-0">No order data to analyze yet. Sync orders first.</p>
+            <?php else: ?>
+            <div class="row">
+              <div class="col-lg-3 col-md-6 mb-3"><h6 class="text-center font-weight-bold">Fulfillment Status</h6><div style="height:230px"><canvas id="chFulfillment"></canvas></div></div>
+              <div class="col-lg-3 col-md-6 mb-3"><h6 class="text-center font-weight-bold">Payment Status</h6><div style="height:230px"><canvas id="chFinancial"></canvas></div></div>
+              <div class="col-lg-3 col-md-6 mb-3"><h6 class="text-center font-weight-bold">Email Marketing Consent</h6><div style="height:230px"><canvas id="chEmail"></canvas></div></div>
+              <div class="col-lg-3 col-md-6 mb-3"><h6 class="text-center font-weight-bold">SMS Marketing Consent</h6><div style="height:230px"><canvas id="chSms"></canvas></div></div>
+            </div>
+            <div class="row">
+              <div class="col-lg-8 mb-3"><h6 class="text-center font-weight-bold">Monthly Orders &amp; Revenue (last 12 months)</h6><div style="height:280px"><canvas id="chMonthly"></canvas></div></div>
+              <div class="col-lg-4 mb-3"><h6 class="text-center font-weight-bold">Orders by Weekday</h6><div style="height:280px"><canvas id="chWeekday"></canvas></div></div>
+            </div>
+            <div class="row">
+              <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Top Shipping Cities</h6><div style="height:280px"><canvas id="chCities"></canvas></div></div>
+              <div class="col-lg-6 mb-3"><h6 class="text-center font-weight-bold">Top Products (units sold)</h6><div style="height:280px"><canvas id="chProducts"></canvas></div></div>
+            </div>
+            <?php endif; ?>
+          </div>
+        </div>
+      </div>
+
       <!-- Search & Filters Container -->
       <div class="card shadow-sm border-0 mb-3" style="border-radius: 12px;">
         <div class="card-body p-3">
@@ -1316,6 +1426,47 @@ include __DIR__ . '/../includes/sidebar.php';
 
 <?php
 ?>
+<?php if ($kOrders > 0): ?>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+(function () {
+  if (typeof Chart === 'undefined') return;
+  var D = <?php echo json_encode($chartData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE); ?>;
+  var palette = ['#007bff', '#28a745', '#ffc107', '#dc3545', '#17a2b8', '#6f42c1', '#fd7e14', '#20c997', '#6c757d'];
+  function pie(id, d) {
+    new Chart(document.getElementById(id), {
+      type: 'doughnut',
+      data: { labels: d.labels, datasets: [{ data: d.data, backgroundColor: palette }] },
+      options: { maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { boxWidth: 12 } } } }
+    });
+  }
+  function bar(id, d, horizontal) {
+    new Chart(document.getElementById(id), {
+      type: 'bar',
+      data: { labels: d.labels, datasets: [{ data: d.data, backgroundColor: palette[0] }] },
+      options: { maintainAspectRatio: false, indexAxis: horizontal ? 'y' : 'x', plugins: { legend: { display: false } } }
+    });
+  }
+  pie('chFulfillment', D.fulfillment);
+  pie('chFinancial', D.financial);
+  pie('chEmail', D.email);
+  pie('chSms', D.sms);
+  bar('chWeekday', D.weekday, false);
+  bar('chCities', D.cities, true);
+  bar('chProducts', D.products, true);
+  new Chart(document.getElementById('chMonthly'), {
+    data: {
+      labels: D.monthly.labels,
+      datasets: [
+        { type: 'bar', label: 'Orders', data: D.monthly.orders, backgroundColor: palette[0], yAxisID: 'y' },
+        { type: 'line', label: 'Revenue (₱)', data: D.monthly.revenue, borderColor: palette[1], backgroundColor: palette[1], yAxisID: 'y1', tension: 0.3 }
+      ]
+    },
+    options: { maintainAspectRatio: false, scales: { y: { beginAtZero: true, position: 'left' }, y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false } } } }
+  });
+})();
+</script>
+<?php endif; ?>
 <script>
 document.getElementById('syncOrdersForm').addEventListener('submit', async function (ev) {
   ev.preventDefault();
