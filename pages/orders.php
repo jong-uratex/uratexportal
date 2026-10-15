@@ -233,6 +233,71 @@ function getOrderItemExportFields(?string $lineItems, ?string $orderDetails): ar
     return [implode("\n", $descriptions), implode("\n", $quantities)];
 }
 
+/**
+ * Mask an email address with asterisks when marketing consent is not yes.
+ * Example: john.doe@example.com → j********@e******.com
+ */
+function maskEmailForDisplay(?string $email): string
+{
+    $email = trim((string) $email);
+    if ($email === '' || strtolower($email) === 'n/a') {
+        return 'N/A';
+    }
+
+    $atPos = strpos($email, '@');
+    if ($atPos === false) {
+        $len = strlen($email);
+        if ($len <= 2) {
+            return str_repeat('*', $len);
+        }
+        return substr($email, 0, 1) . str_repeat('*', max(1, $len - 2)) . substr($email, -1);
+    }
+
+    $local = substr($email, 0, $atPos);
+    $domain = substr($email, $atPos + 1);
+    $localLen = strlen($local);
+    $maskedLocal = $localLen <= 1
+        ? str_repeat('*', $localLen)
+        : substr($local, 0, 1) . str_repeat('*', max(1, $localLen - 1));
+
+    $dotPos = strrpos($domain, '.');
+    if ($dotPos === false) {
+        $maskedDomain = str_repeat('*', max(1, strlen($domain)));
+    } else {
+        $domainName = substr($domain, 0, $dotPos);
+        $tld = substr($domain, $dotPos);
+        $domainNameLen = strlen($domainName);
+        $maskedDomainName = $domainNameLen <= 1
+            ? str_repeat('*', $domainNameLen)
+            : substr($domainName, 0, 1) . str_repeat('*', max(1, $domainNameLen - 1));
+        $maskedDomain = $maskedDomainName . $tld;
+    }
+
+    return $maskedLocal . '@' . $maskedDomain;
+}
+
+/**
+ * Mask a phone number with asterisks when SMS marketing consent is not yes.
+ * Keeps a short visible prefix when present (e.g. +63*******01).
+ */
+function maskPhoneForDisplay(?string $phone): string
+{
+    $phone = trim((string) $phone);
+    if ($phone === '' || strtolower($phone) === 'n/a') {
+        return 'N/A';
+    }
+
+    $len = strlen($phone);
+    if ($len <= 4) {
+        return str_repeat('*', $len);
+    }
+
+    // Keep first 3 and last 2 characters visible; mask the rest
+    $prefixLen = min(3, $len - 2);
+    $suffixLen = 2;
+    return substr($phone, 0, $prefixLen) . str_repeat('*', $len - $prefixLen - $suffixLen) . substr($phone, -$suffixLen);
+}
+
 // -----------------------------------------------------------------------------
 // AUTO-CREATE / MIGRATE TABLE (safe - IF NOT EXISTS + add missing columns)
 // -----------------------------------------------------------------------------
@@ -1347,16 +1412,32 @@ include __DIR__ . '/../includes/sidebar.php';
                         <br><small class="text-muted">ID: <?php echo htmlspecialchars($order['customer_id'] ?? ''); ?></small>
                       </td>
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
-                        <a href="mailto:<?php echo htmlspecialchars($order['email'] ?? ''); ?>" class="text-primary">
-                          <?php echo htmlspecialchars($order['email'] ?? 'N/A'); ?>
-                        </a>
+                        <?php
+                        $emailMkt = strtolower($order['accepts_email_marketing'] ?? 'no');
+                        $rawEmail = $order['email'] ?? '';
+                        if ($emailMkt === 'yes' && $rawEmail !== '') {
+                            echo '<a href="mailto:' . htmlspecialchars($rawEmail) . '" class="text-primary">'
+                               . htmlspecialchars($rawEmail) . '</a>';
+                        } else {
+                            echo '<span class="text-muted" title="Hidden – Email marketing consent is no">'
+                               . htmlspecialchars(maskEmailForDisplay($rawEmail)) . '</span>';
+                        }
+                        ?>
                       </td>
                       <td style="padding: 12px; font-size: 13px; white-space: nowrap;">
-                        <?php echo htmlspecialchars($order['phone'] ?? 'N/A'); ?>
+                        <?php
+                        $smsMkt = strtolower($order['accepts_sms_marketing'] ?? 'no');
+                        $rawPhone = $order['phone'] ?? '';
+                        if ($smsMkt === 'yes' && $rawPhone !== '') {
+                            echo htmlspecialchars($rawPhone);
+                        } else {
+                            echo '<span class="text-muted" title="Hidden – SMS marketing consent is no">'
+                               . htmlspecialchars(maskPhoneForDisplay($rawPhone)) . '</span>';
+                        }
+                        ?>
                       </td>
                       <td style="padding: 12px; font-size: 13px; text-align: center;">
                         <?php
-                        $emailMkt = strtolower($order['accepts_email_marketing'] ?? 'no');
                         $emailBadge = ($emailMkt === 'yes') ? 'bg-success' : 'bg-secondary';
                         ?>
                         <span class="badge <?php echo $emailBadge; ?> font-weight-bold" style="font-size: 11px; padding: 4px 8px;">
@@ -1365,7 +1446,6 @@ include __DIR__ . '/../includes/sidebar.php';
                       </td>
                       <td style="padding: 12px; font-size: 13px; text-align: center;">
                         <?php
-                        $smsMkt = strtolower($order['accepts_sms_marketing'] ?? 'no');
                         $smsBadge = ($smsMkt === 'yes') ? 'bg-success' : 'bg-secondary';
                         ?>
                         <span class="badge <?php echo $smsBadge; ?> font-weight-bold" style="font-size: 11px; padding: 4px 8px;">
