@@ -401,17 +401,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                 throw new Exception($message !== '' ? $message : 'Database connection is unavailable.');
             }
 
-            $latestOrderStmt = $db->prepare("
-                SELECT shopify_order_id
-                FROM shopify_orders
-                WHERE store_key = :store
-                  AND order_number IS NOT NULL
-                  AND order_number <> ''
-                ORDER BY CAST(REPLACE(order_number, '#', '') AS UNSIGNED) DESC, shopify_order_id DESC
-                LIMIT 1
-            ");
-            $latestOrderStmt->execute([':store' => $activeStore]);
-            $latestOrderId = (int)$latestOrderStmt->fetchColumn();
+            // Use the real Shopify order ID for since_id (most reliable for incremental sync).
+            // Force a full re-sync when the client sends force_full=1.
+            $forceFull = !empty($_POST['force_full']);
+            $latestOrderId = 0;
+            if (!$forceFull) {
+                $latestOrderStmt = $db->prepare("
+                    SELECT MAX(shopify_order_id)
+                    FROM shopify_orders
+                    WHERE store_key = :store
+                ");
+                $latestOrderStmt->execute([':store' => $activeStore]);
+                $latestOrderId = (int)$latestOrderStmt->fetchColumn();
+            }
 
             $insertStmt = $db->prepare("
                 INSERT INTO shopify_orders (
@@ -454,9 +456,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
             while ($hasMore && $pageNum <= $maxPages) {
                 $endpoint = '/admin/api/' . $version . '/orders.json?limit=250';
                 if ($pageInfo) {
+                    // Cursor pagination – do NOT mix with other filters
                     $endpoint .= '&page_info=' . urlencode($pageInfo);
                 } else {
-                    $endpoint .= '&status=any&order=created_at+desc';
+                    // First page: status=any is required to include closed/cancelled/archived orders.
+                    // Default sort is already created_at desc – do not add order= (can cause empty results on some versions).
+                    $endpoint .= '&status=any';
                     if ($latestOrderId > 0) {
                         $endpoint .= '&since_id=' . $latestOrderId;
                     }
@@ -673,7 +678,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
 
             if ($isAjaxSync) {
                 header('Content-Type: application/json');
-                echo json_encode(['ok' => true, 'synced' => $syncCount, 'next' => $hasMore ? $pageInfo : null]);
+                $payload = [
+                    'ok'       => true,
+                    'synced'   => $syncCount,
+                    'next'     => $hasMore ? $pageInfo : null,
+                    'force'    => !empty($forceFull),
+                    'since_id' => $latestOrderId,
+                ];
+                // Helpful diagnostic when the API returns nothing
+                if ($syncCount === 0 && !$hasMore) {
+                    $payload['hint'] = 'Shopify returned 0 orders. Possible causes: (1) the Business store truly has no orders, (2) the access token is missing the read_all_orders scope (only last ~60 days are visible), or (3) wrong store URL / token in Settings.';
+                }
+                echo json_encode($payload);
                 exit;
             }
 
@@ -762,11 +778,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $results[]  = "❌ Access Token: MISSING – No access token found for {$activeStore} store";
         $allSuccess = false;
     } else {
-        $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json";
         $headers = [
             "Content-Type: application/json",
             "X-Shopify-Access-Token: {$token}"
         ];
+
+        // 1) Count with status=any (shows total accessible orders)
+        $testUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders/count.json?status=any";
         $ch = curl_init($testUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
@@ -776,10 +794,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
+        $count = 0;
         if ($httpCode === 200) {
-            $data      = json_decode($response, true);
-            $count     = $data['count'] ?? 0;
-            $results[] = "✅ Pull Orders: SUCCESS – Found {$count} orders in {$activeStore} store";
+            $data  = json_decode($response, true);
+            $count = $data['count'] ?? 0;
+            $results[] = "✅ Count (status=any): SUCCESS – {$count} orders visible in {$activeStore} store";
+            if ($count === 0) {
+                $results[] = "ℹ️  Note: 0 orders returned. Either the store has no orders, or the access token is missing the <code>read_all_orders</code> scope (Shopify only returns the last ~60 days without it).";
+            }
         } else {
             $errorData = json_decode($response, true);
             $errorMsg = 'HTTP ' . $httpCode;
@@ -788,8 +810,33 @@ if (isset($_POST['action']) && $_POST['action'] === 'test_connection') {
             } elseif (is_array($errorData) && !empty($errorData['error'])) {
                 $errorMsg = $errorData['error'];
             }
-            $results[]  = "❌ Pull Orders: FAILED – {$errorMsg} | URL: {$testUrl}";
+            $results[]  = "❌ Count: FAILED – {$errorMsg} | URL: {$testUrl}";
             $allSuccess = false;
+        }
+
+        // 2) Quick list test (limit=1) to confirm the list endpoint also works
+        if ($allSuccess) {
+            $listUrl = "https://" . trim($targetUrl, '/') . "/admin/api/{$version}/orders.json?status=any&limit=1";
+            $ch = curl_init($listUrl);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+            $listResponse = curl_exec($ch);
+            $listCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($listCode === 200) {
+                $listData = json_decode($listResponse, true);
+                $listCount = is_array($listData['orders'] ?? null) ? count($listData['orders']) : 0;
+                $results[] = "✅ List (status=any&limit=1): SUCCESS – received {$listCount} order(s)";
+                if ($listCount === 0 && $count > 0) {
+                    $results[] = "⚠️ Count reported orders but the list endpoint returned none. Check API version / scopes.";
+                }
+            } else {
+                $results[] = "❌ List test: FAILED – HTTP {$listCode}";
+                $allSuccess = false;
+            }
         }
     }
 
@@ -978,10 +1025,14 @@ include __DIR__ . '/../includes/sidebar.php';
           </form>
           <form method="post" id="syncOrdersForm" class="d-inline-block mr-2">
             <input type="hidden" name="action" value="sync_orders">
+            <input type="hidden" name="force_full" id="syncForceFull" value="0">
             <button type="submit" id="syncOrdersBtn" class="btn btn-warning btn-sm shadow-sm font-weight-bold">
               <i class="fas fa-sync-alt mr-1"></i> Sync Orders Data
             </button>
           </form>
+          <button type="button" id="fullSyncBtn" class="btn btn-outline-warning btn-sm shadow-sm font-weight-bold mr-2" title="Ignore any previously saved order IDs and pull every order again">
+            <i class="fas fa-download mr-1"></i> Full Sync
+          </button>
         </div>
       </div>
     </div>
@@ -1737,51 +1788,84 @@ include __DIR__ . '/../includes/sidebar.php';
 </script>
 <?php endif; ?>
 <script>
-document.getElementById('syncOrdersForm').addEventListener('submit', async function (ev) {
-  ev.preventDefault();
-  if (!confirm('This will sync orders after the latest order number saved in the database. If no orders are saved yet, it will sync all orders. Continue?')) return;
-  var btn = document.getElementById('syncOrdersBtn'), label = btn.innerHTML;
-  btn.disabled = true;
-  var panel = document.getElementById('syncProgress'), status = document.getElementById('syncStatus');
-  var batchEl = document.getElementById('syncBatch'), countEl = document.getElementById('syncCount');
-  var warn = function (e) { e.preventDefault(); e.returnValue = ''; };
-  window.addEventListener('beforeunload', warn);
-  panel.style.display = '';
-  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  var total = 0, next = '', failures = 0, batch = 0;
-  try {
-    do {
-      var body = new URLSearchParams({ action: 'sync_orders', ajax: '1', page_info: next });
-      var res, json;
-      status.textContent = 'Fetching batch ' + (batch + 1) + '...';
+(function () {
+  var form = document.getElementById('syncOrdersForm');
+  var forceInput = document.getElementById('syncForceFull');
+  var syncBtn = document.getElementById('syncOrdersBtn');
+  var fullBtn = document.getElementById('fullSyncBtn');
+
+  function runSync(forceFull) {
+    forceInput.value = forceFull ? '1' : '0';
+    var msg = forceFull
+      ? 'FULL SYNC: This will ignore any previously saved order IDs and pull every order from Shopify again. Continue?'
+      : 'This will sync only orders newer than the latest order already saved. If the table is empty it will pull all orders. Continue?';
+    if (!confirm(msg)) return;
+
+    var btn = syncBtn, label = btn.innerHTML;
+    btn.disabled = true;
+    if (fullBtn) fullBtn.disabled = true;
+    var panel = document.getElementById('syncProgress'), status = document.getElementById('syncStatus');
+    var batchEl = document.getElementById('syncBatch'), countEl = document.getElementById('syncCount');
+    var warn = function (e) { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', warn);
+    panel.style.display = '';
+    panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    var total = 0, next = '', failures = 0, batch = 0, lastJson = null;
+    (async function () {
       try {
-        res = await fetch(window.location.pathname, { method: 'POST', body: body, credentials: 'same-origin' });
-        json = await res.json();
+        do {
+          var body = new URLSearchParams({ action: 'sync_orders', ajax: '1', page_info: next, force_full: forceInput.value });
+          var res, json;
+          status.textContent = 'Fetching batch ' + (batch + 1) + '...';
+          try {
+            res = await fetch(window.location.pathname, { method: 'POST', body: body, credentials: 'same-origin' });
+            json = await res.json();
+            lastJson = json;
+          } catch (e) {
+            if (++failures <= 3) { status.textContent = 'Retrying (' + failures + '/3)...'; await new Promise(function (r) { setTimeout(r, 2000); }); continue; }
+            throw new Error('Server busy or unreachable. Synced ' + total + ' orders so far; run the sync again to continue.');
+          }
+          failures = 0;
+          if (!json.ok) throw new Error(json.error || 'Sync failed');
+          total += json.synced;
+          batch++;
+          batchEl.textContent = batch;
+          countEl.textContent = total.toLocaleString();
+          next = json.next || '';
+          btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Synced ' + total.toLocaleString() + ' orders...';
+          if (json.hint && total === 0) {
+            console.warn(json.hint);
+          }
+        } while (next);
+        window.removeEventListener('beforeunload', warn);
+        status.textContent = 'Done';
+        var alertMsg = 'Synced ' + total.toLocaleString() + ' orders.';
+        if (total === 0 && lastJson && lastJson.hint) {
+          alertMsg += '\n\n' + lastJson.hint;
+        }
+        alert(alertMsg);
+        window.location.reload();
       } catch (e) {
-        if (++failures <= 3) { status.textContent = 'Retrying (' + failures + '/3)...'; await new Promise(function (r) { setTimeout(r, 2000); }); continue; }
-        throw new Error('Server busy or unreachable. Synced ' + total + ' orders so far; run the sync again to continue.');
+        window.removeEventListener('beforeunload', warn);
+        panel.style.display = 'none';
+        alert(e.message);
+        btn.disabled = false;
+        if (fullBtn) fullBtn.disabled = false;
+        btn.innerHTML = label;
       }
-      failures = 0;
-      if (!json.ok) throw new Error(json.error || 'Sync failed');
-      total += json.synced;
-      batch++;
-      batchEl.textContent = batch;
-      countEl.textContent = total.toLocaleString();
-      next = json.next || '';
-      btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i> Synced ' + total.toLocaleString() + ' orders...';
-    } while (next);
-    window.removeEventListener('beforeunload', warn);
-    status.textContent = 'Done';
-    alert('Synced ' + total.toLocaleString() + ' orders.');
-    window.location.reload();
-  } catch (e) {
-    window.removeEventListener('beforeunload', warn);
-    panel.style.display = 'none';
-    alert(e.message);
-    btn.disabled = false;
-    btn.innerHTML = label;
+    })();
   }
-});
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    runSync(false);
+  });
+  if (fullBtn) {
+    fullBtn.addEventListener('click', function () {
+      runSync(true);
+    });
+  }
+})();
 
 var exportDateRange = document.getElementById('exportDateRange');
 var customExportDateFields = document.querySelectorAll('.custom-export-date');
