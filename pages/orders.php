@@ -328,6 +328,7 @@ if ($db) {
                 `shipping_city` VARCHAR(255) NULL DEFAULT NULL,
                 `shipping_zip` VARCHAR(50) NULL DEFAULT NULL,
                 `delivery_date` DATETIME NULL DEFAULT NULL,
+                `delivery_method` VARCHAR(255) NULL DEFAULT NULL COMMENT 'Store Pickup or Shipping',
                 `last_synced_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (`id`),
                 UNIQUE KEY `uq_store_order` (`store_key`, `shopify_order_id`),
@@ -357,6 +358,18 @@ if ($db) {
             foreach ($columnDetails as $column) {
                 if ($column['Field'] === 'delivery_date' && $column['Null'] === 'NO') {
                     $db->exec("ALTER TABLE `shopify_orders` MODIFY COLUMN `delivery_date` DATETIME NULL DEFAULT NULL");
+                    break;
+                }
+            }
+        }
+        // delivery_method: Store Pickup / Shipping (user-added column)
+        if (!in_array('delivery_method', $cols, true)) {
+            $db->exec("ALTER TABLE `shopify_orders` ADD COLUMN `delivery_method` VARCHAR(255) NULL DEFAULT NULL COMMENT 'Store Pickup or Shipping' AFTER `delivery_date`");
+        } else {
+            // Ensure it is nullable so inserts never fail when value is missing
+            foreach ($columnDetails as $column) {
+                if ($column['Field'] === 'delivery_method' && $column['Null'] === 'NO') {
+                    $db->exec("ALTER TABLE `shopify_orders` MODIFY COLUMN `delivery_method` VARCHAR(255) NULL DEFAULT NULL COMMENT 'Store Pickup or Shipping'");
                     break;
                 }
             }
@@ -421,13 +434,15 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     accepts_email_marketing, accepts_sms_marketing,
                     shipping_address, billing_address, order_number, total_price,
                     financial_status, fulfillment_status, fulfillment_details,
-                    created_at, updated_at, line_items, order_details, shipping_city, shipping_zip, delivery_date, last_synced_at
+                    created_at, updated_at, line_items, order_details, shipping_city, shipping_zip,
+                    delivery_date, delivery_method, last_synced_at
                 ) VALUES (
                     :store_key, :shopify_order_id, :customer_id, :full_name, :email, :phone,
                     :accepts_email_marketing, :accepts_sms_marketing,
                     :shipping_address, :billing_address, :order_number, :total_price,
                     :financial_status, :fulfillment_status, :fulfillment_details,
-                    :created_at, :updated_at, :line_items, :order_details, :shipping_city, :shipping_zip, :delivery_date, NOW()
+                    :created_at, :updated_at, :line_items, :order_details, :shipping_city, :shipping_zip,
+                    :delivery_date, :delivery_method, NOW()
                 )
                 ON DUPLICATE KEY UPDATE
                     customer_id = VALUES(customer_id),
@@ -450,6 +465,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                     shipping_city = VALUES(shipping_city),
                     shipping_zip = VALUES(shipping_zip),
                     delivery_date = VALUES(delivery_date),
+                    delivery_method = VALUES(delivery_method),
                     last_synced_at = NOW()
             ");
 
@@ -628,6 +644,33 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                         $shippingCity = $order['shipping_address']['city'] ?? '';
                         $shippingZip  = $order['shipping_address']['zip'] ?? '';
 
+                        // Detect delivery method: normalize to "Store Pickup" or "Shipping"
+                        $deliveryMethod = 'Shipping';
+                        $shippingTitles = [];
+                        if (!empty($order['shipping_lines']) && is_array($order['shipping_lines'])) {
+                            foreach ($order['shipping_lines'] as $sl) {
+                                $t = trim((string)($sl['title'] ?? $sl['code'] ?? ''));
+                                if ($t !== '') {
+                                    $shippingTitles[] = $t;
+                                }
+                            }
+                        }
+                        $joinedTitles = implode(' ', $shippingTitles);
+                        $isPickup = false;
+                        if ($joinedTitles !== '' && preg_match('/\b(store\s*pickup|local\s*pickup|pick[\s\-]?up|pickup)\b/i', $joinedTitles)) {
+                            $isPickup = true;
+                        } elseif (empty($order['shipping_address']) && empty($shippingTitles)) {
+                            $isPickup = true;
+                        }
+                        // Also check order tags (common for custom pickup apps / themes)
+                        if (!$isPickup && !empty($order['tags'])) {
+                            $tags = is_string($order['tags']) ? $order['tags'] : implode(',', (array)$order['tags']);
+                            if (preg_match('/\b(store\s*pickup|local\s*pickup|pick[\s\-]?up|pickup)\b/i', $tags)) {
+                                $isPickup = true;
+                            }
+                        }
+                        $deliveryMethod = $isPickup ? 'Store Pickup' : 'Shipping';
+
                         $insertStmt->execute([
                             ':store_key'                => $activeStore,
                             ':shopify_order_id'         => $shopifyOrderId,
@@ -650,7 +693,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'sync_orders') {
                             ':order_details'            => $orderDetails,
                             ':shipping_city'            => $shippingCity,
                             ':shipping_zip'             => $shippingZip,
-                            ':delivery_date'            => $deliveryDate
+                            ':delivery_date'            => $deliveryDate,
+                            ':delivery_method'          => $deliveryMethod
                         ]);
                     }
                     if ($db && $db->inTransaction()) {
@@ -1411,6 +1455,7 @@ include __DIR__ . '/../includes/sidebar.php';
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Order ID</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Order #</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Delivery Date</th>
+                  <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Delivery Method</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Customer</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Email</th>
                   <th style="padding: 12px; font-size: 12px; text-transform: uppercase; font-weight: 600;">Phone</th>
@@ -1427,7 +1472,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <tbody>
                 <?php if (empty($orders)): ?>
                   <tr>
-                    <td colspan="14" class="text-center py-4 text-muted">
+                    <td colspan="15" class="text-center py-4 text-muted">
                       <i class="fas fa-inbox fa-2x mb-2"></i><br>
                       No orders found<?php echo ($filterStatus !== '' || $search !== '') ? ' matching your filters.' : '.'; ?>
                       <?php if ($totalRows === 0 && $filterStatus === '' && $search === ''): ?>
@@ -1455,6 +1500,20 @@ include __DIR__ . '/../includes/sidebar.php';
                             }
                         } else {
                             echo 'N/A';
+                        }
+                        ?>
+                      </td>
+                      <td style="padding: 12px; font-size: 13px; text-align: center; white-space: nowrap;">
+                        <?php
+                        $dm = trim((string)($order['delivery_method'] ?? ''));
+                        if ($dm === '') {
+                            echo '<span class="text-muted">N/A</span>';
+                        } else {
+                            $isPickup = (strcasecmp($dm, 'Store Pickup') === 0 || stripos($dm, 'pickup') !== false);
+                            // Match Shopify admin colors: green = Store Pickup, orange = Shipping
+                            $dmBadge = $isPickup ? 'bg-success' : 'bg-warning text-dark';
+                            echo '<span class="badge ' . $dmBadge . ' font-weight-bold" style="font-size: 11px; padding: 4px 8px;">'
+                               . htmlspecialchars($dm) . '</span>';
                         }
                         ?>
                       </td>
