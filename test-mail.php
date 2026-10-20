@@ -12,14 +12,14 @@ try {
     $mail->isSMTP();                                            // Send using SMTP
     $mail->Host       = '100.82.205.40';                     // Your server IP or domain (e.g., dev.uratex.com.ph)
     $mail->SMTPAuth   = true;                                   // Enable SMTP authentication
-    $mail->Username   = 'YOUR_SMTP_USERNAME';                   // Your server system user / SASL username
-    $mail->Password   = 'YOUR_SMTP_PASSWORD';                   // Your user password
+    $mail->Username   = 'root';                   // Your server system user / SASL username
+    $mail->Password   = 'UX@Shopify!@#68';                   // Your user password
     $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;         // Enable TLS encryption (STARTTLS on port 587)
     $mail->Port       = 587;                                    // TCP port to connect to
 
     // Recipients
     $mail->setFrom('sender@dev.uratex.com.ph', 'Dev Team');
-    $mail->addAddress('recipient@example.com', 'Test Recipient'); // Add a recipient
+    $mail->addAddress('jenor.ricafort@uratex.coml.ph', 'Test Recipient'); // Add a recipient
 
     // Content
     $mail->isHTML(true);                                        // Set email format to HTML
