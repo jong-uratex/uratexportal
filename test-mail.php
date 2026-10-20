@@ -19,7 +19,7 @@ try {
 
     // Recipients
     $mail->setFrom('sender@dev.uratex.com.ph', 'Dev Team');
-    $mail->addAddress('jenor.ricafort@uratex.coml.ph', 'Test Recipient'); // Add a recipient
+    $mail->addAddress('jenor.ricafort@uratex.com.ph', 'Test Recipient'); // Add a recipient
 
     // Content
     $mail->isHTML(true);                                        // Set email format to HTML
