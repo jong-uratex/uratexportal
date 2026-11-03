@@ -2,6 +2,7 @@
 /**
  * Custom Report (custom_report.php) - 2026 orders with customer and shipping address.
  * Reads from the `shopify_orders` table (populated by orders.php sync). Admin only.
+ * Includes Delivery Method analytics and full-column CSV export of all matching orders.
  */
 require_once __DIR__ . '/../config/config.php';
 
@@ -26,9 +27,9 @@ $page = max(1, (int)($_GET['page'] ?? 1));
 $search = trim($_GET['search'] ?? '');
 
 $rows = [];
-$kpi = ['orders' => 0, 'revenue' => 0, 'customers' => 0];
+$kpi = ['orders' => 0, 'revenue' => 0, 'customers' => 0, 'pickup' => 0, 'shipping' => 0];
 $freshness = ['latest' => null, 'synced' => null];
-$monthly = $byPayment = $byFulfillment = $byCity = [];
+$monthly = $byPayment = $byFulfillment = $byCity = $byDelivery = [];
 $total = 0;
 $error = '';
 
@@ -43,25 +44,83 @@ if (!$db) {
             ':to'    => (REPORT_YEAR + 1) . '-01-01 00:00:00',
         ];
         if ($search !== '') {
-            $where .= " AND (order_number LIKE :q1 OR full_name LIKE :q2 OR email LIKE :q3 OR shipping_address LIKE :q4)";
+            $where .= " AND (
+                order_number LIKE :q1 OR full_name LIKE :q2 OR email LIKE :q3
+                OR shipping_address LIKE :q4 OR delivery_method LIKE :q5
+                OR phone LIKE :q6 OR order_details LIKE :q7
+            )";
             $like = '%' . addcslashes($search, '%_\\') . '%';
-            $params[':q1'] = $params[':q2'] = $params[':q3'] = $params[':q4'] = $like;
+            $params[':q1'] = $params[':q2'] = $params[':q3'] = $params[':q4'] =
+            $params[':q5'] = $params[':q6'] = $params[':q7'] = $like;
         }
 
+        // -------------------------------------------------------------------------
+        // CSV EXPORT – ALL columns, first → last order (no LIMIT)
+        // -------------------------------------------------------------------------
         if (isset($_GET['export']) && $_GET['export'] === 'csv') {
             $stmt = $db->prepare(
-                "SELECT order_number, created_at, full_name, email, phone, shipping_address, shipping_city, shipping_zip,
-                        order_details, total_price, financial_status, fulfillment_status
-                 FROM shopify_orders WHERE $where ORDER BY created_at DESC, id DESC"
+                "SELECT
+                    shopify_order_id,
+                    order_number,
+                    created_at,
+                    delivery_date,
+                    delivery_method,
+                    full_name,
+                    customer_id,
+                    email,
+                    phone,
+                    accepts_email_marketing,
+                    accepts_sms_marketing,
+                    shipping_address,
+                    billing_address,
+                    shipping_city,
+                    shipping_zip,
+                    order_details,
+                    total_price,
+                    financial_status,
+                    fulfillment_status,
+                    fulfillment_details,
+                    updated_at,
+                    last_synced_at
+                 FROM shopify_orders
+                 WHERE $where
+                 ORDER BY created_at ASC, id ASC"
             );
             $stmt->execute($params);
+
             header('Content-Type: text/csv; charset=utf-8');
             header('Content-Disposition: attachment; filename="orders_report_' . REPORT_YEAR . '_' . $activeStore . '_' . date('Ymd_His') . '.csv"');
             $out = fopen('php://output', 'w');
+            // UTF-8 BOM for Excel
             fwrite($out, "\xEF\xBB\xBF");
-            fputcsv($out, ['Order #', 'Order Date', 'Customer', 'Email', 'Phone', 'Shipping Address', 'City', 'ZIP', 'Order Details', 'Total', 'Payment Status', 'Fulfillment Status']);
+            fputcsv($out, [
+                'Shopify Order ID',
+                'Order #',
+                'Order Date',
+                'Delivery Date',
+                'Delivery Method',
+                'Customer Name',
+                'Customer ID',
+                'Email',
+                'Phone',
+                'Accepts Email Marketing',
+                'Accepts SMS Marketing',
+                'Shipping Address',
+                'Billing Address',
+                'City',
+                'ZIP',
+                'Order Details',
+                'Total',
+                'Payment Status',
+                'Fulfillment Status',
+                'Fulfillment Details',
+                'Updated At',
+                'Last Synced At',
+            ]);
+
             while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
                 $r['total_price'] = number_format((float)$r['total_price'], 2, '.', '');
+                // Flatten multi-line fields and guard against CSV injection
                 $r = array_map(function ($v) {
                     $v = str_replace(["\r\n", "\r", "\n"], ' | ', (string)$v);
                     return preg_match('/^[=+\-@\t]/', $v) ? "'" . $v : $v;
@@ -72,21 +131,29 @@ if (!$db) {
             exit;
         }
 
+        // -------------------------------------------------------------------------
+        // KPIs + analytics queries
+        // -------------------------------------------------------------------------
         $stmt = $db->prepare("SELECT COUNT(*) FROM shopify_orders WHERE $where");
         $stmt->execute($params);
         $total = (int)$stmt->fetchColumn();
 
         $stmt = $db->prepare("SELECT MAX(created_at) AS latest, MAX(last_synced_at) AS synced FROM shopify_orders WHERE store_key = :store");
         $stmt->execute([':store' => $activeStore]);
-        $freshness = $stmt->fetch(PDO::FETCH_ASSOC);
+        $freshness = $stmt->fetch(PDO::FETCH_ASSOC) ?: ['latest' => null, 'synced' => null];
 
         $stmt = $db->prepare(
-            "SELECT COUNT(*) AS orders, COALESCE(SUM(total_price),0) AS revenue,
-                    COUNT(DISTINCT NULLIF(LOWER(email),'')) AS customers
+            "SELECT
+                COUNT(*) AS orders,
+                COALESCE(SUM(total_price), 0) AS revenue,
+                COUNT(DISTINCT NULLIF(LOWER(email), '')) AS customers,
+                SUM(CASE WHEN LOWER(TRIM(COALESCE(delivery_method,''))) LIKE '%pickup%' THEN 1 ELSE 0 END) AS pickup,
+                SUM(CASE WHEN LOWER(TRIM(COALESCE(delivery_method,''))) NOT LIKE '%pickup%'
+                          AND TRIM(COALESCE(delivery_method,'')) <> '' THEN 1 ELSE 0 END) AS shipping
              FROM shopify_orders WHERE $where"
         );
         $stmt->execute($params);
-        $kpi = $stmt->fetch(PDO::FETCH_ASSOC);
+        $kpi = $stmt->fetch(PDO::FETCH_ASSOC) ?: $kpi;
 
         $stmt = $db->prepare(
             "SELECT DATE_FORMAT(created_at,'%Y-%m') AS m, COUNT(*) AS orders, SUM(total_price) AS revenue
@@ -103,9 +170,10 @@ if (!$db) {
             $stmt->execute($params);
             return $stmt->fetchAll(PDO::FETCH_ASSOC);
         };
-        $byPayment = $group('financial_status');
+        $byPayment     = $group('financial_status');
         $byFulfillment = $group('fulfillment_status');
-        $byCity = $group('shipping_city');
+        $byCity        = $group('shipping_city');
+        $byDelivery    = $group('delivery_method');
 
         $totalPages = max(1, (int)ceil($total / $perPage));
         $page = min($page, $totalPages);
@@ -113,14 +181,15 @@ if (!$db) {
 
         $stmt = $db->prepare(
             "SELECT shopify_order_id, order_number, full_name, email, phone, shipping_address,
-                    order_details, total_price, financial_status, fulfillment_status, created_at
+                    order_details, total_price, financial_status, fulfillment_status,
+                    delivery_method, delivery_date, created_at
              FROM shopify_orders WHERE $where
              ORDER BY created_at DESC, id DESC LIMIT $perPage OFFSET $offset"
         );
         $stmt->execute($params);
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     } catch (Throwable $e) {
-        $error = 'Unable to load report. Make sure orders have been synced from the Orders page.';
+        $error = 'Unable to load report. Make sure orders have been synced from the Orders page. (' . $e->getMessage() . ')';
     }
 }
 
@@ -145,7 +214,10 @@ function e($v): string
 /** Page numbers to display, with null as an ellipsis gap. */
 function pageWindow(int $current, int $last): array
 {
-    $pages = array_unique(array_filter([1, $last, $current - 2, $current - 1, $current, $current + 1, $current + 2], fn($p) => $p >= 1 && $p <= $last));
+    $pages = array_unique(array_filter(
+        [1, $last, $current - 2, $current - 1, $current, $current + 1, $current + 2],
+        fn($p) => $p >= 1 && $p <= $last
+    ));
     sort($pages);
     $out = [];
     $prev = 0;
@@ -168,10 +240,18 @@ for ($m = 1; $m <= 12; $m++) {
 }
 $pie = fn(array $d) => ['labels' => array_column($d, 'label'), 'data' => array_map('intval', array_column($d, 'c'))];
 $chartData = [
-    'months' => $monthLabels, 'orders' => $monthOrders, 'revenue' => $monthRevenue,
-    'payment' => $pie($byPayment), 'fulfillment' => $pie($byFulfillment), 'city' => $pie($byCity),
+    'months'      => $monthLabels,
+    'orders'      => $monthOrders,
+    'revenue'     => $monthRevenue,
+    'payment'     => $pie($byPayment),
+    'fulfillment' => $pie($byFulfillment),
+    'city'        => $pie($byCity),
+    'delivery'    => $pie($byDelivery),
 ];
 $avgOrder = $kpi['orders'] ? $kpi['revenue'] / $kpi['orders'] : 0;
+$pickupCount   = (int)($kpi['pickup'] ?? 0);
+$shippingCount = (int)($kpi['shipping'] ?? 0);
+$unknownDelivery = max(0, (int)$kpi['orders'] - $pickupCount - $shippingCount);
 
 $from = $total ? ($page - 1) * $perPage + 1 : 0;
 $to = min($total, $page * $perPage);
@@ -187,7 +267,7 @@ include __DIR__ . '/../includes/sidebar.php';
       <h1 class="m-0 font-weight-bold" style="color: #003399; font-size: 24px;">
         <i class="fas fa-file-alt mr-2"></i><?php echo e(ucfirst($activeStore)); ?> Orders Report <?php echo REPORT_YEAR; ?>
       </h1>
-      <p class="text-muted small mb-0 mt-1">All <?php echo REPORT_YEAR; ?> orders with customer and shipping address.</p>
+      <p class="text-muted small mb-0 mt-1">All <?php echo REPORT_YEAR; ?> orders with customer, shipping address, and delivery method.</p>
     </div>
   </div>
 
@@ -213,10 +293,12 @@ include __DIR__ . '/../includes/sidebar.php';
             ['Revenue', '₱' . number_format((float)$kpi['revenue'], 2), 'fa-peso-sign', 'success'],
             ['Avg. Order Value', '₱' . number_format($avgOrder, 2), 'fa-chart-line', 'info'],
             ['Unique Customers', number_format($kpi['customers']), 'fa-users', 'warning'],
+            ['Store Pickup', number_format($pickupCount), 'fa-store', 'success'],
+            ['Shipping', number_format($shippingCount), 'fa-truck', 'warning'],
         ] as [$label, $val, $icon, $color]): ?>
-          <div class="col-6 col-lg-3">
+          <div class="col-6 col-md-4 col-lg-2">
             <div class="small-box bg-<?php echo $color; ?>">
-              <div class="inner"><h3 style="font-size: 1.6rem;"><?php echo e($val); ?></h3><p><?php echo e($label); ?></p></div>
+              <div class="inner"><h3 style="font-size: 1.4rem;"><?php echo e($val); ?></h3><p class="mb-0" style="font-size: 0.85rem;"><?php echo e($label); ?></p></div>
               <div class="icon"><i class="fas <?php echo $icon; ?>"></i></div>
             </div>
           </div>
@@ -226,23 +308,25 @@ include __DIR__ . '/../includes/sidebar.php';
       <div class="row">
         <div class="col-lg-8"><div class="card shadow-sm"><div class="card-header font-weight-bold">Monthly Orders &amp; Revenue</div>
           <div class="card-body"><canvas id="chartMonthly" height="110"></canvas></div></div></div>
-        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Payment Status</div>
-          <div class="card-body"><canvas id="chartPayment" height="220"></canvas></div></div></div>
+        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Delivery Method</div>
+          <div class="card-body"><canvas id="chartDelivery" height="220"></canvas></div></div></div>
       </div>
       <div class="row">
+        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Payment Status</div>
+          <div class="card-body"><canvas id="chartPayment" height="220"></canvas></div></div></div>
         <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Fulfillment Status</div>
           <div class="card-body"><canvas id="chartFulfillment" height="220"></canvas></div></div></div>
-        <div class="col-lg-8"><div class="card shadow-sm"><div class="card-header font-weight-bold">Top 10 Shipping Cities</div>
-          <div class="card-body"><canvas id="chartCity" height="110"></canvas></div></div></div>
+        <div class="col-lg-4"><div class="card shadow-sm"><div class="card-header font-weight-bold">Top 10 Shipping Cities</div>
+          <div class="card-body"><canvas id="chartCity" height="220"></canvas></div></div></div>
       </div>
-      <p class="small text-muted">Summary reflects the current search filter.</p>
+      <p class="small text-muted">Summary reflects the current search filter. Delivery Method chart uses values stored during Orders sync (Store Pickup / Shipping).</p>
       </div>
 
       <div class="card shadow-sm" style="border-radius: 12px;">
         <div class="card-header bg-white">
           <form method="get" class="form-inline justify-content-between">
             <div class="input-group input-group-sm">
-              <input type="search" name="search" value="<?php echo e($search); ?>" class="form-control" style="min-width: 260px;" placeholder="Search order #, customer, email, address">
+              <input type="search" name="search" value="<?php echo e($search); ?>" class="form-control" style="min-width: 280px;" placeholder="Search order #, customer, email, phone, address, delivery method…">
               <div class="input-group-append">
                 <button class="btn btn-primary" type="submit"><i class="fas fa-search"></i></button>
                 <?php if ($search !== ''): ?>
@@ -251,7 +335,9 @@ include __DIR__ . '/../includes/sidebar.php';
               </div>
             </div>
             <div class="form-group form-group-sm mt-2 mt-md-0">
-              <a class="btn btn-success btn-sm mr-3" href="<?php echo e(reportUrl(['export' => 'csv', 'page' => null])); ?>"><i class="fas fa-download mr-1"></i> Download CSV</a>
+              <a class="btn btn-success btn-sm mr-3" href="<?php echo e(reportUrl(['export' => 'csv', 'page' => null])); ?>">
+                <i class="fas fa-download mr-1"></i> Download CSV (all columns)
+              </a>
               <label class="small text-muted mr-2" for="per_page">Rows per page</label>
               <select name="per_page" id="per_page" class="form-control form-control-sm" onchange="this.form.submit()">
                 <?php foreach ($perPageOptions as $opt): ?>
@@ -268,6 +354,7 @@ include __DIR__ . '/../includes/sidebar.php';
               <tr class="small text-uppercase">
                 <th>Order #</th>
                 <th>Date</th>
+                <th>Delivery Method</th>
                 <th>Customer</th>
                 <th>Email / Phone</th>
                 <th>Shipping Address</th>
@@ -279,12 +366,25 @@ include __DIR__ . '/../includes/sidebar.php';
             </thead>
             <tbody>
               <?php if (!$rows): ?>
-                <tr><td colspan="9" class="text-center text-muted py-5">No <?php echo REPORT_YEAR; ?> orders found.</td></tr>
+                <tr><td colspan="10" class="text-center text-muted py-5">No <?php echo REPORT_YEAR; ?> orders found.</td></tr>
               <?php endif; ?>
               <?php foreach ($rows as $r): ?>
+                <?php
+                  $dm = trim((string)($r['delivery_method'] ?? ''));
+                  $isPickup = $dm !== '' && (stripos($dm, 'pickup') !== false);
+                ?>
                 <tr>
                   <td class="font-weight-bold"><?php echo e($r['order_number']); ?></td>
                   <td class="text-nowrap small"><?php echo e($r['created_at'] ? date('M j, Y g:i A', strtotime($r['created_at'])) : ''); ?></td>
+                  <td>
+                    <?php if ($dm === ''): ?>
+                      <span class="text-muted">—</span>
+                    <?php else: ?>
+                      <span class="badge <?php echo $isPickup ? 'badge-success' : 'badge-warning'; ?>">
+                        <?php echo e($dm); ?>
+                      </span>
+                    <?php endif; ?>
+                  </td>
                   <td><?php echo e($r['full_name'] ?: '—'); ?></td>
                   <td class="small"><?php echo e($r['email']); ?><br><span class="text-muted"><?php echo e($r['phone']); ?></span></td>
                   <td class="small" style="min-width: 220px;"><?php echo nl2br(e($r['shipping_address'] ?: '—')); ?></td>
@@ -341,6 +441,7 @@ include __DIR__ . '/../includes/sidebar.php';
   var d = <?php echo json_encode($chartData, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
   var colors = ['#003399', '#FFCC00', '#17a2b8', '#28a745', '#dc3545', '#6f42c1', '#fd7e14', '#20c997', '#6c757d', '#e83e8c'];
   var pie = function (id, src) {
+    if (!document.getElementById(id)) return;
     new Chart(document.getElementById(id), {
       type: 'doughnut',
       data: { labels: src.labels, datasets: [{ data: src.data, backgroundColor: colors }] },
@@ -355,9 +456,14 @@ include __DIR__ . '/../includes/sidebar.php';
         { type: 'line', label: 'Revenue (₱)', data: d.revenue, borderColor: '#e6b800', backgroundColor: '#FFCC00', tension: 0.3, yAxisID: 'y1' }
       ]
     },
-    options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'Orders' } },
-                         y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Revenue' } } } }
+    options: {
+      scales: {
+        y:  { beginAtZero: true, title: { display: true, text: 'Orders' } },
+        y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, title: { display: true, text: 'Revenue' } }
+      }
+    }
   });
+  pie('chartDelivery', d.delivery);
   pie('chartPayment', d.payment);
   pie('chartFulfillment', d.fulfillment);
   new Chart(document.getElementById('chartCity'), {
@@ -400,3 +506,4 @@ include __DIR__ . '/../includes/sidebar.php';
 
 <?php
 include __DIR__ . '/../includes/footer.php';
+?>
