@@ -369,8 +369,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     $seoTitle          = trim($_POST['seo_title'] ?? '');
     $seoDescription    = trim($_POST['seo_description'] ?? '');
     $articleHandle     = trim($_POST['handle'] ?? '');
-    $submitAction      = $_POST['submit_action'] ?? 'publish'; // 'publish' or 'draft'
-    $visibility        = $_POST['visibility'] ?? ($submitAction === 'publish' ? 'visible' : 'hidden');
+    $submitAction      = ($_POST['submit_action'] ?? 'draft') === 'publish' ? 'publish' : 'draft';
+    $visibility        = in_array($_POST['visibility'] ?? '', ['visible', 'hidden'], true)
+        ? $_POST['visibility']
+        : 'hidden';
     $featuredImageUrl  = trim($_POST['featured_image_url'] ?? '');
     $featuredImageAlt  = trim($_POST['featured_image_alt'] ?? '');
     $existingShopifyId = !empty($_POST['shopify_article_id']) ? (int)$_POST['shopify_article_id'] : ($editingArticle['shopify_article_id'] ?? 0);
@@ -678,17 +680,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 // -----------------------------------------------------------------------------
 // FETCH RECENT ARTICLES ON ACTIVE STORE
 // -----------------------------------------------------------------------------
+$articleFilter = $_GET['article_filter'] ?? '';
+if (!in_array($articleFilter, ['hidden', 'live'], true)) {
+    $articleFilter = '';
+}
+
 $recentArticles = [];
 if ($db) {
     try {
-        $rStmt = $db->prepare("
+        $articleSql = "
             SELECT id, article_title, blog_title, blog_handle, handle, author, status, seo_score, published_at, updated_at, article_url, shopify_article_id
             FROM shopify_blogs
             WHERE store_key = :store
-            ORDER BY updated_at DESC, id DESC
-            LIMIT 6
-        ");
-        $rStmt->execute([':store' => $activeStore]);
+        ";
+        $articleParams = [':store' => $activeStore];
+
+        if ($articleFilter !== '') {
+            $articleSql .= " AND status = :status";
+            $articleParams[':status'] = $articleFilter === 'live' ? 'published' : 'draft';
+        }
+
+        $articleSql .= " ORDER BY updated_at DESC, id DESC";
+        if ($articleFilter === '') {
+            $articleSql .= " LIMIT 6";
+        }
+
+        $rStmt = $db->prepare($articleSql);
+        $rStmt->execute($articleParams);
         $recentArticles = $rStmt->fetchAll(PDO::FETCH_ASSOC);
     } catch (Exception $e) {
         $recentArticles = [];
@@ -705,7 +723,7 @@ $formTags        = $editingArticle['tags'] ?? 'Uratex, Mattress, Sleep Health';
 $formSeoTitle    = $editingArticle['title'] ?? '';
 $formSeoDesc     = $editingArticle['meta_description'] ?? '';
 $formHandle      = $editingArticle['handle'] ?? '';
-$formStatus      = $editingArticle['status'] ?? 'published';
+$formStatus      = $editingArticle['status'] ?? 'draft';
 $formImageUrl    = $editingArticle['image_url'] ?? '';
 
 $pageTitle = 'Write & Publish Article';
@@ -866,6 +884,12 @@ include __DIR__ . '/../includes/sidebar.php';
           </span>
           <a href="blogs.php" class="btn btn-sm btn-outline-primary font-weight-bold">
             <i class="fas fa-newspaper mr-1"></i> View All Articles
+          </a>
+          <a href="content.php?article_filter=hidden" class="btn btn-sm btn-outline-secondary font-weight-bold ml-1">
+            <i class="fas fa-eye-slash mr-1"></i> View Hidden
+          </a>
+          <a href="content.php?article_filter=live" class="btn btn-sm btn-outline-success font-weight-bold ml-1">
+            <i class="fas fa-eye mr-1"></i> View Live
           </a>
         </div>
       </div>
@@ -1252,12 +1276,15 @@ include __DIR__ . '/../includes/sidebar.php';
       </form>
 
       <!-- RECENT ARTICLES TABLE ON ACTIVE STORE -->
-      <?php if (!empty($recentArticles)): ?>
+      <?php if (!empty($recentArticles) || $articleFilter !== ''): ?>
         <div class="card card-outline card-secondary shadow-sm mt-2">
           <div class="card-header bg-white py-3">
             <div class="d-flex justify-content-between align-items-center">
               <h3 class="card-title font-weight-bold text-dark m-0">
-                <i class="fas fa-history text-secondary mr-2"></i>Recent Articles on <?php echo htmlspecialchars($shopCfg['name'] ?? ucfirst($activeStore)); ?>
+                <i class="fas fa-history text-secondary mr-2"></i><?php
+                  echo $articleFilter === 'hidden' ? 'All Hidden Articles'
+                    : ($articleFilter === 'live' ? 'All Live Articles' : 'Recent Articles');
+                ?> on <?php echo htmlspecialchars($shopCfg['name'] ?? ucfirst($activeStore)); ?>
               </h3>
               <a href="blogs.php" class="btn btn-xs btn-outline-primary font-weight-bold">
                 View All in SEO Module <i class="fas fa-chevron-right ml-1"></i>
@@ -1318,6 +1345,13 @@ include __DIR__ . '/../includes/sidebar.php';
                     </td>
                   </tr>
                 <?php endforeach; ?>
+                <?php if (empty($recentArticles)): ?>
+                  <tr>
+                    <td colspan="7" class="text-center text-muted py-4">
+                      No <?php echo $articleFilter === 'hidden' ? 'hidden' : 'live'; ?> articles found.
+                    </td>
+                  </tr>
+                <?php endif; ?>
               </tbody>
             </table>
           </div>
@@ -1605,8 +1639,19 @@ $(document).ready(function() {
 
   // 8. Form Submit Visual Feedback
   $('#articleForm').on('submit', function(e) {
-    const submitBtn = $(document.activeElement);
+    const submitter = e.originalEvent && e.originalEvent.submitter
+      ? e.originalEvent.submitter
+      : document.activeElement;
+    const submitBtn = $(submitter);
     if (submitBtn && submitBtn.length) {
+      if (submitter.name === 'submit_action') {
+        $('<input>', {
+          type: 'hidden',
+          name: 'submit_action',
+          value: submitter.value
+        }).appendTo(this);
+        submitter.removeAttribute('name');
+      }
       submitBtn.prop('disabled', true);
       const isPublish = submitBtn.val() === 'publish';
       submitBtn.html('<i class="fas fa-spinner fa-spin mr-2"></i> ' + (isPublish ? 'Publishing...' : 'Saving Draft...'));
