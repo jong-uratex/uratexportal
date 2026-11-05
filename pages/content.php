@@ -264,6 +264,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 }
 
 // -----------------------------------------------------------------------------
+// AJAX: search Shopify Files for images used by the article editor
+// -----------------------------------------------------------------------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'ajax_search_shopify_images') {
+    header('Content-Type: application/json');
+    $searchTerm = trim((string)($_POST['query'] ?? ''));
+    $searchTerm = substr($searchTerm, 0, 100);
+    $searchTerm = trim(str_replace(['"', '\\', '(', ')', ':', '*'], '', $searchTerm));
+
+    $queries = ['media_type:IMAGE'];
+    if ($searchTerm !== '') {
+        $queries = [
+            'media_type:IMAGE AND filename:' . str_replace(' ', '', $searchTerm) . '*',
+            'media_type:IMAGE AND ' . $searchTerm . '*'
+        ];
+    }
+
+    $query = 'query($query:String){files(first:30,query:$query,sortKey:CREATED_AT,reverse:true){
+                nodes{id alt ... on MediaImage{image{url}}}}}';
+    $files = null;
+    $lastResponse = null;
+    foreach ($queries as $fileQuery) {
+        $lastResponse = shopifyGraphQLRequest($query, ['query' => $fileQuery], $activeStore);
+        $files = $lastResponse['data']['data']['files']['nodes'] ?? null;
+        if ($files) {
+            break;
+        }
+        if ($lastResponse['status'] !== 200 || !empty($lastResponse['data']['errors'])) {
+            break;
+        }
+    }
+
+    if ($lastResponse['status'] !== 200 || !empty($lastResponse['data']['errors']) || $files === null) {
+        http_response_code(502);
+        echo json_encode([
+            'ok' => false,
+            'error' => $lastResponse['data']['errors'][0]['message'] ?? ($lastResponse['error'] ?: 'Unable to search Shopify Files.')
+        ]);
+        exit;
+    }
+
+    $images = [];
+    foreach ($files as $file) {
+        if (empty($file['image']['url'])) {
+            continue;
+        }
+        $images[] = [
+            'url' => $file['image']['url'],
+            'alt' => $file['alt'] ?? '',
+            'name' => basename(parse_url($file['image']['url'], PHP_URL_PATH) ?: '')
+        ];
+    }
+
+    echo json_encode(['ok' => true, 'images' => $images]);
+    exit;
+}
+
+// -----------------------------------------------------------------------------
 // FETCH BLOG CATEGORIES (from Shopify Admin REST API & MySQL fallback)
 // -----------------------------------------------------------------------------
 $availableBlogs = [];
@@ -771,6 +828,40 @@ include __DIR__ . '/../includes/sidebar.php';
   .note-btn:hover {
     background-color: #f1f5f9 !important;
   }
+  .shopify-image-results {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 10px;
+    max-height: 360px;
+    overflow-y: auto;
+  }
+  .shopify-image-result {
+    min-width: 0;
+    padding: 6px;
+    border: 2px solid #e2e8f0;
+    border-radius: 6px;
+    background: #fff;
+    text-align: left;
+  }
+  .shopify-image-result.active {
+    border-color: #003399;
+    box-shadow: 0 0 0 2px rgba(0, 51, 153, .15);
+  }
+  .shopify-image-result img {
+    width: 100%;
+    height: 100px;
+    object-fit: cover;
+    border-radius: 3px;
+  }
+  .shopify-image-result-name {
+    display: block;
+    overflow: hidden;
+    margin-top: 5px;
+    color: #334155;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   /* Google SERP Card Simulator */
   .serp-card {
     background-color: #ffffff;
@@ -1275,6 +1366,31 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
       </form>
 
+      <div class="modal fade" id="shopifyImageModal" tabindex="-1" role="dialog" aria-labelledby="shopifyImageModalTitle" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered" role="document">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h5 class="modal-title" id="shopifyImageModalTitle">Insert Image from Shopify Files</h5>
+              <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+            </div>
+            <div class="modal-body">
+              <div class="input-group mb-3">
+                <input type="search" class="form-control" id="shopifyImageSearch" placeholder="Search images by file name" aria-label="Search Shopify images">
+                <div class="input-group-append">
+                  <button class="btn btn-primary" type="button" id="shopifyImageSearchButton"><i class="fas fa-search mr-1"></i>Search</button>
+                </div>
+              </div>
+              <div id="shopifyImageSearchStatus" class="small text-muted mb-2" role="status">Loading images...</div>
+              <div id="shopifyImageResults" class="shopify-image-results"></div>
+            </div>
+            <div class="modal-footer">
+              <button type="button" class="btn btn-light border" data-dismiss="modal">Cancel</button>
+              <button type="button" class="btn btn-primary" id="insertShopifyImageButton" disabled>Insert Image</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- RECENT ARTICLES TABLE ON ACTIVE STORE -->
       <?php if (!empty($recentArticles) || $articleFilter !== ''): ?>
         <div class="card card-outline card-secondary shadow-sm mt-2">
@@ -1381,6 +1497,18 @@ $(document).ready(function() {
       'Roboto', 'Tahoma', 'Times New Roman', 'Trebuchet MS', 'Verdana'
     ],
     fontNamesIgnoreCheck: ['Source Sans Pro', 'Roboto'],
+    buttons: {
+      shopifyImage: function(context) {
+        return $.summernote.ui.button({
+          contents: '<i class="note-icon-picture"/>',
+          tooltip: 'Insert image from Shopify Files',
+          click: function() {
+            $('#shopifyImageModal').modal('show');
+            loadShopifyImages('');
+          }
+        }).render();
+      }
+    },
     toolbar: [
       ['style', ['style']],
       ['font', ['bold', 'italic', 'underline', 'strikethrough', 'superscript', 'subscript', 'clear']],
@@ -1389,7 +1517,7 @@ $(document).ready(function() {
       ['color', ['color']],
       ['para', ['ul', 'ol', 'paragraph', 'height']],
       ['table', ['table']],
-      ['insert', ['link', 'picture', 'video', 'hr']],
+      ['insert', ['link', 'shopifyImage', 'video', 'hr']],
       ['view', ['fullscreen', 'codeview', 'help']]
     ],
     callbacks: {
@@ -1402,6 +1530,77 @@ $(document).ready(function() {
         updateSerpPreview();
       }
     }
+  });
+
+  let selectedShopifyImage = null;
+
+  function loadShopifyImages(query) {
+    const $status = $('#shopifyImageSearchStatus');
+    const $results = $('#shopifyImageResults');
+    const $insertButton = $('#insertShopifyImageButton');
+    selectedShopifyImage = null;
+    $insertButton.prop('disabled', true);
+    $results.empty();
+    $status.removeClass('text-danger').text('Searching Shopify Files...');
+
+    $.ajax({
+      url: 'content.php',
+      method: 'POST',
+      dataType: 'json',
+      data: { action: 'ajax_search_shopify_images', query: query }
+    }).done(function(response) {
+      if (!response || !response.ok || !Array.isArray(response.images)) {
+        $status.addClass('text-danger').text(response && response.error ? response.error : 'Unable to search Shopify Files.');
+        return;
+      }
+      if (response.images.length === 0) {
+        $status.text('No images found. Try a different file name.');
+        return;
+      }
+
+      $status.text(response.images.length + ' image(s) found. Select one to insert.');
+      response.images.forEach(function(image) {
+        const $button = $('<button>', {
+          type: 'button',
+          class: 'shopify-image-result',
+          'aria-pressed': 'false'
+        });
+        $('<img>', { src: image.url, alt: image.alt || image.name, loading: 'lazy' }).appendTo($button);
+        $('<span>', { class: 'shopify-image-result-name' }).text(image.name || image.alt || 'Shopify image').appendTo($button);
+        $button.on('click', function() {
+          $('.shopify-image-result').removeClass('active').attr('aria-pressed', 'false');
+          $button.addClass('active').attr('aria-pressed', 'true');
+          selectedShopifyImage = image;
+          $insertButton.prop('disabled', false);
+        });
+        $results.append($button);
+      });
+    }).fail(function(xhr) {
+      const error = xhr.responseJSON && xhr.responseJSON.error ? xhr.responseJSON.error : 'Unable to search Shopify Files.';
+      $status.addClass('text-danger').text(error);
+    });
+  }
+
+  $('#shopifyImageSearchButton').on('click', function() {
+    loadShopifyImages($('#shopifyImageSearch').val().trim());
+  });
+  $('#shopifyImageSearch').on('keydown', function(event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      loadShopifyImages(this.value.trim());
+    }
+  });
+  $('#shopifyImageModal').on('shown.bs.modal', function() {
+    $('#shopifyImageSearch').trigger('focus');
+  });
+  $('#insertShopifyImageButton').on('click', function() {
+    if (!selectedShopifyImage) {
+      return;
+    }
+    $('#articleContent').summernote('insertImage', selectedShopifyImage.url, function($image) {
+      $image.attr('alt', selectedShopifyImage.alt || selectedShopifyImage.name || '');
+    });
+    $('#shopifyImageModal').modal('hide');
   });
 
   // AJAX handler for Summernote inline images
