@@ -833,38 +833,74 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 }
 
 // -----------------------------------------------------------------------------
-// FETCH RECENT ARTICLES ON ACTIVE STORE
+// FETCH RECENT ARTICLES ON ACTIVE STORE (paginated, 20 per page)
 // -----------------------------------------------------------------------------
 $articleFilter = $_GET['article_filter'] ?? '';
 if (!in_array($articleFilter, ['hidden', 'live'], true)) {
     $articleFilter = '';
 }
 
-$recentArticles = [];
+$articlesPerPage = 20;
+$articlePage     = max(1, (int)($_GET['page'] ?? 1));
+$articleTotal    = 0;
+$articlePages    = 1;
+$recentArticles  = [];
+
 if ($db) {
     try {
-        $articleSql = "
-            SELECT id, article_title, blog_title, blog_handle, handle, author, status, seo_score, published_at, updated_at, article_url, shopify_article_id
-            FROM shopify_blogs
-            WHERE store_key = :store
-        ";
+        $whereSql    = " WHERE store_key = :store";
         $articleParams = [':store' => $activeStore];
 
         if ($articleFilter !== '') {
-            $articleSql .= " AND status = :status";
+            $whereSql .= " AND status = :status";
             $articleParams[':status'] = $articleFilter === 'live' ? 'published' : 'draft';
         }
 
-        $articleSql .= " ORDER BY updated_at DESC, id DESC";
-        if ($articleFilter === '') {
-            $articleSql .= " LIMIT 6";
+        // Total count for pagination
+        $countStmt = $db->prepare("SELECT COUNT(*) FROM shopify_blogs" . $whereSql);
+        $countStmt->execute($articleParams);
+        $articleTotal = (int)$countStmt->fetchColumn();
+        $articlePages = max(1, (int)ceil($articleTotal / $articlesPerPage));
+        if ($articlePage > $articlePages) {
+            $articlePage = $articlePages;
         }
+        $offset = ($articlePage - 1) * $articlesPerPage;
+
+        $articleSql = "
+            SELECT id, article_title, blog_title, blog_handle, handle, author, status, seo_score, published_at, updated_at, article_url, shopify_article_id
+            FROM shopify_blogs
+            {$whereSql}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT {$articlesPerPage} OFFSET {$offset}
+        ";
 
         $rStmt = $db->prepare($articleSql);
         $rStmt->execute($articleParams);
         $recentArticles = $rStmt->fetchAll(PDO::FETCH_ASSOC);
     } catch (Exception $e) {
         $recentArticles = [];
+        $articleTotal   = 0;
+        $articlePages   = 1;
+    }
+}
+
+// Helper: build pagination URL while preserving filter / store
+if (!function_exists('contentArticlesPageUrl')) {
+    function contentArticlesPageUrl(int $page, string $filter = ''): string
+    {
+        $params = [];
+        if ($filter !== '') {
+            $params['article_filter'] = $filter;
+        }
+        if ($page > 1) {
+            $params['page'] = $page;
+        }
+        // Keep active store if present in query
+        if (isset($_GET['store']) && in_array($_GET['store'], ['retail', 'business'], true)) {
+            $params['store'] = $_GET['store'];
+        }
+        $qs = http_build_query($params);
+        return 'content.php' . ($qs !== '' ? '?' . $qs : '');
     }
 }
 
@@ -1489,16 +1525,21 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
       </div>
 
-      <!-- RECENT ARTICLES TABLE ON ACTIVE STORE -->
-      <?php if (!empty($recentArticles) || $articleFilter !== ''): ?>
+      <!-- RECENT ARTICLES TABLE ON ACTIVE STORE (20 per page + pagination) -->
+      <?php if (!empty($recentArticles) || $articleFilter !== '' || $articleTotal > 0): ?>
         <div class="card card-outline card-secondary shadow-sm mt-2">
           <div class="card-header bg-white py-3">
-            <div class="d-flex justify-content-between align-items-center">
+            <div class="d-flex justify-content-between align-items-center flex-wrap">
               <h3 class="card-title font-weight-bold text-dark m-0">
                 <i class="fas fa-history text-secondary mr-2"></i><?php
                   echo $articleFilter === 'hidden' ? 'All Hidden Articles'
                     : ($articleFilter === 'live' ? 'All Live Articles' : 'Recent Articles');
                 ?> on <?php echo htmlspecialchars($shopCfg['name'] ?? ucfirst($activeStore)); ?>
+                <?php if ($articleTotal > 0): ?>
+                  <span class="text-muted font-weight-normal text-sm ml-1">
+                    (<?php echo number_format($articleTotal); ?> total)
+                  </span>
+                <?php endif; ?>
               </h3>
               <a href="blogs.php" class="btn btn-xs btn-outline-primary font-weight-bold">
                 View All in SEO Module <i class="fas fa-chevron-right ml-1"></i>
@@ -1562,13 +1603,67 @@ include __DIR__ . '/../includes/sidebar.php';
                 <?php if (empty($recentArticles)): ?>
                   <tr>
                     <td colspan="7" class="text-center text-muted py-4">
-                      No <?php echo $articleFilter === 'hidden' ? 'hidden' : 'live'; ?> articles found.
+                      No <?php echo $articleFilter === 'hidden' ? 'hidden' : ($articleFilter === 'live' ? 'live' : ''); ?> articles found.
                     </td>
                   </tr>
                 <?php endif; ?>
               </tbody>
             </table>
           </div>
+
+          <?php if ($articlePages > 1 || $articleTotal > 0): ?>
+            <?php
+              $from = $articleTotal === 0 ? 0 : (($articlePage - 1) * $articlesPerPage) + 1;
+              $to   = min($articlePage * $articlesPerPage, $articleTotal);
+              // Sliding window of page links (max 7 numbers)
+              $window = 7;
+              $startP = max(1, $articlePage - (int)floor($window / 2));
+              $endP   = min($articlePages, $startP + $window - 1);
+              $startP = max(1, $endP - $window + 1);
+            ?>
+            <div class="card-footer bg-white d-flex flex-wrap justify-content-between align-items-center py-3">
+              <div class="text-muted text-sm mb-2 mb-md-0">
+                Showing <strong><?php echo $from; ?></strong>–<strong><?php echo $to; ?></strong>
+                of <strong><?php echo number_format($articleTotal); ?></strong>
+                (<?php echo $articlesPerPage; ?> per page)
+              </div>
+              <nav aria-label="Articles pagination">
+                <ul class="pagination pagination-sm mb-0">
+                  <li class="page-item <?php echo $articlePage <= 1 ? 'disabled' : ''; ?>">
+                    <a class="page-link" href="<?php echo $articlePage <= 1 ? '#' : htmlspecialchars(contentArticlesPageUrl($articlePage - 1, $articleFilter)); ?>" <?php echo $articlePage <= 1 ? 'tabindex="-1" aria-disabled="true"' : ''; ?>>
+                      <i class="fas fa-chevron-left"></i> Prev
+                    </a>
+                  </li>
+                  <?php if ($startP > 1): ?>
+                    <li class="page-item">
+                      <a class="page-link" href="<?php echo htmlspecialchars(contentArticlesPageUrl(1, $articleFilter)); ?>">1</a>
+                    </li>
+                    <?php if ($startP > 2): ?>
+                      <li class="page-item disabled"><span class="page-link">…</span></li>
+                    <?php endif; ?>
+                  <?php endif; ?>
+                  <?php for ($p = $startP; $p <= $endP; $p++): ?>
+                    <li class="page-item <?php echo $p === $articlePage ? 'active' : ''; ?>">
+                      <a class="page-link" href="<?php echo htmlspecialchars(contentArticlesPageUrl($p, $articleFilter)); ?>"><?php echo $p; ?></a>
+                    </li>
+                  <?php endfor; ?>
+                  <?php if ($endP < $articlePages): ?>
+                    <?php if ($endP < $articlePages - 1): ?>
+                      <li class="page-item disabled"><span class="page-link">…</span></li>
+                    <?php endif; ?>
+                    <li class="page-item">
+                      <a class="page-link" href="<?php echo htmlspecialchars(contentArticlesPageUrl($articlePages, $articleFilter)); ?>"><?php echo $articlePages; ?></a>
+                    </li>
+                  <?php endif; ?>
+                  <li class="page-item <?php echo $articlePage >= $articlePages ? 'disabled' : ''; ?>">
+                    <a class="page-link" href="<?php echo $articlePage >= $articlePages ? '#' : htmlspecialchars(contentArticlesPageUrl($articlePage + 1, $articleFilter)); ?>" <?php echo $articlePage >= $articlePages ? 'tabindex="-1" aria-disabled="true"' : ''; ?>>
+                      Next <i class="fas fa-chevron-right"></i>
+                    </a>
+                  </li>
+                </ul>
+              </nav>
+            </div>
+          <?php endif; ?>
         </div>
       <?php endif; ?>
 
