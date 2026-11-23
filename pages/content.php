@@ -412,6 +412,104 @@ if ($db && ($editId > 0 || $editArticleId > 0)) {
     }
 }
 
+// When local body_html is empty, hydrate article content from Shopify Admin API.
+// Blog SEO sync historically stored title/meta/handle only; full body lives on Shopify.
+// Fixes empty Content Body on edit (edit_id 118, 149, 174, 73) and supports
+// U-067 (broken images) / U-071 (internal links) that need the live HTML.
+if (!empty($editingArticle) && !empty($token)) {
+    $localBody = trim((string)($editingArticle['body_html'] ?? ''));
+    $shopifyArticleId = (int)($editingArticle['shopify_article_id'] ?? 0);
+    $shopifyBlogId    = (int)($editingArticle['shopify_blog_id'] ?? 0);
+
+    if ($localBody === '' && $shopifyArticleId > 0) {
+        $articleJson = null;
+
+        // Prefer blog-scoped article endpoint when blog_id is known
+        if ($shopifyBlogId > 0) {
+            $articleUrl = "https://{$adminDomain}/admin/api/{$version}/blogs/{$shopifyBlogId}/articles/{$shopifyArticleId}.json";
+            [$fetchCode, $fetchBody] = shopifySeoApiRequest('GET', $articleUrl, $token);
+            if ($fetchCode >= 200 && $fetchCode < 300) {
+                $articleJson = json_decode($fetchBody, true);
+            }
+        }
+
+        // Fallback: global articles endpoint
+        if (empty($articleJson['article'])) {
+            $articleUrl = "https://{$adminDomain}/admin/api/{$version}/articles/{$shopifyArticleId}.json";
+            [$fetchCode, $fetchBody] = shopifySeoApiRequest('GET', $articleUrl, $token);
+            if ($fetchCode >= 200 && $fetchCode < 300) {
+                $articleJson = json_decode($fetchBody, true);
+            }
+        }
+
+        if (!empty($articleJson['article']) && is_array($articleJson['article'])) {
+            $remote = $articleJson['article'];
+            $remoteBody    = (string)($remote['body_html'] ?? '');
+            $remoteSummary = (string)($remote['summary_html'] ?? ($remote['summary'] ?? ''));
+            $remoteImage   = $remote['image']['src'] ?? ($remote['image']['url'] ?? null);
+            $remoteTags    = is_array($remote['tags'] ?? null)
+                ? implode(', ', $remote['tags'])
+                : (string)($remote['tags'] ?? '');
+            $remoteAuthor  = (string)($remote['author'] ?? '');
+            $remoteHandle  = (string)($remote['handle'] ?? '');
+            $remoteBlogId  = (int)($remote['blog_id'] ?? 0);
+
+            if ($remoteBody !== '') {
+                $editingArticle['body_html'] = $remoteBody;
+            }
+            if (trim((string)($editingArticle['summary_html'] ?? '')) === '' && $remoteSummary !== '') {
+                $editingArticle['summary_html'] = $remoteSummary;
+            }
+            if (empty($editingArticle['image_url']) && !empty($remoteImage)) {
+                $editingArticle['image_url'] = $remoteImage;
+            }
+            if (trim((string)($editingArticle['tags'] ?? '')) === '' && $remoteTags !== '') {
+                $editingArticle['tags'] = $remoteTags;
+            }
+            if (empty($editingArticle['author']) && $remoteAuthor !== '') {
+                $editingArticle['author'] = $remoteAuthor;
+            }
+            if (empty($editingArticle['handle']) && $remoteHandle !== '') {
+                $editingArticle['handle'] = $remoteHandle;
+            }
+            if ($shopifyBlogId <= 0 && $remoteBlogId > 0) {
+                $editingArticle['shopify_blog_id'] = $remoteBlogId;
+            }
+
+            // Cache body (and missing fields) in MySQL so subsequent edits are instant
+            if ($db && $remoteBody !== '') {
+                try {
+                    $upd = $db->prepare("
+                        UPDATE `shopify_blogs`
+                        SET `body_html` = :body,
+                            `summary_html` = COALESCE(NULLIF(TRIM(`summary_html`), ''), :summary),
+                            `image_url` = COALESCE(NULLIF(TRIM(`image_url`), ''), :image),
+                            `tags` = COALESCE(NULLIF(TRIM(`tags`), ''), :tags),
+                            `author` = COALESCE(NULLIF(TRIM(`author`), ''), :author),
+                            `shopify_blog_id` = COALESCE(NULLIF(`shopify_blog_id`, 0), :blog_id),
+                            `last_synced_at` = NOW(),
+                            `updated_at` = NOW()
+                        WHERE `id` = :id AND `store_key` = :store
+                        LIMIT 1
+                    ");
+                    $upd->execute([
+                        ':body'    => $remoteBody,
+                        ':summary' => $remoteSummary !== '' ? $remoteSummary : null,
+                        ':image'   => $remoteImage ?: null,
+                        ':tags'    => $remoteTags !== '' ? $remoteTags : null,
+                        ':author'  => $remoteAuthor !== '' ? $remoteAuthor : null,
+                        ':blog_id' => $remoteBlogId > 0 ? $remoteBlogId : null,
+                        ':id'      => (int)$editingArticle['id'],
+                        ':store'   => $activeStore,
+                    ]);
+                } catch (Exception $e) {
+                    // Non-fatal: editor still has the live body in memory for this request
+                }
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // POST HANDLER: SAVE DRAFT OR PUBLISH ARTICLE
 // -----------------------------------------------------------------------------
