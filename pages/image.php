@@ -1,6 +1,7 @@
 <?php
 /**
- * Image Manager (image.php) - lists Shopify Files (images), where they are used, and edits Alt Text.
+ * Image Manager (image.php) - lists Shopify Files (images), where they are used, edits Alt Text,
+ * and uploads single or bulk images to Shopify Files via stagedUploadsCreate + fileCreate.
  * Requires Admin API scopes: read_files, write_files, read_products, read_content.
  */
 require_once __DIR__ . '/../config/config.php';
@@ -46,6 +47,170 @@ function fileQueryVariants(string $term): array
         $v[] = $base . ' AND filename:' . $tokens[0] . '*';
     }
     return $v;
+}
+
+/** Allowed image MIME types for upload. */
+function imgAllowedMimes(): array
+{
+    return [
+        'image/jpeg' => 'jpg',
+        'image/png'  => 'png',
+        'image/gif'  => 'gif',
+        'image/webp' => 'webp',
+    ];
+}
+
+/**
+ * Detect MIME type of an uploaded file (finfo preferred).
+ */
+function imgDetectMime(string $tmpPath, string $clientName = ''): string
+{
+    if (function_exists('finfo_open')) {
+        $f = finfo_open(FILEINFO_MIME_TYPE);
+        if ($f) {
+            $mime = finfo_file($f, $tmpPath) ?: '';
+            finfo_close($f);
+            if ($mime !== '') {
+                return $mime;
+            }
+        }
+    }
+    $ext = strtolower(pathinfo($clientName, PATHINFO_EXTENSION));
+    $map = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif', 'webp' => 'image/webp'];
+    return $map[$ext] ?? 'application/octet-stream';
+}
+
+/**
+ * Sanitize a filename for Shopify staged upload (keep extension, strip unsafe chars).
+ */
+function imgSafeFilename(string $name): string
+{
+    $base = pathinfo($name, PATHINFO_FILENAME);
+    $ext  = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    $base = preg_replace('/[^A-Za-z0-9._-]+/', '-', $base);
+    $base = trim($base, '.-_') ?: ('image-' . date('YmdHis'));
+    $ext  = in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'], true) ? $ext : 'jpg';
+    if ($ext === 'jpeg') {
+        $ext = 'jpg';
+    }
+    return $base . '.' . $ext;
+}
+
+/**
+ * Upload one local image file to Shopify Files (stagedUploadsCreate → binary upload → fileCreate).
+ * Returns ['ok' => bool, 'id' => ?string, 'error' => ?string, 'filename' => string].
+ */
+function uploadImageToShopify(string $tmpPath, string $originalName, string $alt, string $storeKey): array
+{
+    $filename = imgSafeFilename($originalName);
+    $mime     = imgDetectMime($tmpPath, $originalName);
+    $allowed  = imgAllowedMimes();
+    if (!isset($allowed[$mime])) {
+        return ['ok' => false, 'id' => null, 'error' => "Unsupported type ({$mime}). Use JPG, PNG, GIF, or WEBP.", 'filename' => $filename];
+    }
+    if (!is_readable($tmpPath) || filesize($tmpPath) < 1) {
+        return ['ok' => false, 'id' => null, 'error' => 'Empty or unreadable file.', 'filename' => $filename];
+    }
+    $size = (int)filesize($tmpPath);
+    // Shopify soft limits for images in Files; keep under ~20MB
+    if ($size > 20 * 1024 * 1024) {
+        return ['ok' => false, 'id' => null, 'error' => 'File exceeds 20 MB limit.', 'filename' => $filename];
+    }
+
+    // 1) Create staged upload target
+    $stageMutation = <<<'GQL'
+mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+  stagedUploadsCreate(input: $input) {
+    stagedTargets {
+      url
+      resourceUrl
+      parameters { name value }
+    }
+    userErrors { field message }
+  }
+}
+GQL;
+    $stageInput = [[
+        'filename'   => $filename,
+        'mimeType'   => $mime,
+        'resource'   => 'FILE',
+        'httpMethod' => 'POST',
+        'fileSize'   => (string)$size,
+    ]];
+    $stageRes = shopifyGraphQLRequest($stageMutation, ['input' => $stageInput], $storeKey);
+    $stageData = $stageRes['data']['data']['stagedUploadsCreate'] ?? null;
+    $stageErrs = $stageData['userErrors'] ?? [];
+    if ($stageRes['status'] !== 200 || !empty($stageRes['data']['errors']) || $stageErrs || empty($stageData['stagedTargets'][0])) {
+        $msg = $stageErrs[0]['message']
+            ?? ($stageRes['data']['errors'][0]['message'] ?? ($stageRes['error'] ?: 'stagedUploadsCreate failed.'));
+        return ['ok' => false, 'id' => null, 'error' => $msg, 'filename' => $filename];
+    }
+    $target = $stageData['stagedTargets'][0];
+    $uploadUrl   = $target['url'] ?? '';
+    $resourceUrl = $target['resourceUrl'] ?? '';
+    $parameters  = $target['parameters'] ?? [];
+    if ($uploadUrl === '' || $resourceUrl === '') {
+        return ['ok' => false, 'id' => null, 'error' => 'Shopify returned an incomplete staged upload target.', 'filename' => $filename];
+    }
+
+    // 2) POST multipart form to the staged URL (binary never goes through Admin GraphQL)
+    $postFields = [];
+    foreach ($parameters as $param) {
+        $postFields[$param['name']] = $param['value'];
+    }
+    $postFields['file'] = new CURLFile($tmpPath, $mime, $filename);
+
+    $ch = curl_init($uploadUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $postFields,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 120,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $uploadBody = curl_exec($ch);
+    $uploadCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $uploadErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($uploadBody === false || $uploadCode < 200 || $uploadCode >= 300) {
+        $detail = $uploadErr ?: substr((string)$uploadBody, 0, 200);
+        return ['ok' => false, 'id' => null, 'error' => "Staged binary upload failed (HTTP {$uploadCode}): {$detail}", 'filename' => $filename];
+    }
+
+    // 3) Register the file in Shopify Files
+    $createMutation = <<<'GQL'
+mutation fileCreate($files: [FileCreateInput!]!) {
+  fileCreate(files: $files) {
+    files {
+      id
+      fileStatus
+      alt
+      ... on MediaImage {
+        image { url }
+      }
+    }
+    userErrors { field message }
+  }
+}
+GQL;
+    $fileInput = [[
+        'originalSource' => $resourceUrl,
+        'contentType'    => 'IMAGE',
+        'alt'            => mb_substr(trim($alt), 0, 512),
+        'filename'       => $filename,
+    ]];
+    $createRes = shopifyGraphQLRequest($createMutation, ['files' => $fileInput], $storeKey);
+    $createData = $createRes['data']['data']['fileCreate'] ?? null;
+    $createErrs = $createData['userErrors'] ?? [];
+    if ($createRes['status'] !== 200 || !empty($createRes['data']['errors']) || $createErrs || empty($createData['files'][0]['id'])) {
+        $msg = $createErrs[0]['message']
+            ?? ($createRes['data']['errors'][0]['message'] ?? ($createRes['error'] ?: 'fileCreate failed.'));
+        return ['ok' => false, 'id' => null, 'error' => $msg, 'filename' => $filename];
+    }
+
+    $fileId = $createData['files'][0]['id'];
+    return ['ok' => true, 'id' => $fileId, 'error' => null, 'filename' => $filename];
 }
 
 /**
@@ -313,6 +478,103 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'impor
     }
 }
 
+// Single image upload to Shopify Files
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload_image') {
+    set_time_limit(180);
+    if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        $notice = 'Invalid CSRF token.';
+        $noticeType = 'danger';
+    } elseif (empty($_FILES['image_file']['tmp_name']) || ($_FILES['image_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+        $notice = 'Please choose a valid image file (JPG, PNG, GIF, or WEBP).';
+        $noticeType = 'danger';
+    } else {
+        $file = $_FILES['image_file'];
+        $alt  = trim((string)($_POST['image_alt'] ?? ''));
+        if ($alt === '') {
+            $alt = pathinfo($file['name'], PATHINFO_FILENAME);
+        }
+        $result = uploadImageToShopify($file['tmp_name'], $file['name'], $alt, $activeStore);
+        if ($result['ok']) {
+            $notice = 'Uploaded <strong>' . htmlspecialchars($result['filename']) . '</strong> to Shopify Files'
+                . ($result['id'] ? ' (ID: ' . htmlspecialchars($result['id']) . ').' : '.');
+            $notice .= ' Processing may take a few seconds — refresh the list if it does not appear yet.';
+            $noticeType = 'success';
+            if (function_exists('recordUserLog')) {
+                recordUserLog('Image Upload', 'Image', "Uploaded {$result['filename']} to {$shopCfg['name']}.", 'image', $result['id'], 'success');
+            }
+            // Clear first-page cursor so the new file can show up on next list load
+            $pgKeyClear = 'img_cursors_' . $activeStore . '_' . md5('');
+            unset($_SESSION[$pgKeyClear], $_SESSION[$pgKeyClear . '_v']);
+        } else {
+            $notice = 'Upload failed for <strong>' . htmlspecialchars($result['filename']) . '</strong>: '
+                . htmlspecialchars($result['error'] ?? 'Unknown error');
+            $noticeType = 'danger';
+        }
+    }
+}
+
+// Bulk image upload to Shopify Files (multiple files)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'upload_images_bulk') {
+    set_time_limit(600);
+    if (!hash_equals($_SESSION['img_csrf'], $_POST['csrf'] ?? '')) {
+        $notice = 'Invalid CSRF token.';
+        $noticeType = 'danger';
+    } elseif (empty($_FILES['image_files']['name']) || !is_array($_FILES['image_files']['name'])) {
+        $notice = 'Please select one or more image files to upload.';
+        $noticeType = 'danger';
+    } else {
+        $names  = $_FILES['image_files']['name'];
+        $tmps   = $_FILES['image_files']['tmp_name'];
+        $errors = $_FILES['image_files']['error'];
+        $count  = count($names);
+        $ok     = 0;
+        $fail   = 0;
+        $details = [];
+        $maxBatch = 30; // safety cap per request
+
+        for ($i = 0; $i < $count && $i < $maxBatch; $i++) {
+            if (($errors[$i] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || empty($tmps[$i])) {
+                $fail++;
+                $details[] = htmlspecialchars((string)$names[$i]) . ': upload error';
+                continue;
+            }
+            $alt = pathinfo((string)$names[$i], PATHINFO_FILENAME);
+            $result = uploadImageToShopify($tmps[$i], (string)$names[$i], $alt, $activeStore);
+            if ($result['ok']) {
+                $ok++;
+            } else {
+                $fail++;
+                $details[] = htmlspecialchars($result['filename']) . ': ' . htmlspecialchars($result['error'] ?? 'failed');
+            }
+        }
+        if ($count > $maxBatch) {
+            $details[] = 'Only the first ' . $maxBatch . ' files were processed (request limit).';
+        }
+
+        $notice = "Bulk upload to " . htmlspecialchars($shopCfg['name'] ?? $activeStore)
+            . ": <strong>{$ok}</strong> succeeded, <strong>{$fail}</strong> failed.";
+        if ($details) {
+            $notice .= '<ul class="mb-0 mt-2 small"><li>' . implode('</li><li>', array_slice($details, 0, 15)) . '</li></ul>';
+            if (count($details) > 15) {
+                $notice .= '<div class="small text-muted">…and ' . (count($details) - 15) . ' more.</div>';
+            }
+        }
+        $noticeType = $fail && !$ok ? 'danger' : ($fail ? 'warning' : 'success');
+        if (function_exists('recordUserLog')) {
+            recordUserLog(
+                'Image Bulk Upload',
+                'Image',
+                "Bulk uploaded {$ok} image(s) to {$shopCfg['name']}; {$fail} failed.",
+                'image',
+                null,
+                $fail && !$ok ? 'danger' : ($fail ? 'warning' : 'success')
+            );
+        }
+        $pgKeyClear = 'img_cursors_' . $activeStore . '_' . md5('');
+        unset($_SESSION[$pgKeyClear], $_SESSION[$pgKeyClear . '_v']);
+    }
+}
+
 // AJAX: update alt text
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update_alt') {
     header('Content-Type: application/json');
@@ -465,6 +727,61 @@ include __DIR__ . '/../includes/sidebar.php';
         </div>
       </div>
 
+      <!-- Upload to Shopify Files -->
+      <div class="row mb-3">
+        <div class="col-lg-6 mb-3 mb-lg-0">
+          <div class="card shadow-sm border-0 h-100" style="border-top: 4px solid #003087 !important; border-radius: 8px;">
+            <div class="card-body">
+              <h5 class="font-weight-bold text-dark mb-1">
+                <i class="fas fa-cloud-upload-alt text-primary mr-2"></i>Upload Image to Shopify
+              </h5>
+              <p class="small text-muted mb-3">Send one image to Shopify Files (JPG, PNG, GIF, WEBP · max 20 MB).</p>
+              <form method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                <input type="hidden" name="action" value="upload_image">
+                <div class="form-group mb-2">
+                  <label class="small font-weight-bold mb-1" for="image_file">Image file</label>
+                  <input type="file" name="image_file" id="image_file" class="form-control form-control-sm"
+                         accept="image/jpeg,image/png,image/gif,image/webp,.jpg,.jpeg,.png,.gif,.webp" required>
+                </div>
+                <div class="form-group mb-3">
+                  <label class="small font-weight-bold mb-1" for="image_alt">Alt text <span class="text-muted font-weight-normal">(optional — defaults to file name)</span></label>
+                  <input type="text" name="image_alt" id="image_alt" class="form-control form-control-sm" maxlength="512"
+                         placeholder="e.g. Uratex Orthopedic Mattress Queen">
+                </div>
+                <button type="submit" class="btn btn-primary btn-sm font-weight-bold">
+                  <i class="fas fa-upload mr-1"></i>Upload to Shopify
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="card shadow-sm border-0 h-100" style="border-top: 4px solid #7c3aed !important; border-radius: 8px;">
+            <div class="card-body">
+              <h5 class="font-weight-bold text-dark mb-1">
+                <i class="fas fa-images text-purple mr-2" style="color:#7c3aed"></i>Bulk Upload Images
+              </h5>
+              <p class="small text-muted mb-3">Select multiple images at once (up to 30 per request). Alt text defaults to each file name.</p>
+              <form method="POST" enctype="multipart/form-data" id="bulkUploadForm"
+                    onsubmit="var b=this.querySelector('[type=submit]'); if(b){b.disabled=true;b.innerHTML='<i class=\'fas fa-spinner fa-spin mr-1\'></i>Uploading…';}">
+                <input type="hidden" name="csrf" value="<?php echo $_SESSION['img_csrf']; ?>">
+                <input type="hidden" name="action" value="upload_images_bulk">
+                <div class="form-group mb-2">
+                  <label class="small font-weight-bold mb-1" for="image_files">Image files</label>
+                  <input type="file" name="image_files[]" id="image_files" class="form-control form-control-sm"
+                         accept="image/jpeg,image/png,image/gif,image/webp,.jpg,.jpeg,.png,.gif,.webp" multiple required>
+                  <small class="form-text text-muted" id="bulkFileCount">No files selected</small>
+                </div>
+                <button type="submit" class="btn btn-sm font-weight-bold text-white" style="background:#7c3aed">
+                  <i class="fas fa-upload mr-1"></i>Upload All to Shopify
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <form method="GET" class="form-inline mb-3">
         <input type="text" name="q" value="<?php echo htmlspecialchars($search); ?>" class="form-control form-control-sm mr-2" placeholder="Search file name">
         <button class="btn btn-sm btn-primary mr-2" type="submit">Search</button>
@@ -582,6 +899,22 @@ document.querySelectorAll('.save-alt').forEach(function (btn) {
     btn.disabled = false;
   });
 });
+
+(function () {
+  var input = document.getElementById('image_files');
+  var label = document.getElementById('bulkFileCount');
+  if (!input || !label) return;
+  input.addEventListener('change', function () {
+    var n = input.files ? input.files.length : 0;
+    if (n === 0) {
+      label.textContent = 'No files selected';
+    } else if (n === 1) {
+      label.textContent = '1 file selected';
+    } else {
+      label.textContent = n + ' files selected' + (n > 30 ? ' (first 30 will be uploaded)' : '');
+    }
+  });
+})();
 </script>
 
 <?php include __DIR__ . '/../includes/footer.php'; ?>
